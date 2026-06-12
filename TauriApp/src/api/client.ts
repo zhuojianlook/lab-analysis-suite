@@ -195,6 +195,27 @@ export async function pickFile(title: string): Promise<string | null> {
   return typeof res === "string" ? res : null;
 }
 
+/** Native folder picker → returns a chosen directory path (or null), app-only. */
+export async function pickFolder(title: string): Promise<string | null> {
+  if (!(await isTauri())) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const res = await open({ multiple: false, directory: true, title });
+  return typeof res === "string" ? res : null;
+}
+
+// ── Path-registered omics jobs (scRNA / Spatial / 16S) ──
+// These read large inputs in place from a local path the user picks natively.
+
+export async function registerPath(tab: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return apiJson(`/api/${tab}/register`, "POST", JSON.stringify(body));
+}
+export async function runJob(tab: string, body: Record<string, unknown>): Promise<{ job_id?: string | null; error?: string }> {
+  return apiJson(`/api/${tab}/run`, "POST", JSON.stringify(body));
+}
+export async function jobStatus(tab: string, jobId: string): Promise<RJobStatus> {
+  return apiJson<RJobStatus>(`/api/${tab}/status/${encodeURIComponent(jobId)}`);
+}
+
 // ── qPCR ────────────────────────────────────────────────
 
 export interface QpcrUploadResult {

@@ -31,10 +31,16 @@ pyinstaller --onefile \
     --hidden-import=multipart.multipart \
     --hidden-import=config \
     --hidden-import=r_bridge \
+    --hidden-import=r_settings \
+    --hidden-import=r_packages \
+    --hidden-import=rjobs \
     --hidden-import=platemap \
     --hidden-import=qpcr \
     --hidden-import=xcelligence \
     --hidden-import=rnaseq \
+    --hidden-import=scrna \
+    --hidden-import=spatial \
+    --hidden-import=microbiome \
     --collect-all pandas \
     --collect-all numpy \
     --collect-all scipy \

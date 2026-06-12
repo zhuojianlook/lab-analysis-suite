@@ -31,9 +31,9 @@ MANIFESTS: Dict[str, Dict[str, List[str]]] = {
     "qpcr":        {"cran": ["ggsignif", "rstatix"], "bioc": []},
     "xcelligence": {"cran": ["zoo"], "bioc": []},
     "rnaseq":      {"cran": ["pheatmap"], "bioc": ["DESeq2", "apeglm"]},
-    "scrnaseq":    {"cran": ["Seurat", "Matrix", "harmony", "presto", "hdf5r"], "bioc": ["glmGamPoi", "SingleR", "celldex", "scDblFinder"]},
+    "scrnaseq":    {"cran": ["Seurat", "Matrix", "harmony", "presto", "hdf5r", "data.table"], "bioc": ["glmGamPoi", "SingleR", "celldex", "scDblFinder"]},
     "spatial":     {"cran": ["Seurat", "Rfast2", "hdf5r"], "bioc": []},
-    "microbiome":  {"cran": ["vegan", "ggplot2"], "bioc": ["phyloseq", "dada2", "ANCOMBC"]},
+    "microbiome":  {"cran": ["vegan", "ape", "tidyr"], "bioc": ["phyloseq", "dada2", "ANCOMBC"]},
 }
 
 

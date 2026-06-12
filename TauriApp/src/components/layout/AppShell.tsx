@@ -8,12 +8,18 @@ import { RPackageGate } from "../shared/RPackageGate";
 import { QpcrView } from "../qpcr/QpcrView";
 import { XcelligenceView } from "../xcelligence/XcelligenceView";
 import { RnaseqView } from "../rnaseq/RnaseqView";
+import { ScrnaView } from "../scrna/ScrnaView";
+import { SpatialView } from "../spatial/SpatialView";
+import { MicrobiomeView } from "../microbiome/MicrobiomeView";
 import { PlatemapView } from "../platemap/PlatemapView";
 
 const TABS = [
   { label: "qPCR", render: () => <RPackageGate tab="qpcr"><QpcrView /></RPackageGate> },
   { label: "xCELLigence", render: () => <RPackageGate tab="xcelligence"><XcelligenceView /></RPackageGate> },
   { label: "Bulk RNA-seq", render: () => <RPackageGate tab="rnaseq"><RnaseqView /></RPackageGate> },
+  { label: "scRNA-seq", render: () => <RPackageGate tab="scrnaseq"><ScrnaView /></RPackageGate> },
+  { label: "Spatial", render: () => <RPackageGate tab="spatial"><SpatialView /></RPackageGate> },
+  { label: "16S rRNA", render: () => <RPackageGate tab="microbiome"><MicrobiomeView /></RPackageGate> },
   { label: "Plate Mapper", render: () => <PlatemapView /> },
 ] as const;
 
@@ -87,7 +93,8 @@ export function AppShell() {
         <Tabs
           value={tab}
           onChange={(_, v) => setTab(v)}
-          variant="fullWidth"
+          variant="scrollable"
+          scrollButtons="auto"
           sx={{ minHeight: 40, borderTop: "1px solid", borderColor: "divider" }}
         >
           {TABS.map((t) => (

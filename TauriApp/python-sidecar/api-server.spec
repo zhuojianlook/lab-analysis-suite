@@ -9,7 +9,8 @@ hiddenimports = [
     'uvicorn.protocols.websockets', 'uvicorn.protocols.websockets.auto',
     'uvicorn.lifespan', 'uvicorn.lifespan.on', 'uvicorn.lifespan.off',
     'multipart', 'multipart.multipart',
-    'config', 'r_bridge', 'platemap', 'qpcr', 'xcelligence', 'rnaseq',
+    'config', 'r_bridge', 'r_settings', 'r_packages', 'rjobs',
+    'platemap', 'qpcr', 'xcelligence', 'rnaseq', 'scrna', 'spatial', 'microbiome',
 ]
 
 for pkg in ('pandas', 'numpy', 'scipy', 'statsmodels', 'openpyxl', 'xlsxwriter'):
