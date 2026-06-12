@@ -89,7 +89,20 @@ def _host_rscript(custom_path: Optional[str] = None) -> Optional[str]:
 
 
 def _resolve_rscript(custom_path: Optional[str] = None):
-    """Return (rscript_path | None, is_bundled)."""
+    """Return (rscript_path | None, is_bundled).
+
+    Order: explicit per-request path -> persisted user setting -> optional
+    bundled/portable R (LAS_R_ENV_DIR) -> host discovery.
+    """
+    if custom_path and os.path.isfile(custom_path):
+        return custom_path, False
+    try:
+        import r_settings
+        saved = r_settings.get("rscript_path")
+        if saved and os.path.isfile(saved):
+            return saved, False
+    except Exception:  # noqa: BLE001
+        pass
     b = _bundled_rscript()
     if b:
         return b, True

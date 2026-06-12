@@ -1,44 +1,28 @@
-# Bundled R engine (`r-env`)
+# `r-env` — optional portable R (power users only)
 
-The app ships a self-contained R runtime (a relocated conda env) so ggplot2 +
-DESeq2 work offline with no host R install. `environment.yml` is the spec.
+**The app uses the user's locally-installed R by default.** It is NOT bundled.
+On first use of an R-backed tab, the app installs that tab's R packages as
+binaries via `pak` + Posit Public Package Manager (no compiler needed on
+Windows/macOS; Linux LTS via distro-tagged P3M). See the package system in
+`TauriApp/python-sidecar/r_packages.py`.
 
-## Build locally (per platform, on that platform)
+This folder is kept only as an **optional** way to build a self-contained
+portable R tree for locked-down machines (no admin rights to run the CRAN
+installer, air-gapped labs). It is **not** part of the release build.
 
-Requires [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html)
-(or mamba/conda) and `conda-pack`.
+## Build a portable R (optional)
+
+`environment.yml` lists R + the packages. Build it with micromamba + conda-pack
+using `../TauriApp/scripts/build-r-env.sh` (macOS/Linux) or `build-r-env.ps1`
+(Windows), then point the app at it:
 
 ```bash
-# 1. Create the env into a local prefix
-micromamba create -y -p ./build/r-env -f environment.yml
-
-# 2. Smoke-test that DESeq2 + ggplot2 load
-./build/r-env/bin/Rscript -e 'suppressMessages({library(DESeq2); library(ggplot2)}); cat("ok\n")'
-
-# 3. Relocate (rewrites absolute prefixes/rpaths so the env works anywhere)
-micromamba run -p ./build/r-env conda-pack -p ./build/r-env -o r-env.tar.gz
-mkdir -p unpacked && tar -xzf r-env.tar.gz -C unpacked
-./unpacked/bin/conda-unpack            # finalizes relocation
-
-# 4. (optional) prune docs/help/tests to cut size
-rm -rf unpacked/lib/R/library/*/doc unpacked/lib/R/library/*/help unpacked/lib/R/library/*/tests 2>/dev/null || true
-
-# 5. Place into the Tauri bundle resources
-rm -rf ../TauriApp/src-tauri/resources/r-env
-cp -R unpacked ../TauriApp/src-tauri/resources/r-env
+export LAS_R_ENV_DIR=/path/to/portable/r-env   # the Tauri shell forwards this
+                                                # to the sidecar as --r-env-dir
 ```
 
-> Windows layout differs: Rscript is under `Scripts/` / `Library/bin/` /
-> `Lib/R/bin/x64/`. `r_bridge.py` globs all of these, so just unpack the env to
-> `resources/r-env` and it will be found.
+The sidecar's `r_bridge.py` will then resolve `Rscript` inside that tree and set
+`R_HOME` / `R_LIBS` / `PATH` accordingly, instead of discovering a host R.
 
-## How the app finds it
-
-The Tauri shell passes `--r-env-dir <resource_dir>/resources/r-env` to the
-sidecar (`src-tauri/src/lib.rs`). `r_bridge.py` resolves `Rscript` inside it and
-sets `R_HOME` / `R_LIBS_SITE` / `PATH` before invoking it.
-
-## R plot templates
-
-`rscripts/` holds the versioned ggplot/DESeq2 templates each tab feeds through
-`/api/analysis/run-r` (added per tab in Phase 2).
+`rscripts/` holds the versioned ggplot/analysis R templates the tabs feed
+through `/api/analysis/run-r` (added per tab).

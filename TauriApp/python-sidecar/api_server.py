@@ -78,9 +78,15 @@ def warmup():
 
 app.include_router(r_router)
 
+# R settings (Rscript-path persistence) + the package check/install system.
+from r_settings import router as r_settings_router  # noqa: E402
+from r_packages import router as r_packages_router  # noqa: E402
+app.include_router(r_settings_router)
+app.include_router(r_packages_router)
+
 # Tab routers are added as each tab is implemented (Phase 2). Imported lazily
 # so the sidecar still boots while a module is a work in progress.
-for _mod in ("platemap", "qpcr", "xcelligence", "rnaseq"):
+for _mod in ("platemap", "qpcr", "xcelligence", "rnaseq", "scrna", "spatial", "microbiome"):
     try:
         _m = __import__(_mod)
         if hasattr(_m, "router"):

@@ -133,27 +133,9 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x TauriApp/src-tauri/binaries/api-server-*
 
-      # ── Bundled R engine (conda env) → src-tauri/resources/r-env ──────────
-      # Cache the micromamba package cache so re-solves are fast across runs.
-      - name: Cache conda packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/micromamba/pkgs
-            ~/.cache/micromamba
-          key: rpkgs-${{ matrix.os }}-${{ hashFiles('r-env/environment.yml') }}
-      - uses: mamba-org/setup-micromamba@v2
-        with:
-          micromamba-version: '2.0.5-0'
-          init-shell: bash
-      - name: Build bundled R engine (macOS/Linux)
-        if: runner.os != 'Windows'
-        shell: bash -l {0}
-        run: ./TauriApp/scripts/build-r-env.sh
-      - name: Build bundled R engine (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./TauriApp/scripts/build-r-env.ps1
+      # R is the user's local install — nothing R-related is bundled or built
+      # here. Installers stay small (~90 MB); each tab installs the R packages
+      # it needs on first use (binary, via pak + Posit P3M, no toolchain).
 
       - name: Install frontend deps
         working-directory: TauriApp

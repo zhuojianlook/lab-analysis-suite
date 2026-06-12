@@ -1,16 +1,9 @@
 import { useEffect, useState } from "react";
-import {
-  AppBar,
-  Box,
-  Chip,
-  Tab,
-  Tabs,
-  Toolbar,
-  Tooltip,
-  Typography,
-} from "@mui/material";
+import { AppBar, Box, Chip, Tab, Tabs, Toolbar, Tooltip, Typography } from "@mui/material";
 import ScienceIcon from "@mui/icons-material/Science";
-import { checkHealth, checkR, lastHealthError } from "../../api/client";
+import { checkHealth, lastHealthError } from "../../api/client";
+import { useRStore } from "../../store/rStore";
+import { RStatusBanner } from "../shared/RStatusBanner";
 import { QpcrView } from "../qpcr/QpcrView";
 import { XcelligenceView } from "../xcelligence/XcelligenceView";
 import { RnaseqView } from "../rnaseq/RnaseqView";
@@ -28,11 +21,11 @@ type Status = "checking" | "ok" | "down";
 export function AppShell() {
   const [tab, setTab] = useState(0);
   const [health, setHealth] = useState<Status>("checking");
-  const [rStatus, setRStatus] = useState<Status>("checking");
-  const [rVersion, setRVersion] = useState<string>("");
+  const rState = useRStore((s) => s.state);
+  const recheckR = useRStore((s) => s.recheck);
 
-  // Poll sidecar health until it comes up (PyInstaller cold start can take
-  // a few seconds), then probe R once.
+  // Poll sidecar health until it comes up (PyInstaller cold start can take a
+  // few seconds), then probe R once.
   useEffect(() => {
     let cancelled = false;
     let tries = 0;
@@ -41,19 +34,10 @@ export function AppShell() {
       if (cancelled) return;
       if (ok) {
         setHealth("ok");
-        try {
-          const r = await checkR();
-          if (!cancelled) {
-            setRStatus(r.installed ? "ok" : "down");
-            setRVersion(r.version || "");
-          }
-        } catch {
-          if (!cancelled) setRStatus("down");
-        }
+        recheckR();
         return;
       }
-      tries += 1;
-      if (tries > 30) {
+      if (++tries > 30) {
         setHealth("down");
         return;
       }
@@ -63,7 +47,7 @@ export function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [recheckR]);
 
   const healthChip = {
     checking: <Chip size="small" color="default" label="Engine: starting…" />,
@@ -75,19 +59,17 @@ export function AppShell() {
     ),
   }[health];
 
-  const rChip = {
-    checking: <Chip size="small" variant="outlined" label="R: checking…" />,
-    ok: (
-      <Tooltip title={rVersion}>
-        <Chip size="small" color="success" variant="outlined" label="R: ready" />
-      </Tooltip>
-    ),
-    down: (
-      <Tooltip title="Bundled R not found (dev: install R or build the r-env)">
-        <Chip size="small" color="warning" variant="outlined" label="R: unavailable" />
-      </Tooltip>
-    ),
-  }[rStatus];
+  const rChip = !rState ? (
+    <Chip size="small" variant="outlined" label="R: checking…" />
+  ) : rState.installed ? (
+    <Tooltip title={`${rState.version}${rState.bundled ? " (portable)" : ""}`}>
+      <Chip size="small" color="success" variant="outlined" label="R: ready" />
+    </Tooltip>
+  ) : (
+    <Tooltip title="R not found — install it or set a custom Rscript path">
+      <Chip size="small" color="warning" variant="outlined" label="R: not found" />
+    </Tooltip>
+  );
 
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
@@ -112,9 +94,8 @@ export function AppShell() {
           ))}
         </Tabs>
       </AppBar>
-      <Box sx={{ flexGrow: 1, overflow: "auto", bgcolor: "background.default" }}>
-        {TABS[tab].render()}
-      </Box>
+      <RStatusBanner />
+      <Box sx={{ flexGrow: 1, overflow: "auto", bgcolor: "background.default" }}>{TABS[tab].render()}</Box>
     </Box>
   );
 }

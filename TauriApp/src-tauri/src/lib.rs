@@ -334,14 +334,10 @@ pub fn run() {
       let sidecar_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
       let sidecar_child: Arc<Mutex<Option<CommandChild>>> = Arc::new(Mutex::new(None));
 
-      // Where the bundled R engine lives — resources/r-env inside the app
-      // bundle. Passed to the sidecar so it can locate Rscript + set R_HOME.
-      // In dev we leave it unset and the sidecar falls back to a host R.
-      let r_env_dir: Option<String> = app
-        .path()
-        .resource_dir()
-        .ok()
-        .map(|p| p.join("resources").join("r-env").to_string_lossy().to_string());
+      // The app uses the user's locally-installed R. Power users on locked-down
+      // machines can point at a portable R tree via the LAS_R_ENV_DIR env var;
+      // normally unset → the sidecar discovers the host R itself.
+      let r_env_dir: Option<String> = std::env::var("LAS_R_ENV_DIR").ok().filter(|s| !s.is_empty());
 
       // Launch sidecar in production; in dev, assume it's already running.
       let port: u16;
