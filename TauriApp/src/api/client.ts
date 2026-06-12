@@ -195,6 +195,37 @@ export async function pickFile(title: string): Promise<string | null> {
   return typeof res === "string" ? res : null;
 }
 
+// ── qPCR ────────────────────────────────────────────────
+
+export interface QpcrUploadResult {
+  pairs: { name: string; records: Record<string, unknown>[]; n_rows: number }[];
+  genes_common: string[];
+  genes_all: string[];
+  samples: string[];
+  errors: string[];
+}
+
+export interface QpcrAnalyzeResult {
+  analysis_data: Record<string, unknown>[];
+  summary: { Gene: string; Sample: string; mean: number; sd: number; sem: number; n: number }[];
+  ttest_results: Record<string, unknown>[];
+  anova_tukey_results: Record<string, unknown>[];
+  error?: string;
+}
+
+export async function uploadQpcr(files: File[], dropHighCp: boolean): Promise<QpcrUploadResult> {
+  const text = await uploadFiles(`/api/qpcr/upload?drop_high_cp=${dropHighCp}`, files, "files");
+  return JSON.parse(text) as QpcrUploadResult;
+}
+
+export async function analyzeQpcr(body: Record<string, unknown>): Promise<QpcrAnalyzeResult> {
+  return apiJson<QpcrAnalyzeResult>("/api/qpcr/analyze", "POST", JSON.stringify(body));
+}
+
+export async function plotQpcr(body: Record<string, unknown>): Promise<RunRResponse> {
+  return apiJson<RunRResponse>("/api/qpcr/plot", "POST", JSON.stringify(body));
+}
+
 /** Check for + download + install an app update (Rust-driven). */
 export async function downloadAndInstallUpdate(manifestUrl: string): Promise<string> {
   const invoke = await getInvoke();

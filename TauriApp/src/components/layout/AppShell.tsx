@@ -4,15 +4,16 @@ import ScienceIcon from "@mui/icons-material/Science";
 import { checkHealth, lastHealthError } from "../../api/client";
 import { useRStore } from "../../store/rStore";
 import { RStatusBanner } from "../shared/RStatusBanner";
+import { RPackageGate } from "../shared/RPackageGate";
 import { QpcrView } from "../qpcr/QpcrView";
 import { XcelligenceView } from "../xcelligence/XcelligenceView";
 import { RnaseqView } from "../rnaseq/RnaseqView";
 import { PlatemapView } from "../platemap/PlatemapView";
 
 const TABS = [
-  { label: "qPCR", render: () => <QpcrView /> },
-  { label: "xCELLigence", render: () => <XcelligenceView /> },
-  { label: "Bulk RNA-seq", render: () => <RnaseqView /> },
+  { label: "qPCR", render: () => <RPackageGate tab="qpcr"><QpcrView /></RPackageGate> },
+  { label: "xCELLigence", render: () => <RPackageGate tab="xcelligence"><XcelligenceView /></RPackageGate> },
+  { label: "Bulk RNA-seq", render: () => <RPackageGate tab="rnaseq"><RnaseqView /></RPackageGate> },
   { label: "Plate Mapper", render: () => <PlatemapView /> },
 ] as const;
 
