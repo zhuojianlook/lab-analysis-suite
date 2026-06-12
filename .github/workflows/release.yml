@@ -157,19 +157,17 @@ jobs:
           SECRET_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           SECRET_PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          KEYFILE="$RUNNER_TEMP/las_updater.key"
           if [ -n "$SECRET_KEY" ]; then
-            {
-              echo "TAURI_SIGNING_PRIVATE_KEY<<LASKEY"; echo "$SECRET_KEY"; echo "LASKEY"
-              echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$SECRET_PW"
-            } >> "$GITHUB_ENV"
+            printf '%s' "$SECRET_KEY" > "$KEYFILE"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$SECRET_PW" >> "$GITHUB_ENV"
           else
             echo "::warning::No TAURI_SIGNING_PRIVATE_KEY secret — generating an ephemeral key so the build completes. The in-app updater will NOT verify until you set a real key + matching pubkey in tauri.conf.json."
-            npx tauri signer generate -w "$RUNNER_TEMP/las_updater.key" -p ""
-            {
-              echo "TAURI_SIGNING_PRIVATE_KEY<<LASKEY"; cat "$RUNNER_TEMP/las_updater.key"; echo "LASKEY"
-              echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
-            } >> "$GITHUB_ENV"
+            npx tauri signer generate -w "$KEYFILE" -p ""
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
           fi
+          # Tauri accepts a path in TAURI_SIGNING_PRIVATE_KEY (avoids multiline-env issues).
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEYFILE" >> "$GITHUB_ENV"
 
       # macOS: import a self-signed cert (if provided) for a STABLE identity.
       # Deliberately NOT named APPLE_SIGNING_IDENTITY so Tauri does not sign
