@@ -1,0 +1,18 @@
+# Web server
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+python-multipart>=0.0.6
+
+# Analysis logic (plotting is delegated to the bundled R engine, so NO
+# matplotlib / Pillow / opencv here — keeps the sidecar small).
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+statsmodels>=0.14
+
+# Excel I/O (xCELLigence .xlsx input; Plate Mapper / results .xlsx export)
+openpyxl>=3.1
+xlsxwriter>=3.1
+
+# Build
+pyinstaller>=6.0

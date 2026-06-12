@@ -1,0 +1,12 @@
+# See TauriApp/.gitignore for app-level ignores.
+.claude/
+.DS_Store
+*.log
+.venv/
+__pycache__/
+*.pyc
+
+# Built / packed R engine (large, CI-produced)
+r-env/build/
+r-env/*.tar.zst
+r-env/*.tar.gz

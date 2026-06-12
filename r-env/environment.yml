@@ -1,0 +1,33 @@
+# Bundled R engine for the Lab Analysis Suite.
+#
+# Built per platform in CI (or locally) with micromamba/mamba, relocated with
+# `conda-unpack`, pruned, and copied into TauriApp/src-tauri/resources/r-env so
+# it ships INSIDE the installer (fully offline). The Python sidecar points
+# Rscript at this env and sets R_HOME/R_LIBS accordingly (see r_bridge.py).
+#
+# Pin exact builds with conda-lock for reproducible CI:
+#   conda-lock lock -f environment.yml -p osx-arm64 -p win-64 -p linux-64
+#
+# bioconductor-deseq2 pulls its compiled dependency graph as prebuilt binaries
+# (no on-user-machine toolchain needed) — this is why conda is used over a
+# native R + BiocManager::install (which compiles from source).
+name: las-r-env
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base=4.3
+  # Plotting + stats (CRAN)
+  - r-ggplot2
+  - r-dplyr
+  - r-tidyr
+  - r-scales
+  - r-ggrepel
+  - r-ggsignif
+  - r-rstatix
+  - r-rcolorbrewer
+  - r-pheatmap
+  - r-svglite
+  # Differential expression (Bioconductor)
+  - bioconductor-deseq2
+  - bioconductor-apeglm

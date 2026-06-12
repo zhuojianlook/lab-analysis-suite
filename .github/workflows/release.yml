@@ -1,0 +1,357 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'      # stable releases
+      - 'exp-*'   # experimental releases
+  workflow_dispatch:
+
+jobs:
+  # ── 1. Build the Python sidecar (PyInstaller) per platform ────────────────
+  build-sidecar:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14            # Apple Silicon
+            triple: aarch64-apple-darwin
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04        # oldest supported glibc
+            triple: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python deps
+        working-directory: TauriApp/python-sidecar
+        run: pip install -r requirements.txt
+      - name: Build sidecar
+        working-directory: TauriApp/python-sidecar
+        run: |
+          pyinstaller --onefile --name api-server \
+            --hidden-import=uvicorn.logging \
+            --hidden-import=uvicorn.protocols.http \
+            --hidden-import=uvicorn.protocols.http.auto \
+            --hidden-import=uvicorn.protocols.websockets \
+            --hidden-import=uvicorn.protocols.websockets.auto \
+            --hidden-import=uvicorn.lifespan \
+            --hidden-import=uvicorn.lifespan.on \
+            --hidden-import=uvicorn.lifespan.off \
+            --hidden-import=multipart --hidden-import=multipart.multipart \
+            --hidden-import=config --hidden-import=r_bridge \
+            --hidden-import=platemap --hidden-import=qpcr \
+            --hidden-import=xcelligence --hidden-import=rnaseq \
+            --collect-all pandas --collect-all numpy --collect-all scipy \
+            --collect-all statsmodels --collect-all openpyxl --collect-all xlsxwriter \
+            --exclude-module matplotlib --exclude-module PIL \
+            --exclude-module cv2 --exclude-module tkinter \
+            --noconfirm api_server.py
+        shell: bash
+      - name: Copy sidecar binary
+        run: |
+          mkdir -p TauriApp/src-tauri/binaries
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp TauriApp/python-sidecar/dist/api-server.exe "TauriApp/src-tauri/binaries/api-server-${{ matrix.triple }}.exe"
+          else
+            cp TauriApp/python-sidecar/dist/api-server "TauriApp/src-tauri/binaries/api-server-${{ matrix.triple }}"
+          fi
+        shell: bash
+      - name: Upload sidecar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidecar-${{ matrix.triple }}
+          path: TauriApp/src-tauri/binaries/
+
+  # ── 2. Build the bundled R engine + the Tauri app per platform ────────────
+  build-tauri:
+    needs: build-sidecar
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+            bundles: app
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Linux: Tauri v2 system deps (webkit2gtk 4.1) + AppImage runtime.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
+            libayatana-appindicator3-dev build-essential curl wget file \
+            libssl-dev libfuse2
+
+      # Pin the app version to the tag so the updater + bundle agree (prevents
+      # the "updater offers the new version forever" bug from a stale config).
+      - name: Sync app version to release tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == exp-* ]]; then VERSION="${TAG#exp-}";
+          elif [[ "$TAG" == v* ]]; then VERSION="${TAG#v}";
+          else VERSION=""; fi
+          if [ -n "$VERSION" ]; then
+            echo "Pinning app version to $VERSION (from tag $TAG)"
+            node -e '
+              const fs = require("fs");
+              const v = process.argv[1];
+              for (const p of ["TauriApp/src-tauri/tauri.conf.json", "TauriApp/package.json"]) {
+                const c = JSON.parse(fs.readFileSync(p, "utf8"));
+                c.version = v;
+                fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");
+                console.log(p, "->", v);
+              }
+            ' "$VERSION"
+          else
+            echo "Not a version tag ($TAG) — leaving versions as committed."
+          fi
+        shell: bash
+
+      - name: Download sidecar
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar-${{ matrix.triple }}
+          path: TauriApp/src-tauri/binaries/
+      - name: Make sidecar executable
+        if: runner.os != 'Windows'
+        run: chmod +x TauriApp/src-tauri/binaries/api-server-*
+
+      # ── Bundled R engine (conda env) → src-tauri/resources/r-env ──────────
+      # Cache the micromamba package cache so re-solves are fast across runs.
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/micromamba/pkgs
+            ~/.cache/micromamba
+          key: rpkgs-${{ matrix.os }}-${{ hashFiles('r-env/environment.yml') }}
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          micromamba-version: '2.0.5-0'
+          init-shell: bash
+      - name: Build bundled R engine (macOS/Linux)
+        if: runner.os != 'Windows'
+        shell: bash -l {0}
+        run: ./TauriApp/scripts/build-r-env.sh
+      - name: Build bundled R engine (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./TauriApp/scripts/build-r-env.ps1
+
+      - name: Install frontend deps
+        working-directory: TauriApp
+        run: npm ci || npm install
+      - name: Build frontend
+        working-directory: TauriApp
+        run: npm run build
+
+      # macOS: import a self-signed cert (if provided) for a STABLE identity.
+      # Deliberately NOT named APPLE_SIGNING_IDENTITY so Tauri does not sign
+      # with the hardened runtime (which enables library validation and breaks
+      # the bundled R / PyInstaller sidecar dlopen). We sign ourselves after.
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS'
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$CERT_B64" ]; then
+            echo "No MACOS_CERT_P12_BASE64 secret — will ad-hoc sign."
+            exit 0
+          fi
+          set -e
+          KC="$RUNNER_TEMP/build.keychain-db"
+          KC_PW="ci-$RANDOM-$RANDOM"
+          echo "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PW" "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed s/\"//g)
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PW" -T /usr/bin/codesign -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          IDENTITY=$(security find-identity -p codesigning "$KC" | grep '"' | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          if [ -z "$IDENTITY" ]; then echo "ERROR: no signing identity"; exit 1; fi
+          echo "LAS_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Build Tauri (with updater signing)
+        working-directory: TauriApp
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --bundles ${{ matrix.bundles }}
+        shell: bash
+
+      # macOS: sign WITHOUT hardened runtime (so the bundled R dylibs + sidecar
+      # can dlopen), then rebuild the DMG + regenerate/re-sign the updater bundle.
+      - name: Sign macOS app + rebuild artifacts
+        if: runner.os == 'macOS'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -e
+          WS="$GITHUB_WORKSPACE"
+          MACOS_DIR="$WS/TauriApp/src-tauri/target/release/bundle/macos"
+          APP_PATH=$(find "$MACOS_DIR" -maxdepth 1 -name "*.app")
+          APP_NAME=$(basename "$APP_PATH")
+          if [ -n "${LAS_SIGN_IDENTITY:-}" ]; then ID="$LAS_SIGN_IDENTITY"; else ID="-"; fi
+          echo "Signing $APP_PATH with '$ID' (deep, no hardened runtime)"
+          # Deep sign so the hundreds of nested R dylibs in Resources/r-env get
+          # sealed. NO --options runtime → library validation stays off.
+          codesign --force --deep -s "$ID" "$APP_PATH"
+          codesign --verify --deep "$APP_PATH" && echo "Signature valid"
+          # Rebuild DMG from the signed .app (Tauri's DMG bundler is flaky on CI).
+          DMG_DIR="$WS/TauriApp/src-tauri/target/release/bundle/dmg"
+          mkdir -p "$DMG_DIR"
+          VERSION=$(node -p "require('$WS/TauriApp/package.json').version")
+          DMG_NAME="Lab Analysis Suite_${VERSION}_aarch64.dmg"
+          rm -f "$DMG_DIR/$DMG_NAME"
+          STAGE=$(mktemp -d)
+          cp -R "$APP_PATH" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Lab Analysis Suite" -srcfolder "$STAGE" -ov -format UDZO "$DMG_DIR/$DMG_NAME"
+          rm -rf "$STAGE"
+          # Regenerate + re-sign the updater bundle (.app.tar.gz) from the signed app.
+          ( cd "$MACOS_DIR" && rm -f "$APP_NAME.tar.gz" "$APP_NAME.tar.gz.sig" && COPYFILE_DISABLE=1 tar czf "$APP_NAME.tar.gz" "$APP_NAME" )
+          ( cd "$WS/TauriApp" && npx tauri signer sign "$MACOS_DIR/$APP_NAME.tar.gz" )
+          ls -la "$MACOS_DIR/"
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.triple }}
+          path: |
+            TauriApp/src-tauri/target/release/bundle/dmg/*.dmg
+            TauriApp/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            TauriApp/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+            TauriApp/src-tauri/target/release/bundle/nsis/*-setup.exe
+            TauriApp/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+            TauriApp/src-tauri/target/release/bundle/appimage/*.AppImage
+            TauriApp/src-tauri/target/release/bundle/appimage/*.AppImage.sig
+            TauriApp/src-tauri/target/release/bundle/deb/*.deb
+
+  # ── 3. Publish the release + updater manifest ─────────────────────────────
+  create-release:
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/exp-')
+    concurrency:
+      group: updater-branch-write
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: List artifacts
+        run: find artifacts/ -type f | sort
+      - name: Generate latest.json for Tauri updater
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == exp-* ]]; then CHANNEL="experimental"; VERSION="${TAG#exp-}";
+          else CHANNEL="stable"; VERSION="${TAG#v}"; fi
+          REPO="zhuojianlook/lab-analysis-suite"
+          echo "Channel: $CHANNEL  Version: $VERSION  Tag: $TAG"
+
+          read_sig() { [ -f "$1" ] && cat "$1" || echo ""; }
+          MAC_SIG=$(read_sig "$(find artifacts/ -name '*.app.tar.gz.sig' | head -1)")
+          WIN_SIG=$(read_sig "$(find artifacts/ -name '*-setup.exe.sig' | head -1)")
+          LIN_SIG=$(read_sig "$(find artifacts/ -name '*.AppImage.sig' | head -1)")
+
+          MAC_TAR=$(basename "$(find artifacts/ -name '*.app.tar.gz' ! -name '*.sig' | head -1)" 2>/dev/null || echo "")
+          WIN_EXE=$(basename "$(find artifacts/ -name '*-setup.exe' | head -1)" 2>/dev/null || echo "")
+          LIN_APP=$(basename "$(find artifacts/ -name '*.AppImage' | head -1)" 2>/dev/null || echo "")
+          # GitHub replaces spaces with dots in release asset names.
+          MAC_GH=$(echo "$MAC_TAR" | tr ' ' '.'); WIN_GH=$(echo "$WIN_EXE" | tr ' ' '.'); LIN_GH=$(echo "$LIN_APP" | tr ' ' '.')
+
+          MANIFEST="latest.json"; [ "$CHANNEL" = "experimental" ] && MANIFEST="latest-experimental.json"
+          cat > "artifacts/${MANIFEST}" << ENDJSON
+          {
+            "version": "${VERSION}",
+            "notes": "Update to ${TAG}",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": { "signature": "${MAC_SIG}", "url": "https://github.com/${REPO}/releases/download/${TAG}/${MAC_GH}" },
+              "windows-x86_64": { "signature": "${WIN_SIG}", "url": "https://github.com/${REPO}/releases/download/${TAG}/${WIN_GH}" },
+              "linux-x86_64":   { "signature": "${LIN_SIG}", "url": "https://github.com/${REPO}/releases/download/${TAG}/${LIN_GH}" }
+            }
+          }
+          ENDJSON
+          cat "artifacts/${MANIFEST}"
+      - name: Push manifest to updater branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == exp-* ]]; then VERSION="${TAG#exp-}"; MANIFEST="latest-experimental.json";
+          else VERSION="${TAG#v}"; MANIFEST="latest.json"; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin updater:updater-local 2>/dev/null || true
+          if git rev-parse --verify updater-local >/dev/null 2>&1; then
+            git checkout updater-local
+          else
+            git checkout --orphan updater-local; git rm -rf . 2>/dev/null || true
+          fi
+          # Downgrade guard: refuse to overwrite a newer remote manifest.
+          if [ -f "$MANIFEST" ]; then
+            REMOTE_VER=$(python3 -c "import json;print(json.load(open('$MANIFEST')).get('version',''))" 2>/dev/null || echo "")
+            if [ -n "$REMOTE_VER" ]; then
+              NEWER=$(python3 -c "r=tuple(int(x) for x in '$REMOTE_VER'.split('.') if x.isdigit());v=tuple(int(x) for x in '$VERSION'.split('.') if x.isdigit());print('1' if r>v else '0')")
+              if [ "$NEWER" = "1" ]; then echo "Remote $REMOTE_VER newer than $VERSION — skip."; exit 0; fi
+            fi
+          fi
+          cp "artifacts/${MANIFEST}" "${MANIFEST}"
+          git add "${MANIFEST}"
+          git commit -m "Update manifest for ${TAG}" --allow-empty
+          git push origin updater-local:updater --force
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == exp-* ]]; then PATTERN='exp-*'; else PATTERN='v*'; fi
+          PREV_TAG=$(git tag -l "$PATTERN" --sort=-v:refname | grep -vx "$TAG" | head -1)
+          if [ -n "$PREV_TAG" ]; then RANGE="${PREV_TAG}..${TAG}"; else RANGE="$TAG"; fi
+          BULLETS=$(git log --no-merges --pretty=format:'* %s' "$RANGE" \
+            | grep -vE '^\* (Merge|Co-Authored-By)' | grep -vE '^\*\s*$' || true)
+          [ -z "$BULLETS" ] && BULLETS="* Release ${TAG}"
+          { echo "body<<LAS_NOTES_EOF"; echo "$BULLETS"; echo "LAS_NOTES_EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/release-*/**/*.dmg
+            artifacts/release-*/**/*.app.tar.gz
+            artifacts/release-*/**/*-setup.exe
+            artifacts/release-*/**/*.AppImage
+            artifacts/release-*/**/*.deb
+            artifacts/release-*/**/*.sig
+            artifacts/latest*.json
+          body: ${{ steps.notes.outputs.body }}
+          prerelease: ${{ startsWith(github.ref, 'refs/tags/exp-') }}
