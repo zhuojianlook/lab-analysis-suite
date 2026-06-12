@@ -226,6 +226,46 @@ export async function plotQpcr(body: Record<string, unknown>): Promise<RunRRespo
   return apiJson<RunRResponse>("/api/qpcr/plot", "POST", JSON.stringify(body));
 }
 
+// ── xCELLigence ─────────────────────────────────────────
+
+export interface XcellUploadResult {
+  token: string | null;
+  files: { name: string; samples: string[]; wells: string[]; n_timepoints: number }[];
+  errors: string[];
+}
+
+export interface XcellProcessResult {
+  samples: string[];
+  times_h: number[];
+  summary: { Time_h: number; Sample: string; mean: number | null; sd: number }[];
+  n_wells: number;
+  error?: string;
+}
+
+export interface XcellBarStats {
+  time_h: number;
+  replicates: { Sample: string; Well: string; Value: number }[];
+  summary: { Sample: string; mean: number; sd: number; n: number }[];
+  comparisons: { group1: string; group2: string; p: number; star: string; reject: boolean }[];
+  error?: string;
+}
+
+export async function uploadXcelligence(files: File[]): Promise<XcellUploadResult> {
+  return JSON.parse(await uploadFiles("/api/xcelligence/upload", files, "files")) as XcellUploadResult;
+}
+export async function processXcelligence(body: Record<string, unknown>): Promise<XcellProcessResult> {
+  return apiJson<XcellProcessResult>("/api/xcelligence/process", "POST", JSON.stringify(body));
+}
+export async function barStatsXcelligence(body: Record<string, unknown>): Promise<XcellBarStats> {
+  return apiJson<XcellBarStats>("/api/xcelligence/bar-stats", "POST", JSON.stringify(body));
+}
+export async function plotLineXcelligence(body: Record<string, unknown>): Promise<RunRResponse> {
+  return apiJson<RunRResponse>("/api/xcelligence/plot-line", "POST", JSON.stringify(body));
+}
+export async function plotBarXcelligence(body: Record<string, unknown>): Promise<RunRResponse> {
+  return apiJson<RunRResponse>("/api/xcelligence/plot-bar", "POST", JSON.stringify(body));
+}
+
 /** Check for + download + install an app update (Rust-driven). */
 export async function downloadAndInstallUpdate(manifestUrl: string): Promise<string> {
   const invoke = await getInvoke();
