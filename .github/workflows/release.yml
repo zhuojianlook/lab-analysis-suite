@@ -144,6 +144,31 @@ jobs:
         working-directory: TauriApp
         run: npm run build
 
+      - name: Generate app icons
+        working-directory: TauriApp
+        run: npx tauri icon src-tauri/app-icon.png
+
+      - name: Ensure updater signing key (real secret or ephemeral)
+        working-directory: TauriApp
+        shell: bash
+        env:
+          SECRET_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          SECRET_PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$SECRET_KEY" ]; then
+            {
+              echo "TAURI_SIGNING_PRIVATE_KEY<<LASKEY"; echo "$SECRET_KEY"; echo "LASKEY"
+              echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$SECRET_PW"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::No TAURI_SIGNING_PRIVATE_KEY secret — generating an ephemeral key so the build completes. The in-app updater will NOT verify until you set a real key + matching pubkey in tauri.conf.json."
+            npx tauri signer generate -w "$RUNNER_TEMP/las_updater.key" -p ""
+            {
+              echo "TAURI_SIGNING_PRIVATE_KEY<<LASKEY"; cat "$RUNNER_TEMP/las_updater.key"; echo "LASKEY"
+              echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
+            } >> "$GITHUB_ENV"
+          fi
+
       # macOS: import a self-signed cert (if provided) for a STABLE identity.
       # Deliberately NOT named APPLE_SIGNING_IDENTITY so Tauri does not sign
       # with the hardened runtime (which enables library validation and breaks
@@ -176,9 +201,6 @@ jobs:
 
       - name: Build Tauri (with updater signing)
         working-directory: TauriApp
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build --bundles ${{ matrix.bundles }}
         shell: bash
 
@@ -186,9 +208,6 @@ jobs:
       # can dlopen), then rebuild the DMG + regenerate/re-sign the updater bundle.
       - name: Sign macOS app + rebuild artifacts
         if: runner.os == 'macOS'
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -e
           WS="$GITHUB_WORKSPACE"
