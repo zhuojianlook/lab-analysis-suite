@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
-import { AppBar, Box, Chip, Tab, Tabs, Toolbar, Tooltip, Typography } from "@mui/material";
+import { AppBar, Box, Chip, IconButton, Tab, Tabs, Toolbar, Tooltip, Typography } from "@mui/material";
 import ScienceIcon from "@mui/icons-material/Science";
+import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import { checkHealth, lastHealthError } from "../../api/client";
 import { useRStore } from "../../store/rStore";
+import { useUpdaterStore } from "../../store/updaterStore";
 import { RStatusBanner } from "../shared/RStatusBanner";
 import { RPackageGate } from "../shared/RPackageGate";
 import { QpcrView } from "../qpcr/QpcrView";
@@ -87,6 +89,11 @@ export function AppShell() {
             Lab Analysis Suite
           </Typography>
           <Box sx={{ flexGrow: 1 }} />
+          <Tooltip title="Check for updates">
+            <IconButton size="small" onClick={() => useUpdaterStore.getState().check(true)} sx={{ color: "text.secondary" }}>
+              <SystemUpdateAltIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
           {rChip}
           {healthChip}
         </Toolbar>
