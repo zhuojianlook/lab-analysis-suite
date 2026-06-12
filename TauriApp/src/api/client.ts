@@ -266,6 +266,74 @@ export async function plotBarXcelligence(body: Record<string, unknown>): Promise
   return apiJson<RunRResponse>("/api/xcelligence/plot-bar", "POST", JSON.stringify(body));
 }
 
+// ── Async R job (shared by DESeq2 / scRNA / Spatial / 16S) ──
+
+export interface RJobStatus {
+  status: "queued" | "running" | "done" | "error";
+  stage: string;
+  progress: number;
+  tail: string;
+  error: string | null;
+  plots: string[];
+  tables: { name: string; csv: string }[];
+}
+
+/** Poll an async R-job endpoint until done/error, reporting progress. */
+export async function pollRJob(
+  statusUrl: (jobId: string) => string,
+  jobId: string,
+  onProgress?: (s: RJobStatus) => void,
+  intervalMs = 2000,
+): Promise<RJobStatus> {
+  for (;;) {
+    const s = await apiJson<RJobStatus>(statusUrl(jobId));
+    onProgress?.(s);
+    if (s.status === "done" || s.status === "error") return s;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+/** Parse a simple CSV (DESeq2/job table output) into typed records. */
+export function parseCsv(csv: string): Record<string, string | number>[] {
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+  const header = lines[0].split(",");
+  return lines.slice(1).map((line) => {
+    const cells = line.split(",");
+    const o: Record<string, string | number> = {};
+    header.forEach((h, i) => {
+      const v = cells[i] ?? "";
+      if (v === "" || v === "NA") o[h] = NaN;
+      else {
+        const n = Number(v);
+        o[h] = isNaN(n) ? v : n;
+      }
+    });
+    return o;
+  });
+}
+
+// ── Bulk RNA-seq (DESeq2) ───────────────────────────────
+
+export interface RnaseqUploadResult {
+  token?: string;
+  n_genes?: number;
+  samples?: string[];
+  n_samples_matched?: number;
+  factors?: Record<string, string[]>;
+  error?: string;
+}
+
+export async function uploadRnaseq(countsCsv: string, coldataCsv: string): Promise<RnaseqUploadResult> {
+  return apiJson<RnaseqUploadResult>("/api/rnaseq/upload", "POST", JSON.stringify({ counts_csv: countsCsv, coldata_csv: coldataCsv }));
+}
+export async function runRnaseq(body: Record<string, unknown>): Promise<{ job_id?: string | null; error?: string }> {
+  return apiJson("/api/rnaseq/run", "POST", JSON.stringify(body));
+}
+export async function rnaseqStatus(jobId: string): Promise<RJobStatus> {
+  return apiJson<RJobStatus>(`/api/rnaseq/status/${encodeURIComponent(jobId)}`);
+}
+
 /** Check for + download + install an app update (Rust-driven). */
 export async function downloadAndInstallUpdate(manifestUrl: string): Promise<string> {
   const invoke = await getInvoke();
