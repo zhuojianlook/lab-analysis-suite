@@ -42,8 +42,10 @@ jobs:
             --hidden-import=uvicorn.lifespan.off \
             --hidden-import=multipart --hidden-import=multipart.multipart \
             --hidden-import=config --hidden-import=r_bridge \
+            --hidden-import=r_settings --hidden-import=r_packages --hidden-import=rjobs \
             --hidden-import=platemap --hidden-import=qpcr \
             --hidden-import=xcelligence --hidden-import=rnaseq \
+            --hidden-import=scrna --hidden-import=spatial --hidden-import=microbiome \
             --collect-all pandas --collect-all numpy --collect-all scipy \
             --collect-all statsmodels --collect-all openpyxl --collect-all xlsxwriter \
             --exclude-module matplotlib --exclude-module PIL \
