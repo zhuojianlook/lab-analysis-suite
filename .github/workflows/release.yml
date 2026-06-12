@@ -157,21 +157,17 @@ jobs:
           SECRET_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           SECRET_PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          KEYFILE="$RUNNER_TEMP/las_updater.key"
           if [ -n "$SECRET_KEY" ]; then
+            KEYFILE="$RUNNER_TEMP/las_updater.key"
             printf '%s' "$SECRET_KEY" > "$KEYFILE"
+            # Tauri accepts a path in TAURI_SIGNING_PRIVATE_KEY (avoids multiline-env issues).
+            echo "TAURI_SIGNING_PRIVATE_KEY=$KEYFILE" >> "$GITHUB_ENV"
             echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$SECRET_PW" >> "$GITHUB_ENV"
+            echo "Signing key provided — updater artifacts enabled."
           else
-            echo "::warning::No TAURI_SIGNING_PRIVATE_KEY secret — generating an ephemeral key so the build completes. The in-app updater will NOT verify across versions until you set a real key + matching pubkey in tauri.conf.json."
-            npx tauri signer generate -w "$KEYFILE" -p ""
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
-            # The committed pubkey is a placeholder (invalid base64) — inject the
-            # ephemeral key's matching pubkey so createUpdaterArtifacts succeeds.
-            PUB_B64=$(base64 < "$KEYFILE.pub" | tr -d '\n')
-            node -e 'const fs=require("fs");const p="src-tauri/tauri.conf.json";const c=JSON.parse(fs.readFileSync(p,"utf8"));c.plugins.updater.pubkey=process.argv[1];fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n");console.log("Injected ephemeral updater pubkey.");' "$PUB_B64"
+            echo "::warning::No TAURI_SIGNING_PRIVATE_KEY secret — disabling updater artifacts for this build. Installers are still produced. Set the secret + a valid pubkey in tauri.conf.json to enable the auto-updater across versions."
+            node -e 'const fs=require("fs");const p="src-tauri/tauri.conf.json";const c=JSON.parse(fs.readFileSync(p,"utf8"));c.bundle=c.bundle||{};c.bundle.createUpdaterArtifacts=false;fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n");console.log("createUpdaterArtifacts=false (no signing key).");'
           fi
-          # Tauri accepts a path in TAURI_SIGNING_PRIVATE_KEY (avoids multiline-env issues).
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEYFILE" >> "$GITHUB_ENV"
 
       # macOS: import a self-signed cert (if provided) for a STABLE identity.
       # Deliberately NOT named APPLE_SIGNING_IDENTITY so Tauri does not sign
@@ -235,9 +231,13 @@ jobs:
           ln -s /Applications "$STAGE/Applications"
           hdiutil create -volname "Lab Analysis Suite" -srcfolder "$STAGE" -ov -format UDZO "$DMG_DIR/$DMG_NAME"
           rm -rf "$STAGE"
-          # Regenerate + re-sign the updater bundle (.app.tar.gz) from the signed app.
-          ( cd "$MACOS_DIR" && rm -f "$APP_NAME.tar.gz" "$APP_NAME.tar.gz.sig" && COPYFILE_DISABLE=1 tar czf "$APP_NAME.tar.gz" "$APP_NAME" )
-          ( cd "$WS/TauriApp" && npx tauri signer sign "$MACOS_DIR/$APP_NAME.tar.gz" )
+          # Regenerate + re-sign the updater bundle only when a signing key is set.
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            ( cd "$MACOS_DIR" && rm -f "$APP_NAME.tar.gz" "$APP_NAME.tar.gz.sig" && COPYFILE_DISABLE=1 tar czf "$APP_NAME.tar.gz" "$APP_NAME" )
+            ( cd "$WS/TauriApp" && npx tauri signer sign "$MACOS_DIR/$APP_NAME.tar.gz" )
+          else
+            echo "No signing key — skipping updater bundle (.app.tar.gz)."
+          fi
           ls -la "$MACOS_DIR/"
         shell: bash
 
