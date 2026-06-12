@@ -84,10 +84,15 @@ app discovers it automatically; you can also set a custom path in-app).
 
 ## Status
 
-- [x] Phase 0 — scaffold + sidecar handshake (sidecar verified)
-- [x] Plate Mapper tab (export verified)
-- [~] Host-R refactor + R package system (manifests + binary installer done)
-- [ ] qPCR · xCELLigence · Bulk RNA-seq (DESeq2)
-- [ ] scRNA-seq · Spatial · 16S rRNA
-- [ ] CI/updater first green release · packaging per OS
+- [x] Phase 0 — scaffold + sidecar handshake
+- [x] Host-R refactor + R package system (pak/P3M binary installer)
+- [x] All 7 tabs: Plate Mapper · qPCR · xCELLigence · Bulk RNA-seq (DESeq2) ·
+      scRNA-seq · Spatial · 16S rRNA
+- [x] CI/updater release pipeline (3-OS GitHub Actions)
+- [ ] First green CI release + packaging/signing per OS (needs the setup tasks above)
+
+All Python analysis logic + the 34 sidecar routes are verified locally. The
+TypeScript/Tauri build and the R/ggplot/Seurat/DESeq2/DADA2 templates are
+verified when you build and run with Node + Rust + R installed (`npm install &&
+npm run tauri dev`).
 ```
