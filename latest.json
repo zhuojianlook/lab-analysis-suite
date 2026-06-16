@@ -1,10 +1,10 @@
 {
-  "version": "0.2.0",
-  "notes": "Update to v0.2.0",
-  "pub_date": "2026-06-16T02:59:26Z",
+  "version": "0.2.1",
+  "notes": "Update to v0.2.1",
+  "pub_date": "2026-06-16T03:28:09Z",
   "platforms": {
-    "darwin-aarch64": { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.0/" },
-    "windows-x86_64": { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.0/Lab.Analysis.Suite_0.2.0_x64-setup.exe" },
-    "linux-x86_64":   { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.0/Lab.Analysis.Suite_0.2.0_amd64.AppImage" }
+    "darwin-aarch64": { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.1/" },
+    "windows-x86_64": { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.1/Lab.Analysis.Suite_0.2.1_x64-setup.exe" },
+    "linux-x86_64":   { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.1/Lab.Analysis.Suite_0.2.1_amd64.AppImage" }
   }
 }
