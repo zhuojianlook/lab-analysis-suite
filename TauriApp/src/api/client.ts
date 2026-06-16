@@ -117,6 +117,18 @@ export async function checkHealth(): Promise<boolean> {
   }
 }
 
+/** The sidecar's captured startup stderr / exit info (for diagnostics when the
+ *  engine is down). Empty string in a browser dev preview. */
+export async function getSidecarError(): Promise<string> {
+  const invoke = await getInvoke();
+  if (!invoke) return "";
+  try {
+    return ((await invoke("get_sidecar_error", {})) as string | null) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 /** Is R (bundled or host) available to the sidecar? */
 export async function checkR(): Promise<CheckRResponse> {
   return apiJson<CheckRResponse>("/api/analysis/check-r");

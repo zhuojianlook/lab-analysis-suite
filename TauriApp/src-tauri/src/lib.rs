@@ -135,6 +135,21 @@ async fn download_and_install_update(
     Ok("Installed. Please restart the app to apply.".to_string())
 }
 
+/// Check a specific channel's manifest (stable or experimental) without
+/// installing. Returns {available, version, notes}.
+#[tauri::command]
+async fn check_update(app: tauri::AppHandle, manifest_url: String) -> Result<serde_json::Value, String> {
+    let url = url::Url::parse(&manifest_url).map_err(|e| format!("Invalid URL: {}", e))?;
+    let updater = app.updater_builder()
+        .endpoints(vec![url]).map_err(|e| format!("Failed to set endpoints: {}", e))?
+        .build().map_err(|e| format!("Failed to build updater: {}", e))?;
+    let update = updater.check().await.map_err(|e| format!("Update check failed: {}", e))?;
+    Ok(match update {
+        Some(u) => serde_json::json!({ "available": true, "version": u.version, "notes": u.body }),
+        None => serde_json::json!({ "available": false, "version": "", "notes": null }),
+    })
+}
+
 #[tauri::command]
 async fn save_base64_to_path(path: String, data_b64: String) -> Result<(), String> {
     let bytes = base64_decode(&data_b64).map_err(|e| format!("Base64 decode: {}", e))?;
@@ -443,6 +458,7 @@ pub fn run() {
       file_size,
       delete_file,
       open_url,
+      check_update,
       download_and_install_update,
       kill_sidecar
     ])

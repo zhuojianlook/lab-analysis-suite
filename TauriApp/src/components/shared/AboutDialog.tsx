@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   Box, Button, CircularProgress, Dialog, DialogActions, DialogContent,
-  DialogTitle, Divider, LinearProgress, Link, Stack, Typography,
+  DialogTitle, Divider, LinearProgress, Link, Stack, ToggleButton,
+  ToggleButtonGroup, Typography,
 } from "@mui/material";
 import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import { useUpdaterStore } from "../../store/updaterStore";
@@ -14,7 +15,7 @@ const REPO_URL = "https://github.com/zhuojianlook/lab-analysis-suite";
  *  Multi-Panel Figure Builder. Bound to the shared updaterStore so the toolbar
  *  startup snackbars stay in sync. */
 export function AboutDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { status, version: updVersion, progress, error, check, install, restart } = useUpdaterStore();
+  const { status, version: updVersion, progress, error, channel, setChannel, check, install, restart } = useUpdaterStore();
   const [appVersion, setAppVersion] = useState("…");
 
   useEffect(() => {
@@ -60,6 +61,19 @@ export function AboutDialog({ open, onClose }: { open: boolean; onClose: () => v
         <Divider sx={{ my: 2 }} />
 
         <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1 }}>
+          <ToggleButtonGroup
+            size="small"
+            exclusive
+            value={channel}
+            onChange={(_, v) => { if (v) setChannel(v); }}
+            disabled={status === "checking" || status === "downloading"}
+          >
+            <ToggleButton value="stable" sx={{ textTransform: "none", px: 2 }}>Stable</ToggleButton>
+            <ToggleButton value="experimental" sx={{ textTransform: "none", px: 2 }}>Experimental</ToggleButton>
+          </ToggleButtonGroup>
+          <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5 }}>
+            {channel === "experimental" ? "Experimental: early/test builds (exp-* tags)" : "Stable channel"}
+          </Typography>
           <Button
             variant="outlined"
             size="small"

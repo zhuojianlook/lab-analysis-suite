@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { AppBar, Box, Chip, IconButton, Tab, Tabs, Toolbar, Tooltip, Typography } from "@mui/material";
 import ScienceIcon from "@mui/icons-material/Science";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import { checkHealth, lastHealthError } from "../../api/client";
+import { checkHealth, lastHealthError, getSidecarError } from "../../api/client";
 import { useRStore } from "../../store/rStore";
 import { AboutDialog } from "../shared/AboutDialog";
 import { RStatusBanner } from "../shared/RStatusBanner";
@@ -31,11 +31,15 @@ export function AppShell() {
   const [tab, setTab] = useState(0);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [health, setHealth] = useState<Status>("checking");
+  const [engineErr, setEngineErr] = useState("");
   const rState = useRStore((s) => s.state);
   const recheckR = useRStore((s) => s.recheck);
 
-  // Poll sidecar health until it comes up (PyInstaller cold start can take a
-  // few seconds), then probe R once.
+  // Poll sidecar health until it comes up. The PyInstaller --onefile sidecar
+  // (pandas/scipy/statsmodels) extracts + imports on FIRST launch, which can
+  // take 30-90s on macOS — so poll fast for ~2 min, then keep slow-retrying so
+  // a late start still recovers. If it never comes up, surface the sidecar's
+  // captured stderr (the real reason) instead of a generic request error.
   useEffect(() => {
     let cancelled = false;
     let tries = 0;
@@ -44,26 +48,35 @@ export function AppShell() {
       if (cancelled) return;
       if (ok) {
         setHealth("ok");
+        setEngineErr("");
         recheckR();
         return;
       }
-      if (++tries > 30) {
+      tries += 1;
+      if (tries < 120) {
+        setHealth("checking");
+        setTimeout(poll, 1000);
+      } else {
         setHealth("down");
-        return;
+        if (!engineErr) {
+          const se = await getSidecarError();
+          if (!cancelled && se) setEngineErr(se);
+        }
+        setTimeout(poll, 5000);
       }
-      setTimeout(poll, 1000);
     };
     poll();
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recheckR]);
 
   const healthChip = {
     checking: <Chip size="small" color="default" label="Engine: starting…" />,
     ok: <Chip size="small" color="success" label="Engine: ready" />,
     down: (
-      <Tooltip title={lastHealthError || "Sidecar not reachable"}>
+      <Tooltip title={engineErr || lastHealthError || "Sidecar not reachable"}>
         <Chip size="small" color="error" label="Engine: down" />
       </Tooltip>
     ),
