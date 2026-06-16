@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
 import { AppBar, Box, Chip, IconButton, Tab, Tabs, Toolbar, Tooltip, Typography } from "@mui/material";
 import ScienceIcon from "@mui/icons-material/Science";
-import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { checkHealth, lastHealthError } from "../../api/client";
 import { useRStore } from "../../store/rStore";
-import { useUpdaterStore } from "../../store/updaterStore";
+import { AboutDialog } from "../shared/AboutDialog";
 import { RStatusBanner } from "../shared/RStatusBanner";
 import { RPackageGate } from "../shared/RPackageGate";
 import { QpcrView } from "../qpcr/QpcrView";
@@ -29,6 +29,7 @@ type Status = "checking" | "ok" | "down";
 
 export function AppShell() {
   const [tab, setTab] = useState(0);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const [health, setHealth] = useState<Status>("checking");
   const rState = useRStore((s) => s.state);
   const recheckR = useRStore((s) => s.recheck);
@@ -89,9 +90,9 @@ export function AppShell() {
             Lab Analysis Suite
           </Typography>
           <Box sx={{ flexGrow: 1 }} />
-          <Tooltip title="Check for updates">
-            <IconButton size="small" onClick={() => useUpdaterStore.getState().check(true)} sx={{ color: "text.secondary" }}>
-              <SystemUpdateAltIcon fontSize="small" />
+          <Tooltip title="About & updates">
+            <IconButton size="small" onClick={() => setAboutOpen(true)} sx={{ color: "text.secondary" }}>
+              <InfoOutlinedIcon fontSize="small" />
             </IconButton>
           </Tooltip>
           {rChip}
@@ -111,6 +112,7 @@ export function AppShell() {
       </AppBar>
       <RStatusBanner />
       <Box sx={{ flexGrow: 1, overflow: "auto", bgcolor: "background.default" }}>{TABS[tab].render()}</Box>
+      <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
     </Box>
   );
 }

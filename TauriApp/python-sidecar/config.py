@@ -6,7 +6,7 @@ tab modules. Kept deliberately tiny so importing it has no side effects.
 
 from typing import Optional
 
-APP_VERSION: str = "0.2.0"
+APP_VERSION: str = "0.2.1"
 
 # Absolute path to the bundled R engine directory (a relocated conda env),
 # passed by the Tauri shell as --r-env-dir. None in dev / browser preview,
