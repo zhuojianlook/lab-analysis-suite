@@ -35,7 +35,7 @@
       "endpoints": [
         "https://raw.githubusercontent.com/zhuojianlook/lab-analysis-suite/updater/latest.json"
       ],
-      "pubkey": "REPLACE_WITH_YOUR_MINISIGN_PUBKEY"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY2RjIzMkFDNjNDQTU2MEUKUldRT1ZzcGpyREx5WnV2eXVZQkNqNjhxL3htQVlpUTZHcHFFa2RSOHZ6UEw5MTZ6ODZDa2VRQnAK"
     }
   },
   "bundle": {
