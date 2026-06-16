@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import sys
 
+print("[api-server] booting (loading analysis libraries)…", flush=True)
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -108,7 +110,8 @@ def main():
     config.set_r_env_dir(args.r_env_dir)
 
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    print(f"[api-server] listening on http://{args.host}:{args.port}", flush=True)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

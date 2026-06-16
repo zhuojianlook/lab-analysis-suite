@@ -366,8 +366,10 @@ pub fn run() {
         {
           if let Ok(exe_path) = std::env::current_exe() {
             if let Some(macos_dir) = exe_path.parent() {
-              let sidecar_name = format!("api-server-{}-apple-darwin", std::env::consts::ARCH);
-              let sidecar_path = macos_dir.join(&sidecar_name);
+              // Tauri bundles the externalBin as the base name "api-server"
+              // in Contents/MacOS (triple suffix stripped), so strip quarantine
+              // from that. (The whole-.app strip below is the real safety net.)
+              let sidecar_path = macos_dir.join("api-server");
               let _ = std::process::Command::new("xattr")
                 .args(["-cr", &sidecar_path.to_string_lossy().to_string()])
                 .output();
