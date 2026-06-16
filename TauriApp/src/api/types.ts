@@ -25,6 +25,8 @@ export interface RunRResponse {
   plots: string[];
   /** CSV tables written by the R script via mpfig_data(df, name). */
   tables: { name: string; csv: string }[];
+  /** Publication exports (TIFF / transparent PNG) from mpfig_render(). */
+  exports?: { name: string; format: "png" | "tiff"; b64: string }[];
   labels?: Record<string, string>;
   svg?: string | null;
 }

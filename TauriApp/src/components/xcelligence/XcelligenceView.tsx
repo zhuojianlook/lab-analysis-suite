@@ -25,18 +25,32 @@ export function XcelligenceView() {
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
+  // shared export
+  const [exportFormat, setExportFormat] = useState<"png" | "tiff">("png");
+  const [transparent, setTransparent] = useState(false);
+
   // line
   const [lineSamples, setLineSamples] = useState<string[]>([]);
   const [colors, setColors] = useState<Record<string, string>>({});
   const [labels, setLabels] = useState<Record<string, string>>({});
   const [showSd, setShowSd] = useState(true);
   const [lineTitle, setLineTitle] = useState("Normalized Cell Index vs Time");
+  const [lineXlabel, setLineXlabel] = useState("Time (Hours)");
+  const [lineYlabel, setLineYlabel] = useState("Normalized Cell Index");
+  const [lineWidth, setLineWidth] = useState(1400);
+  const [lineHeight, setLineHeight] = useState(800);
+  const [lineDpi, setLineDpi] = useState(150);
   const [linePlot, setLinePlot] = useState<RunRResponse | null>(null);
 
   // bar
   const [barTime, setBarTime] = useState<number | "">("");
   const [barStats, setBarStats] = useState<XcellBarStats | null>(null);
   const [barTitle, setBarTitle] = useState("Endpoint comparison");
+  const [barXlabel, setBarXlabel] = useState("Condition");
+  const [barYlabel, setBarYlabel] = useState("Normalized Cell Index");
+  const [barWidth, setBarWidth] = useState(1200);
+  const [barHeight, setBarHeight] = useState(800);
+  const [barDpi, setBarDpi] = useState(150);
   const [barPlot, setBarPlot] = useState<RunRResponse | null>(null);
 
   const setP = (name: string, patch: Partial<FileParam>) =>
@@ -79,6 +93,8 @@ export function XcelligenceView() {
     try {
       setLinePlot(await plotLineXcelligence({
         token: upload.token, samples: lineSamples, colors, labels, show_sd: showSd, title: lineTitle,
+        xlabel: lineXlabel, ylabel: lineYlabel, width: lineWidth, height: lineHeight, dpi: lineDpi,
+        export_format: exportFormat, transparent,
       }));
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
   };
@@ -93,6 +109,8 @@ export function XcelligenceView() {
       setBarPlot(await plotBarXcelligence({
         summary: stats.summary, replicates: stats.replicates, comparisons: stats.comparisons,
         sample_order: lineSamples, colors, labels, title: barTitle,
+        xlabel: barXlabel, ylabel: barYlabel, width: barWidth, height: barHeight, dpi: barDpi,
+        export_format: exportFormat, transparent,
       }));
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
   };
@@ -162,6 +180,20 @@ export function XcelligenceView() {
               <FormControlLabel control={<Checkbox checked={showSd} onChange={(e) => setShowSd(e.target.checked)} />} label="±SD band" />
             </Stack>
             <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap sx={{ mb: 1 }}>
+              <TextField size="small" label="X label" value={lineXlabel} onChange={(e) => setLineXlabel(e.target.value)} sx={{ width: 150 }} />
+              <TextField size="small" label="Y label" value={lineYlabel} onChange={(e) => setLineYlabel(e.target.value)} sx={{ width: 170 }} />
+              <TextField size="small" type="number" label="Width (px)" value={lineWidth} onChange={(e) => setLineWidth(Number(e.target.value) || 1400)} inputProps={{ step: 100 }} sx={{ width: 110 }} />
+              <TextField size="small" type="number" label="Height (px)" value={lineHeight} onChange={(e) => setLineHeight(Number(e.target.value) || 800)} inputProps={{ step: 100 }} sx={{ width: 110 }} />
+              <TextField select size="small" label="DPI" value={lineDpi} onChange={(e) => setLineDpi(Number(e.target.value))} sx={{ width: 100 }}>
+                {[100, 150, 300, 600].map((d) => <MenuItem key={d} value={d}>{d}</MenuItem>)}
+              </TextField>
+              <TextField select size="small" label="Export" value={exportFormat} onChange={(e) => setExportFormat(e.target.value as "png" | "tiff")} sx={{ width: 110 }}>
+                <MenuItem value="png">PNG</MenuItem>
+                <MenuItem value="tiff">TIFF</MenuItem>
+              </TextField>
+              <FormControlLabel control={<Checkbox checked={transparent} onChange={(e) => setTransparent(e.target.checked)} />} label="Transparent bg" />
+            </Stack>
+            <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap sx={{ mb: 1 }}>
               {lineSamples.map((s) => (
                 <Stack key={s} direction="row" spacing={1} alignItems="center">
                   <input type="color" value={colors[s] ?? "#5a7fa8"} onChange={(e) => setColors({ ...colors, [s]: e.target.value })}
@@ -184,6 +216,13 @@ export function XcelligenceView() {
                 {proc.times_h.map((t) => <MenuItem key={t} value={t}>{t} h</MenuItem>)}
               </TextField>
               <TextField size="small" label="Title" value={barTitle} onChange={(e) => setBarTitle(e.target.value)} />
+              <TextField size="small" label="X label" value={barXlabel} onChange={(e) => setBarXlabel(e.target.value)} sx={{ width: 140 }} />
+              <TextField size="small" label="Y label" value={barYlabel} onChange={(e) => setBarYlabel(e.target.value)} sx={{ width: 170 }} />
+              <TextField size="small" type="number" label="Width (px)" value={barWidth} onChange={(e) => setBarWidth(Number(e.target.value) || 1200)} inputProps={{ step: 100 }} sx={{ width: 110 }} />
+              <TextField size="small" type="number" label="Height (px)" value={barHeight} onChange={(e) => setBarHeight(Number(e.target.value) || 800)} inputProps={{ step: 100 }} sx={{ width: 110 }} />
+              <TextField select size="small" label="DPI" value={barDpi} onChange={(e) => setBarDpi(Number(e.target.value))} sx={{ width: 100 }}>
+                {[100, 150, 300, 600].map((d) => <MenuItem key={d} value={d}>{d}</MenuItem>)}
+              </TextField>
               <Button variant="contained" disabled={barTime === "" || !lineSamples.length || busy === "bar"} onClick={doBar}>
                 {busy === "bar" ? <CircularProgress size={18} /> : "Compute + plot"}
               </Button>

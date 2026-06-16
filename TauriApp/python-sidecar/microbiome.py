@@ -85,7 +85,8 @@ class RunRequest(BaseModel):
     rarefy: bool = True
     tax_rank: str = "Genus"
     diff_method: str = "ancombc2"     # ancombc2 | none
-    build_tree: bool = False
+    build_tree: bool = False          # attach the supplied tree to the phyloseq object
+    beta_metric: str = "bray"         # bray | wunifrac | unifrac (UniFrac needs a tree)
     # DADA2 (fastq mode)
     trunc_len_f: int = 0
     trunc_len_r: int = 0
@@ -140,8 +141,24 @@ def _downstream(s: dict, body: RunRequest) -> str:
     grp = _resc(body.group_column)
     rank = _resc(body.tax_rank)
     rarefy = "TRUE" if body.rarefy else "FALSE"
+
+    # Beta-diversity distance. UniFrac variants require a phylogenetic tree; if
+    # one isn't available we attach nothing and fall back to Bray-Curtis so the
+    # selector never silently produces a misleading result.
+    has_tree = bool(s.get("tree"))
+    beta = str(body.beta_metric).lower()
+    if beta not in ("bray", "unifrac", "wunifrac"):
+        beta = "bray"
+    needs_tree = beta in ("unifrac", "wunifrac")
+    attach_tree = has_tree and (body.build_tree or needs_tree)
+    if needs_tree and not attach_tree:
+        beta = "bray"
+    dist_method = beta
+    dist_label = {"unifrac": "Unweighted UniFrac", "wunifrac": "Weighted UniFrac",
+                  "bray": "Bray-Curtis"}[dist_method]
+
     tree_block = ""
-    if body.build_tree and s.get("tree"):
+    if attach_tree:
         tree_block = f'TREE <- ape::read.tree("{_resc(s["tree"])}"); ps <- merge_phyloseq(ps, phyloseq::phy_tree(TREE))\n'
     diff_block = ""
     if body.diff_method == "ancombc2":
@@ -182,12 +199,13 @@ if ("{grp}" %in% colnames(rich)) {{
 
 las_stage("beta", 0.8)
 psr <- if ({rarefy}) rarefy_even_depth(ps, rngseed=1, verbose=FALSE) else ps
-ord <- ordinate(psr, method="PCoA", distance="bray")
+bc <- tryCatch(phyloseq::distance(psr, method="{dist_method}"),
+               error=function(e) {{ cat("Distance '{dist_method}' failed (", conditionMessage(e), "); falling back to Bray-Curtis\\n"); phyloseq::distance(psr, method="bray") }})
+ord <- ordinate(psr, method="PCoA", distance=bc)
 mpfig_plot()
 print(plot_ordination(psr, ord, color="{grp}") + geom_point(size=3) + theme_classic(base_size=13) +
-        ggtitle("PCoA (Bray-Curtis)"))
+        ggtitle("PCoA ({dist_label})"))
 mdf <- as(sample_data(psr), "data.frame")
-bc <- phyloseq::distance(psr, method="bray")
 perm <- tryCatch(vegan::adonis2(as.formula(paste("bc ~", "{grp}")), data=mdf),
                  error=function(e) {{ las_error(paste("PERMANOVA:", conditionMessage(e))); NULL }})
 if (!is.null(perm)) mpfig_data(as.data.frame(perm), "permanova")

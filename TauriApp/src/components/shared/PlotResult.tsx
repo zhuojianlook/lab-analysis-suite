@@ -17,27 +17,46 @@ export function PlotResult({ result, baseName = "plot" }: { result: RunRResponse
   if (!result.plots || result.plots.length === 0) {
     return <Alert severity="info" sx={{ mt: 1 }}>R ran successfully but produced no plot.</Alert>;
   }
+  const exports = result.exports ?? [];
   return (
     <Stack spacing={2} sx={{ mt: 1 }}>
-      {result.plots.map((b64, i) => (
-        <Box key={i}>
-          <Box
-            component="img"
-            src={`data:image/png;base64,${b64}`}
-            alt={`${baseName} ${i + 1}`}
-            sx={{ maxWidth: "100%", border: "1px solid", borderColor: "divider", borderRadius: 1, background: "#fff" }}
-          />
-          <Box sx={{ mt: 0.5 }}>
-            <Button
-              size="small"
-              startIcon={<DownloadIcon />}
-              onClick={() => saveDownload(`${baseName}_${i + 1}.png`, b64, "image/png")}
-            >
-              Download PNG
-            </Button>
+      {result.plots.map((b64, i) => {
+        const exp = exports[i];
+        return (
+          <Box key={i}>
+            <Box
+              component="img"
+              src={`data:image/png;base64,${b64}`}
+              alt={`${baseName} ${i + 1}`}
+              sx={{ maxWidth: "100%", border: "1px solid", borderColor: "divider", borderRadius: 1, background: "#fff" }}
+            />
+            <Box sx={{ mt: 0.5, display: "flex", gap: 1, flexWrap: "wrap" }}>
+              <Button
+                size="small"
+                startIcon={<DownloadIcon />}
+                onClick={() => saveDownload(`${baseName}_${i + 1}.png`, b64, "image/png")}
+              >
+                Download PNG
+              </Button>
+              {exp && (
+                <Button
+                  size="small"
+                  startIcon={<DownloadIcon />}
+                  onClick={() =>
+                    saveDownload(
+                      `${baseName}_${i + 1}.${exp.format === "tiff" ? "tiff" : "png"}`,
+                      exp.b64,
+                      exp.format === "tiff" ? "image/tiff" : "image/png",
+                    )
+                  }
+                >
+                  Download {exp.format === "tiff" ? "TIFF" : "PNG"} (export)
+                </Button>
+              )}
+            </Box>
           </Box>
-        </Box>
-      ))}
+        );
+      })}
     </Stack>
   );
 }

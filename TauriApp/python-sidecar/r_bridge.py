@@ -144,10 +144,11 @@ def _r_env(rscript: str, is_bundled: bool) -> Optional[dict]:
 
 # ── R prelude (helpers injected before every user script) ───────────────────
 
-def _r_prelude(data_path: str, plot_dir: str, table_dir: str) -> str:
+def _r_prelude(data_path: str, plot_dir: str, table_dir: str, export_dir: str) -> str:
     dp = data_path.replace("\\", "/")
     pd_ = plot_dir.replace("\\", "/")
     td = table_dir.replace("\\", "/")
+    ed = export_dir.replace("\\", "/")
     return f"""
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 # Load the data CSV the sidecar wrote.
@@ -155,14 +156,39 @@ data <- if (file.exists("{dp}") && file.info("{dp}")$size > 1) read.csv("{dp}", 
 
 .plot_dir <- "{pd_}"
 .table_dir <- "{td}"
+.export_dir <- "{ed}"
 .plot_count <- 0
+.export_count <- 0
 
 # Open a PNG device for the next plot. Call before each ggplot print().
-mpfig_plot <- function(filename = NULL, width = 1200, height = 900, res = 150) {{
+# bg may be "white" (default) or "transparent".
+mpfig_plot <- function(filename = NULL, width = 1200, height = 900, res = 150, bg = "white") {{
   while (dev.cur() > 1) try(dev.off(), silent = TRUE)
   .plot_count <<- .plot_count + 1
   if (is.null(filename)) filename <- sprintf("plot_%02d.png", .plot_count)
-  grDevices::png(file.path(.plot_dir, filename), width = width, height = height, res = res)
+  grDevices::png(file.path(.plot_dir, filename), width = width, height = height, res = res, bg = bg)
+}}
+
+# Render a ggplot object to (a) a PNG preview the WebView can display, and
+# (b) an optional publication export in the requested format / background.
+# format: "png" | "tiff" ; bg: "white" | "transparent".
+mpfig_render <- function(p, width = 1200, height = 900, res = 150, format = "png", bg = "white") {{
+  mpfig_plot(width = width, height = height, res = res, bg = "white")
+  print(p)
+  while (dev.cur() > 1) try(dev.off(), silent = TRUE)
+  fmt <- tolower(as.character(format))
+  if (fmt %in% c("tiff", "tif") || !identical(bg, "white")) {{
+    .export_count <<- .export_count + 1
+    ext <- if (fmt %in% c("tiff", "tif")) "tiff" else "png"
+    ef <- file.path(.export_dir, sprintf("export_%02d.%s", .export_count, ext))
+    if (ext == "tiff") {{
+      grDevices::tiff(ef, width = width, height = height, res = res, bg = bg, compression = "lzw")
+    }} else {{
+      grDevices::png(ef, width = width, height = height, res = res, bg = bg)
+    }}
+    print(p)
+    while (dev.cur() > 1) try(dev.off(), silent = TRUE)
+  }}
 }}
 
 # Write a data.frame out as a result table the UI can show / download.
@@ -238,10 +264,12 @@ def run_r(body: RunRRequest):
             f.write((body.data_csv or "").rstrip() + "\n")
         plot_dir = os.path.join(tmpdir, "plots")
         table_dir = os.path.join(tmpdir, "tables")
+        export_dir = os.path.join(tmpdir, "exports")
         os.makedirs(plot_dir, exist_ok=True)
         os.makedirs(table_dir, exist_ok=True)
+        os.makedirs(export_dir, exist_ok=True)
 
-        script = _r_prelude(data_path, plot_dir, table_dir)
+        script = _r_prelude(data_path, plot_dir, table_dir, export_dir)
         script += "\n# ── user code ──\n" + body.code + "\n"
         script += "\nwhile (dev.cur() > 1) try(dev.off(), silent = TRUE)\n"
 
@@ -277,12 +305,25 @@ def run_r(body: RunRRequest):
             except Exception as _e:  # noqa: BLE001
                 print(f"[run-r] failed to read table {csv_path}: {_e}", file=sys.stderr, flush=True)
 
+        # Publication exports (TIFF / transparent PNG) written via mpfig_render().
+        exports_out = []
+        for exp_path in sorted(glob_mod.glob(os.path.join(export_dir, "*"))):
+            ext = os.path.splitext(exp_path)[1].lower().lstrip(".")
+            fmt = "tiff" if ext in ("tiff", "tif") else "png"
+            with open(exp_path, "rb") as ef:
+                exports_out.append({
+                    "name": os.path.splitext(os.path.basename(exp_path))[0],
+                    "format": fmt,
+                    "b64": base64.b64encode(ef.read()).decode(),
+                })
+
         return {
             "success": result.returncode == 0,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "plots": plots_b64,
             "tables": tables_out,
+            "exports": exports_out,
         }
 
 

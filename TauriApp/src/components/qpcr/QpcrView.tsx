@@ -51,6 +51,10 @@ export function QpcrView() {
   const [ylabel, setYlabel] = useState("Fold change");
   const [fontSize, setFontSize] = useState(14);
   const [dpi, setDpi] = useState(150);
+  const [plotWidth, setPlotWidth] = useState(1200);
+  const [plotHeight, setPlotHeight] = useState(800);
+  const [exportFormat, setExportFormat] = useState<"png" | "tiff">("png");
+  const [transparent, setTransparent] = useState(false);
   const [sigLevel, setSigLevel] = useState(0.05);
   const [hideNs, setHideNs] = useState(true);
   const [colors, setColors] = useState<Record<string, string>>({});
@@ -127,9 +131,11 @@ export function QpcrView() {
         xlabel,
         ylabel,
         font_size: fontSize,
-        width: 1200,
-        height: 800,
+        width: plotWidth,
+        height: plotHeight,
         dpi,
+        export_format: exportFormat,
+        transparent,
       });
       setPlot(res);
     } catch (e) {
@@ -268,6 +274,16 @@ export function QpcrView() {
             <TextField size="small" type="number" label="Sig. level" value={sigLevel}
               onChange={(e) => setSigLevel(Number(e.target.value) || 0.05)} inputProps={{ step: 0.01 }} sx={{ width: 100 }} />
             <FormControlLabel control={<Checkbox checked={hideNs} onChange={(e) => setHideNs(e.target.checked)} />} label="Hide ns" />
+            <TextField size="small" type="number" label="Width (px)" value={plotWidth}
+              onChange={(e) => setPlotWidth(Number(e.target.value) || 1200)} inputProps={{ step: 100 }} sx={{ width: 110 }} />
+            <TextField size="small" type="number" label="Height (px)" value={plotHeight}
+              onChange={(e) => setPlotHeight(Number(e.target.value) || 800)} inputProps={{ step: 100 }} sx={{ width: 110 }} />
+            <TextField select size="small" label="Export" value={exportFormat}
+              onChange={(e) => setExportFormat(e.target.value as "png" | "tiff")} sx={{ width: 110 }}>
+              <MenuItem value="png">PNG</MenuItem>
+              <MenuItem value="tiff">TIFF</MenuItem>
+            </TextField>
+            <FormControlLabel control={<Checkbox checked={transparent} onChange={(e) => setTransparent(e.target.checked)} />} label="Transparent bg" />
           </Stack>
 
           <Divider sx={{ my: 1 }} />

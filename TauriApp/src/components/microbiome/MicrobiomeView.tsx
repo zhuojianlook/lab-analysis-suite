@@ -21,7 +21,7 @@ export function MicrobiomeView() {
   const [rarefy, setRarefy] = useState(true);
   const [taxRank, setTaxRank] = useState("Genus");
   const [diffMethod, setDiffMethod] = useState("ancombc2");
-  const [buildTree, setBuildTree] = useState(false);
+  const [betaMetric, setBetaMetric] = useState("bray");
   const [truncF, setTruncF] = useState(0);
   const [truncR, setTruncR] = useState(0);
   const [trimLeft, setTrimLeft] = useState(0);
@@ -47,7 +47,8 @@ export function MicrobiomeView() {
     try {
       const { job_id, error } = await runJob("microbiome", {
         token, group_column: groupCol, rarefy, tax_rank: taxRank, diff_method: diffMethod,
-        build_tree: buildTree, trunc_len_f: truncF, trunc_len_r: truncR, trim_left: trimLeft,
+        beta_metric: betaMetric, build_tree: betaMetric !== "bray",
+        trunc_len_f: truncF, trunc_len_r: truncR, trim_left: trimLeft,
       });
       if (!job_id) { setErr(error || "Could not start the run."); return; }
       const final = await pollRJob((id) => `/api/microbiome/status/${id}`, job_id, setJob);
@@ -113,7 +114,13 @@ export function MicrobiomeView() {
               <MenuItem value="ancombc2">ANCOM-BC2</MenuItem><MenuItem value="none">None</MenuItem>
             </TextField>
             <FormControlLabel control={<Checkbox checked={rarefy} onChange={(e) => setRarefy(e.target.checked)} />} label="Rarefy (alpha/beta)" />
-            <FormControlLabel control={<Checkbox checked={buildTree} onChange={(e) => setBuildTree(e.target.checked)} />} label="Use tree (UniFrac)" />
+            <TextField select size="small" label="Beta-diversity distance" value={betaMetric}
+              onChange={(e) => setBetaMetric(e.target.value)} sx={{ minWidth: 200 }}
+              helperText={betaMetric !== "bray" ? "Requires a phylogenetic tree" : " "}>
+              <MenuItem value="bray">Bray-Curtis</MenuItem>
+              <MenuItem value="wunifrac">Weighted UniFrac</MenuItem>
+              <MenuItem value="unifrac">Unweighted UniFrac</MenuItem>
+            </TextField>
           </Stack>
           <Box sx={{ mt: 1.5 }}>
             <Button variant="contained" disabled={!groupCol || busy === "run"} onClick={doRun}>

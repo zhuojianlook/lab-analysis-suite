@@ -355,6 +355,14 @@ export async function rnaseqStatus(jobId: string): Promise<RJobStatus> {
   return apiJson<RJobStatus>(`/api/rnaseq/status/${encodeURIComponent(jobId)}`);
 }
 
+/** Re-render only the volcano from an existing results table at new padj /
+ *  |log2FC| thresholds (no DESeq2 re-run). */
+export async function replotVolcano(body: {
+  results_csv: string; padj: number; lfc: number; top_n?: number; title?: string;
+}): Promise<RunRResponse> {
+  return apiJson<RunRResponse>("/api/rnaseq/volcano", "POST", JSON.stringify(body));
+}
+
 /** Check for + download + install an app update (Rust-driven). */
 export async function downloadAndInstallUpdate(manifestUrl: string): Promise<string> {
   const invoke = await getInvoke();

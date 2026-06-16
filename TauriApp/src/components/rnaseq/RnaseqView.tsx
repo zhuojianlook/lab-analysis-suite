@@ -6,9 +6,10 @@ import {
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import { DataGrid, type GridColDef } from "@mui/x-data-grid";
 import {
-  uploadRnaseq, runRnaseq, rnaseqStatus, pollRJob, parseCsv,
+  uploadRnaseq, runRnaseq, rnaseqStatus, pollRJob, parseCsv, replotVolcano,
   type RnaseqUploadResult, type RJobStatus,
 } from "../../api/client";
+import type { RunRResponse } from "../../api/types";
 import { JobProgress } from "../shared/JobProgress";
 import { PlotResult } from "../shared/PlotResult";
 
@@ -31,6 +32,7 @@ export function RnaseqView() {
   const [job, setJob] = useState<RJobStatus | null>(null);
   const [padjMax, setPadjMax] = useState(0.05);
   const [lfcMin, setLfcMin] = useState(1);
+  const [volcano, setVolcano] = useState<RunRResponse | null>(null);
 
   const factorLevels = upload?.factors?.[factor] ?? [];
 
@@ -52,7 +54,7 @@ export function RnaseqView() {
 
   const doRun = async () => {
     if (!upload?.token || !factor || !num || !den) return;
-    setBusy("run"); setErr(null); setJob(null);
+    setBusy("run"); setErr(null); setJob(null); setVolcano(null);
     try {
       const { job_id, error } = await runRnaseq({
         token: upload.token, design: design || factor,
@@ -88,6 +90,14 @@ export function RnaseqView() {
         typeof v === "number" ? (isNaN(v) ? "" : Math.abs(v) < 1e-3 && v !== 0 ? v.toExponential(2) : v.toFixed(3)) : v,
     }));
   }, [allRows]);
+
+  const doVolcano = async () => {
+    if (!resultsCsv) return;
+    setBusy("volcano"); setErr(null);
+    try {
+      setVolcano(await replotVolcano({ results_csv: resultsCsv, padj: padjMax, lfc: lfcMin, top_n: 15 }));
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); } finally { setBusy(null); }
+  };
 
   const jobPlots = job?.status === "done" ? { success: true, stdout: "", stderr: "", plots: job.plots, tables: [] } : null;
 
@@ -155,7 +165,15 @@ export function RnaseqView() {
             <TextField size="small" type="number" label="padj ≤" value={padjMax} onChange={(e) => setPadjMax(Number(e.target.value) || 1)} inputProps={{ step: 0.01 }} sx={{ width: 110 }} />
             <TextField size="small" type="number" label="|log2FC| ≥" value={lfcMin} onChange={(e) => setLfcMin(Number(e.target.value) || 0)} inputProps={{ step: 0.5 }} sx={{ width: 120 }} />
             <Typography variant="caption" color="text.secondary">{filtered.length} of {allRows.length} genes pass</Typography>
+            <Button size="small" variant="outlined" disabled={!resultsCsv || busy === "volcano"} onClick={doVolcano}>
+              {busy === "volcano" ? <CircularProgress size={16} /> : "Re-render volcano at these thresholds"}
+            </Button>
           </Stack>
+          {volcano && (
+            <Box sx={{ mb: 1 }}>
+              <PlotResult result={volcano} baseName="deseq2_volcano" />
+            </Box>
+          )}
           {allRows.length > 0 && (
             <Box sx={{ height: 360, width: "100%" }}>
               <DataGrid

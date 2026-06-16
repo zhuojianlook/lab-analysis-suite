@@ -203,6 +203,8 @@ class PlotRequest(BaseModel):
     width: int = 1200
     height: int = 800
     dpi: int = 150
+    export_format: str = "png"                 # png | tiff (publication export)
+    transparent: bool = False                  # transparent background on export
 
 
 def _resc(s: str) -> str:
@@ -259,6 +261,17 @@ def plot(body: PlotRequest):
     colors = [body.colors.get(s, "#888888") for s in body.sample_order]
     labels = [body.labels.get(s, s) for s in body.sample_order]
 
+    export_fmt = "tiff" if str(body.export_format).lower() in ("tiff", "tif") else "png"
+    bg = "transparent" if body.transparent else "white"
+    transparent_theme = (
+        " + theme(plot.background=element_rect(fill='transparent', colour=NA), "
+        "panel.background=element_rect(fill='transparent', colour=NA), "
+        "legend.background=element_rect(fill='transparent', colour=NA), "
+        "legend.box.background=element_rect(fill='transparent', colour=NA), "
+        "legend.key=element_rect(fill='transparent', colour=NA))"
+        if body.transparent else ""
+    )
+
     # bracket data.frame as an inline R literal
     if brackets:
         bg = _r_vec([b[0] for b in brackets])
@@ -290,8 +303,8 @@ p <- ggplot(data, aes(x=Sample, y=mean, fill=Sample)) +
   theme_classic(base_size={int(body.font_size)}) +
   theme(axis.text.x=element_text(angle=45, hjust=1))
 {bracket_block}
-mpfig_plot(width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)})
-print(p)
+p <- p{transparent_theme}
+mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
 mpfig_data(data, "qpcr_plot_data")
 """
     summary_csv = sdf.to_csv(index=False)

@@ -17,6 +17,7 @@ import pandas as pd
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+import r_bridge
 import rjobs
 
 router = APIRouter()
@@ -26,6 +27,36 @@ _SESS: Dict[str, dict] = {}
 
 def _resc(s: str) -> str:
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _volcano_ggplot(src: str, padj: float, lfc: float, top_n: int, title: str) -> str:
+    """R that draws a volcano from a results data.frame `src` (cols include
+    gene, log2FoldChange, pvalue, padj), colouring Up/Down/NS by the given
+    padj + |log2FC| thresholds and labelling the top_n hits with ggrepel.
+    Opens its own device via mpfig_plot(); caller stages around it."""
+    t = _resc(title)
+    return f'''
+.vdf <- {src}
+if (!"gene" %in% colnames(.vdf)) .vdf$gene <- rownames(.vdf)
+.vdf$neglog10p <- -log10(.vdf$pvalue)
+.vdf$sig <- ifelse(!is.na(.vdf$padj) & .vdf$padj < {padj} & abs(.vdf$log2FoldChange) > {lfc},
+                   ifelse(.vdf$log2FoldChange > 0, "Up", "Down"), "NS")
+.lab <- subset(.vdf, sig != "NS" & !is.na(padj))
+.lab <- .lab[order(.lab$padj), ]
+if (nrow(.lab) > {int(top_n)}) .lab <- .lab[1:{int(top_n)}, ]
+suppressMessages(library(ggplot2))
+.gg <- ggplot(.vdf, aes(log2FoldChange, neglog10p, colour=sig)) +
+  geom_point(size=0.7, alpha=0.7) +
+  scale_colour_manual(values=c(Up="#c1666b", Down="#5a7fa8", NS="grey70")) +
+  geom_vline(xintercept=c(-{lfc}, {lfc}), linetype="dashed") +
+  geom_hline(yintercept=-log10({padj}), linetype="dashed") +
+  labs(title="{t}", x="log2 fold change", y="-log10 p-value", colour=NULL) +
+  theme_classic(base_size=14)
+if (requireNamespace("ggrepel", quietly=TRUE) && nrow(.lab) > 0)
+  .gg <- .gg + ggrepel::geom_text_repel(data=.lab, aes(label=gene), size=3, max.overlaps=20, show.legend=FALSE)
+mpfig_plot()
+print(.gg)
+'''
 
 
 class UploadRequest(BaseModel):
@@ -83,6 +114,7 @@ def _deseq2_code(body: RunRequest) -> str:
     den = _resc(body.contrast_denominator)
     design = _resc(body.design.strip() or body.contrast_factor)
     shrink = "TRUE" if body.lfc_shrink else "FALSE"
+    volcano = _volcano_ggplot("resdf", 0.05, 1.0, 15, "Volcano")
     return f'''
 las_stage("loading", 0.05)
 counts <- as.matrix(read.csv("counts.csv", row.names=1, check.names=FALSE))
@@ -110,19 +142,7 @@ resdf <- resdf[order(resdf$padj), ]
 mpfig_data(resdf, "deseq2_results")
 
 las_stage("plots", 0.75)
-vdf <- resdf
-vdf$neglog10p <- -log10(vdf$pvalue)
-vdf$sig <- ifelse(!is.na(vdf$padj) & vdf$padj < 0.05 & abs(vdf$log2FoldChange) > 1,
-                  ifelse(vdf$log2FoldChange > 0, "Up", "Down"), "NS")
-mpfig_plot()
-print(ggplot(vdf, aes(log2FoldChange, neglog10p, colour=sig)) +
-        geom_point(size=0.7, alpha=0.7) +
-        scale_colour_manual(values=c(Up="#c1666b", Down="#5a7fa8", NS="grey70")) +
-        geom_vline(xintercept=c(-1, 1), linetype="dashed") +
-        geom_hline(yintercept=-log10(0.05), linetype="dashed") +
-        labs(title="Volcano", x="log2 fold change", y="-log10 p-value", colour=NULL) +
-        theme_classic(base_size=14))
-
+{volcano}
 mpfig_plot()
 print(ggplot(resdf, aes(baseMean, log2FoldChange, colour=(!is.na(padj) & padj < 0.05))) +
         geom_point(size=0.6, alpha=0.6) + scale_x_log10() +
@@ -170,3 +190,19 @@ def run(body: RunRequest):
 @router.get("/api/rnaseq/status/{job_id}")
 def status(job_id: str):
     return rjobs.status(job_id)
+
+
+class VolcanoRequest(BaseModel):
+    results_csv: str                # the deseq2_results table CSV
+    padj: float = 0.05
+    lfc: float = 1.0
+    top_n: int = 15
+    title: str = "Volcano"
+
+
+@router.post("/api/rnaseq/volcano")
+def volcano(body: VolcanoRequest):
+    """Re-render only the volcano from an existing results table at new padj /
+    |log2FC| thresholds — no DESeq2 re-run. Synchronous via the R bridge."""
+    code = _volcano_ggplot("data", body.padj, body.lfc, body.top_n, body.title)
+    return r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=body.results_csv, timeout_sec=120))

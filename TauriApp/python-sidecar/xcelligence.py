@@ -266,6 +266,23 @@ class LinePlotRequest(BaseModel):
     width: int = 1400
     height: int = 800
     dpi: int = 150
+    export_format: str = "png"                 # png | tiff
+    transparent: bool = False
+
+
+def _export_bits(export_format: str, transparent: bool):
+    """Return (export_fmt, bg, transparent_theme_suffix) for the R template."""
+    fmt = "tiff" if str(export_format).lower() in ("tiff", "tif") else "png"
+    bg = "transparent" if transparent else "white"
+    suffix = (
+        " + theme(plot.background=element_rect(fill='transparent', colour=NA), "
+        "panel.background=element_rect(fill='transparent', colour=NA), "
+        "legend.background=element_rect(fill='transparent', colour=NA), "
+        "legend.box.background=element_rect(fill='transparent', colour=NA), "
+        "legend.key=element_rect(fill='transparent', colour=NA))"
+        if transparent else ""
+    )
+    return fmt, bg, suffix
 
 
 @router.post("/api/xcelligence/plot-line")
@@ -290,6 +307,7 @@ def plot_line(body: LinePlotRequest):
 
     colors = [body.colors.get(s, "#5a7fa8") for s in body.samples]
     labels = [body.labels.get(s, s) for s in body.samples]
+    export_fmt, bg, transparent_theme = _export_bits(body.export_format, body.transparent)
     ribbon = (
         "  geom_ribbon(aes(ymin=mean-sd, ymax=mean+sd, fill=Sample), alpha=0.18, colour=NA) +\n"
         if body.show_sd else ""
@@ -305,8 +323,8 @@ p <- ggplot(data, aes(x=Time_h, y=mean, colour=Sample)) +
   scale_fill_manual(values=.cols, labels=.labs) +
   labs(title="{_resc(body.title)}", x="{_resc(body.xlabel)}", y="{_resc(body.ylabel)}", colour=NULL, fill=NULL) +
   theme_classic(base_size=14) + theme(legend.position="bottom")
-mpfig_plot(width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)})
-print(p)
+p <- p{transparent_theme}
+mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
 mpfig_data(data, "xcelligence_line_data")
 """
     return r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=df.to_csv(index=False), timeout_sec=120))
@@ -325,6 +343,8 @@ class BarPlotRequest(BaseModel):
     width: int = 1200
     height: int = 800
     dpi: int = 150
+    export_format: str = "png"                 # png | tiff
+    transparent: bool = False
 
 
 @router.post("/api/xcelligence/plot-bar")
@@ -346,6 +366,7 @@ def plot_bar(body: BarPlotRequest):
 
     colors = [body.colors.get(s, "#5a7fa8") for s in body.sample_order]
     labels = [body.labels.get(s, s) for s in body.sample_order]
+    export_fmt, bg, transparent_theme = _export_bits(body.export_format, body.transparent)
     rep_df = pd.DataFrame(body.replicates)
     rep_csv_inline = ""
     if not rep_df.empty:
@@ -380,8 +401,8 @@ p <- ggplot(data, aes(x=Sample, y=mean, fill=Sample)) +
   labs(title="{_resc(body.title)}", x="{_resc(body.xlabel)}", y="{_resc(body.ylabel)}", fill=NULL) +
   theme_classic(base_size=14) + theme(axis.text.x=element_text(angle=45, hjust=1))
 {rep_csv_inline}{bracket_block}
-mpfig_plot(width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)})
-print(p)
+p <- p{transparent_theme}
+mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
 mpfig_data(data, "xcelligence_bar_data")
 """
     return r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=sdf.to_csv(index=False), timeout_sec=120))
