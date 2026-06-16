@@ -214,20 +214,20 @@ jobs:
           MACOS_DIR="$WS/TauriApp/src-tauri/target/release/bundle/macos"
           APP_PATH=$(find "$MACOS_DIR" -maxdepth 1 -name "*.app")
           APP_NAME=$(basename "$APP_PATH")
-          # Tauri already ad-hoc-signs the .app (no hardened runtime) and, with a
-          # signing key set, produces a signed .app.tar.gz updater bundle. Only
-          # when a REAL Apple cert identity is provided do we re-sign without the
-          # hardened runtime (so the bundled sidecar can dlopen) and regenerate +
-          # re-sign the updater bundle from the modified .app.
-          if [ -n "${LAS_SIGN_IDENTITY:-}" ]; then
-            echo "Re-signing with '$LAS_SIGN_IDENTITY' (deep, no hardened runtime)"
-            codesign --force --deep -s "$LAS_SIGN_IDENTITY" "$APP_PATH"
-            codesign --verify --deep "$APP_PATH" && echo "Signature valid"
-            if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -f "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
-              ( cd "$MACOS_DIR" && rm -f "$APP_NAME.tar.gz" "$APP_NAME.tar.gz.sig" && COPYFILE_DISABLE=1 tar czf "$APP_NAME.tar.gz" "$APP_NAME" )
-              # `tauri signer sign` reads the env var as the key STRING (not a path).
-              ( cd "$WS/TauriApp" && TAURI_SIGNING_PRIVATE_KEY="$(cat "$TAURI_SIGNING_PRIVATE_KEY")" npx tauri signer sign "$MACOS_DIR/$APP_NAME.tar.gz" )
-            fi
+          # ALWAYS (re)sign so the signature is valid over ALL nested binaries
+          # (the api-server sidecar + dylibs). An incomplete seal makes macOS
+          # report the app as "damaged" on Apple Silicon. Real cert if provided,
+          # else ad-hoc ("-"). NO hardened runtime so the sidecar can dlopen.
+          ID="${LAS_SIGN_IDENTITY:--}"
+          echo "Signing $APP_NAME with identity '$ID' (deep, no hardened runtime)"
+          codesign --force --deep -s "$ID" "$APP_PATH"
+          codesign --verify --deep "$APP_PATH" && echo "Signature valid"
+          # Re-signing changed the .app → regenerate + re-sign the updater bundle
+          # when an updater key is present (env holds the key file PATH; the
+          # signer wants the key STRING, so pass its contents).
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -f "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            ( cd "$MACOS_DIR" && rm -f "$APP_NAME.tar.gz" "$APP_NAME.tar.gz.sig" && COPYFILE_DISABLE=1 tar czf "$APP_NAME.tar.gz" "$APP_NAME" )
+            ( cd "$WS/TauriApp" && TAURI_SIGNING_PRIVATE_KEY="$(cat "$TAURI_SIGNING_PRIVATE_KEY")" npx tauri signer sign "$MACOS_DIR/$APP_NAME.tar.gz" )
           fi
           # Build the DMG from the .app for manual download (Tauri's own DMG
           # bundler is skipped on CI — flaky on the runner).
