@@ -1,0 +1,10 @@
+{
+  "version": "0.2.6",
+  "notes": "Update to exp-0.2.6",
+  "pub_date": "2026-06-17T06:35:24Z",
+  "platforms": {
+    "darwin-aarch64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5Wm1kRFdhTEpQUXBneXBXRFRBZ3pESW5GWjJ4cEEzcHU4ZXByN3AzVU1xanBKMjR1cjliYlRDTi9hWjQvUnlUNmtDaVFxaGJURnNKbTB6MW1oSWRsT0FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNjc3NzE0CWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlLmFwcC50YXIuZ3oKWDRNcE1RWXNVVzJjb0JaT2ZxdTBuUzhnSWdVaG9BSmdpazRMNHU3T0ZtaXlrWEJnYWxIc3I5SDJ0NUVzbzRab1JpbWZFbXRTaCtJN2luTE1xU2ptQWc9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.6/Lab.Analysis.Suite.app.tar.gz" },
+    "windows-x86_64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5Wm9FNVpUdkNBYmV6K0hocVhzT3hJUThrTjkwcXIyQ1ZKSHc2K3B5aWc1WWlpTkFtR05ZOVNpaW14eVNWTmg1RktFbGVuaHNGUGNGWEhCbTZoN1VjaVFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNjc4MTAwCWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlXzAuMi42X3g2NC1zZXR1cC5leGUKNkxNMnYrY2dJN1ZEME9qTnZEaElkNjBlYkNrYnNrWnRRdDRpOGRRcDNyWGFDa2d6eWo0TG93SEo5VkNNNUVJTDhZWEkrSnIwWU5mcGlpenFicnZVQXc9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.6/Lab.Analysis.Suite_0.2.6_x64-setup.exe" },
+    "linux-x86_64":   { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WmlQcFBrclVXV29ZVGNXMDU3K3crMUJqbm9WZTB4OGkrb3lJVHhwb1I0QjFtV1Y3eS82VHRiWDM3WHFEUlRVZ2hCZnhwNEE1WjlZenpyTEpGYzEvSGdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNjc3ODk0CWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlXzAuMi42X2FtZDY0LkFwcEltYWdlCmxVTWtVdlY2T0xUMEl4dlZDdkJVKzdPN09IdXFxaExKRE5jZEo1QkJ1UzNUa2tCNzIybWZGd25wVHNHYzlPZXdOSitYT1FLbFhoOEJwZFhsaGQ0YkN3PT0K", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.6/Lab.Analysis.Suite_0.2.6_amd64.AppImage" }
+  }
+}
