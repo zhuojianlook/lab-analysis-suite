@@ -1,9 +1,7 @@
 use tauri::{Emitter, Manager};
-use tauri_plugin_shell::ShellExt;
-use tauri_plugin_shell::process::CommandEvent;
-use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_updater::UpdaterExt;
 use std::sync::{Arc, Mutex};
+use std::io::{BufRead, BufReader};
 
 #[derive(serde::Serialize, Clone)]
 struct UpdateProgress {
@@ -85,10 +83,10 @@ async fn kill_sidecar(state: tauri::State<'_, SidecarChild>) -> Result<(), Strin
 }
 
 /// Helper to kill sidecar and any child processes.
-fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<CommandChild>>>) {
+fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<std::process::Child>>>) {
     if let Ok(mut guard) = child_mutex.lock() {
-        if let Some(child) = guard.take() {
-            eprintln!("[cleanup] Killing sidecar process");
+        if let Some(mut child) = guard.take() {
+            eprintln!("[cleanup] Killing engine process");
             let _ = child.kill();
         }
     }
@@ -339,7 +337,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 
 struct SidecarPort(u16);
 struct SidecarError(Arc<Mutex<Option<String>>>);
-struct SidecarChild(Arc<Mutex<Option<CommandChild>>>);
+struct SidecarChild(Arc<Mutex<Option<std::process::Child>>>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -360,7 +358,7 @@ pub fn run() {
       }
 
       let sidecar_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-      let sidecar_child: Arc<Mutex<Option<CommandChild>>> = Arc::new(Mutex::new(None));
+      let sidecar_child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
 
       // The app uses the user's locally-installed R. Power users on locked-down
       // machines can point at a portable R tree via the LAS_R_ENV_DIR env var;
@@ -372,84 +370,81 @@ pub fn run() {
       if cfg!(debug_assertions) {
         port = 8765;
       } else {
-        // On macOS, PyInstaller --onefile extracts to /tmp and inherits the
-        // bundle's quarantine flag; strip it from the whole .app so Gatekeeper
-        // doesn't block the sidecar (or the bundled R dylibs it spawns).
-        #[cfg(target_os = "macos")]
-        {
-          if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(macos_dir) = exe_path.parent() {
-              // Tauri bundles the externalBin as the base name "api-server"
-              // in Contents/MacOS (triple suffix stripped), so strip quarantine
-              // from that. (The whole-.app strip below is the real safety net.)
-              let sidecar_path = macos_dir.join("api-server");
-              let _ = std::process::Command::new("xattr")
-                .args(["-cr", &sidecar_path.to_string_lossy().to_string()])
-                .output();
+        // The engine is a PyInstaller --onedir folder bundled under
+        // Contents/Resources/engine (resource_dir/engine) — no per-launch
+        // extraction, so it starts fast. Spawn its executable directly.
+        match app.path().resource_dir() {
+          Ok(res_dir) => {
+            let engine_dir = res_dir.join("engine");
+            let exe_name = if cfg!(target_os = "windows") { "api-server.exe" } else { "api-server" };
+            let engine_exe = engine_dir.join(exe_name);
+
+            // macOS: clear the download quarantine off the whole .app (covers the
+            // engine + its dylibs) and make the engine executable, so Gatekeeper
+            // doesn't kill the spawned process.
+            #[cfg(target_os = "macos")]
+            {
               let _ = std::process::Command::new("chmod")
-                .args(["+x", &sidecar_path.to_string_lossy().to_string()])
-                .output();
-              if let Some(contents_dir) = macos_dir.parent() {
-                if let Some(app_dir) = contents_dir.parent() {
+                .args(["+x", &engine_exe.to_string_lossy().to_string()]).output();
+              let _ = std::process::Command::new("xattr")
+                .args(["-cr", &engine_dir.to_string_lossy().to_string()]).output();
+              if let Ok(cur) = std::env::current_exe() {
+                if let Some(app_dir) = cur.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
                   let _ = std::process::Command::new("xattr")
-                    .args(["-cr", &app_dir.to_string_lossy().to_string()])
-                    .output();
+                    .args(["-cr", &app_dir.to_string_lossy().to_string()]).output();
                 }
               }
             }
-          }
-        }
 
-        let sidecar_result = app.shell().sidecar("api-server");
-        match sidecar_result {
-          Ok(cmd) => {
-            let mut args: Vec<String> = vec!["--port".into(), "8765".into()];
+            let mut command = std::process::Command::new(&engine_exe);
+            command.arg("--port").arg("8765");
             if let Some(ref dir) = r_env_dir {
-              args.push("--r-env-dir".into());
-              args.push(dir.clone());
+              command.arg("--r-env-dir").arg(dir);
             }
-            let cmd = cmd.args(args);
-            match cmd.spawn() {
-              Ok((mut rx, child)) => {
-                *sidecar_child.lock().unwrap() = Some(child);
-                let err_clone = sidecar_error.clone();
-                tauri::async_runtime::spawn(async move {
-                  while let Some(event) = rx.recv().await {
-                    match event {
-                      CommandEvent::Stderr(line) => {
-                        let msg = String::from_utf8_lossy(&line).to_string();
-                        eprintln!("[sidecar stderr] {}", msg);
-                        let mut e = err_clone.lock().unwrap();
+            command.current_dir(&engine_dir);
+            command.stdout(std::process::Stdio::piped());
+            command.stderr(std::process::Stdio::piped());
+            #[cfg(target_os = "windows")]
+            {
+              use std::os::windows::process::CommandExt;
+              command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+
+            match command.spawn() {
+              Ok(mut child) => {
+                if let Some(out) = child.stdout.take() {
+                  std::thread::spawn(move || {
+                    for line in BufReader::new(out).lines().map_while(Result::ok) {
+                      eprintln!("[engine] {}", line);
+                    }
+                  });
+                }
+                if let Some(errpipe) = child.stderr.take() {
+                  let err_clone = sidecar_error.clone();
+                  std::thread::spawn(move || {
+                    for line in BufReader::new(errpipe).lines().map_while(Result::ok) {
+                      eprintln!("[engine stderr] {}", line);
+                      if let Ok(mut e) = err_clone.lock() {
                         let current = e.get_or_insert_with(String::new);
                         if current.len() < 2000 {
-                          current.push_str(&msg);
+                          current.push_str(&line);
                           current.push('\n');
                         }
                       }
-                      CommandEvent::Stdout(line) => {
-                        eprintln!("[sidecar stdout] {}", String::from_utf8_lossy(&line));
-                      }
-                      CommandEvent::Terminated(payload) => {
-                        let msg = format!("Sidecar exited with code: {:?}, signal: {:?}", payload.code, payload.signal);
-                        eprintln!("{}", msg);
-                        let mut e = err_clone.lock().unwrap();
-                        let current = e.get_or_insert_with(String::new);
-                        current.push_str(&msg);
-                      }
-                      _ => {}
                     }
-                  }
-                });
+                  });
+                }
+                *sidecar_child.lock().unwrap() = Some(child);
               }
               Err(e) => {
-                let msg = format!("Failed to spawn sidecar: {}", e);
+                let msg = format!("Failed to spawn engine ({}): {}", engine_exe.display(), e);
                 eprintln!("{}", msg);
                 *sidecar_error.lock().unwrap() = Some(msg);
               }
             }
           }
           Err(e) => {
-            let msg = format!("Failed to find sidecar binary: {}", e);
+            let msg = format!("Failed to resolve resource dir: {}", e);
             eprintln!("{}", msg);
             *sidecar_error.lock().unwrap() = Some(msg);
           }

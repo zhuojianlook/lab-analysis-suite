@@ -31,7 +31,7 @@ jobs:
       - name: Build sidecar
         working-directory: TauriApp/python-sidecar
         run: |
-          pyinstaller --onefile --name api-server \
+          pyinstaller --onedir --name api-server \
             --hidden-import=uvicorn.logging \
             --hidden-import=uvicorn.protocols.http \
             --hidden-import=uvicorn.protocols.http.auto \
@@ -52,20 +52,19 @@ jobs:
             --exclude-module cv2 --exclude-module tkinter \
             --noconfirm api_server.py
         shell: bash
-      - name: Copy sidecar binary
+      - name: Stage engine (onedir folder)
         run: |
-          mkdir -p TauriApp/src-tauri/binaries
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp TauriApp/python-sidecar/dist/api-server.exe "TauriApp/src-tauri/binaries/api-server-${{ matrix.triple }}.exe"
-          else
-            cp TauriApp/python-sidecar/dist/api-server "TauriApp/src-tauri/binaries/api-server-${{ matrix.triple }}"
-          fi
+          rm -rf TauriApp/src-tauri/engine
+          mkdir -p TauriApp/src-tauri/engine
+          cp -R TauriApp/python-sidecar/dist/api-server/. TauriApp/src-tauri/engine/
+          ls TauriApp/src-tauri/engine | head
         shell: bash
       - name: Upload sidecar artifact
         uses: actions/upload-artifact@v4
         with:
           name: sidecar-${{ matrix.triple }}
-          path: TauriApp/src-tauri/binaries/
+          path: TauriApp/src-tauri/engine/
+          include-hidden-files: true
 
   # ── 2. Build the bundled R engine + the Tauri app per platform ────────────
   build-tauri:
@@ -130,10 +129,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: sidecar-${{ matrix.triple }}
-          path: TauriApp/src-tauri/binaries/
-      - name: Make sidecar executable
+          path: TauriApp/src-tauri/engine/
+      - name: Make engine executable
         if: runner.os != 'Windows'
-        run: chmod +x TauriApp/src-tauri/binaries/api-server-*
+        run: chmod +x TauriApp/src-tauri/engine/api-server
 
       # R is the user's local install — nothing R-related is bundled or built
       # here. Installers stay small (~90 MB); each tab installs the R packages

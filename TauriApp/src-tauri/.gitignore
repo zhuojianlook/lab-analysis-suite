@@ -4,3 +4,6 @@
 /gen/schemas
 # Bundled R engine is large and CI-populated — never commit it
 /resources/r-env/
+
+# onedir engine (downloaded in CI)
+/engine
