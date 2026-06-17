@@ -1,0 +1,20 @@
+Experiment: demo qPCR run
+Include	Color	Pos	Name	Cp	Concentration	Standard	Status
+1	255	A1	GAPDH_Ctrl	20.0			ok
+1	255	A2	GAPDH_Ctrl	20.1			ok
+1	255	A3	GAPDH_Ctrl	19.9			ok
+1	255	A4	GAPDH_Treat	20.0			ok
+1	255	A5	GAPDH_Treat	19.9			ok
+1	255	A6	GAPDH_Treat	20.1			ok
+1	255	A7	MYC_Ctrl	25.0			ok
+1	255	A8	MYC_Ctrl	25.1			ok
+1	255	A9	MYC_Ctrl	24.9			ok
+1	255	A10	MYC_Treat	24.0			ok
+1	255	A11	MYC_Treat	24.1			ok
+1	255	A12	MYC_Treat	23.9			ok
+1	255	B1	IL6_Ctrl	23.0			ok
+1	255	B2	IL6_Ctrl	23.1			ok
+1	255	B3	IL6_Ctrl	22.9			ok
+1	255	B4	IL6_Treat	24.0			ok
+1	255	B5	IL6_Treat	24.1			ok
+1	255	B6	IL6_Treat	23.9			ok

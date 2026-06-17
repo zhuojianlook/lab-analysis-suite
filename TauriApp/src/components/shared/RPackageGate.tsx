@@ -8,11 +8,18 @@ import {
 } from "../../api/client";
 import { useRStore } from "../../store/rStore";
 
+/** Per-tab package-check cache (session-lived). The check runs an Rscript, so
+ *  re-running it on every tab switch is slow; once a tab is known good we cache
+ *  it and switching back is instant. Keyed by tab + the active Rscript path. */
+type GateState = { rAvailable: boolean; packages: PackageStatus[]; allOk: boolean };
+const pkgCache = new Map<string, GateState>();
+
 /** Wrap an R-backed tab's content. Renders the tab only when R is present and
  *  all its packages are installed; otherwise shows an "install required
  *  packages" gate with a binary (pak/P3M) install + progress. */
 export function RPackageGate({ tab, children }: { tab: string; children: React.ReactNode }) {
   const rState = useRStore((s) => s.state);
+  const cacheKey = `${tab}|${rState?.path ?? ""}`;
   const [pkgs, setPkgs] = useState<PackageStatus[] | null>(null);
   const [allOk, setAllOk] = useState(false);
   const [rAvailable, setRAvailable] = useState(true);
@@ -25,18 +32,31 @@ export function RPackageGate({ tab, children }: { tab: string; children: React.R
     setErr(null);
     try {
       const res = await checkPackages(tab);
-      setRAvailable(res.r_available);
-      setPkgs(res.packages);
-      setAllOk(res.r_available && res.all_installed);
+      const st: GateState = {
+        rAvailable: res.r_available,
+        packages: res.packages,
+        allOk: res.r_available && res.all_installed,
+      };
+      pkgCache.set(cacheKey, st);
+      setRAvailable(st.rAvailable);
+      setPkgs(st.packages);
+      setAllOk(st.allOk);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     }
   };
 
   useEffect(() => {
+    const cached = pkgCache.get(cacheKey);
+    if (cached) {
+      setRAvailable(cached.rAvailable);
+      setPkgs(cached.packages);
+      setAllOk(cached.allOk);
+      if (cached.allOk) return; // trust a known-good tab → instant, no R call
+    }
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, rState?.installed, rState?.path]);
+  }, [cacheKey]);
 
   const doInstall = async () => {
     setInstalling(true);

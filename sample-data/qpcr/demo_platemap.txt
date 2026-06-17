@@ -1,0 +1,19 @@
+Cell Position	Gene	Sample
+A1	GAPDH	Ctrl
+A2	GAPDH	Ctrl
+A3	GAPDH	Ctrl
+A4	GAPDH	Treat
+A5	GAPDH	Treat
+A6	GAPDH	Treat
+A7	MYC	Ctrl
+A8	MYC	Ctrl
+A9	MYC	Ctrl
+A10	MYC	Treat
+A11	MYC	Treat
+A12	MYC	Treat
+B1	IL6	Ctrl
+B2	IL6	Ctrl
+B3	IL6	Ctrl
+B4	IL6	Treat
+B5	IL6	Treat
+B6	IL6	Treat
