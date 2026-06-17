@@ -21,6 +21,17 @@ fn get_sidecar_error(state: tauri::State<'_, SidecarError>) -> Option<String> {
     state.0.lock().unwrap().clone()
 }
 
+/// HTTP client that never routes through a system/env proxy. The sidecar lives
+/// on 127.0.0.1, but a configured HTTP(S)_PROXY / ALL_PROXY env var or a macOS
+/// system proxy would otherwise make reqwest try to proxy localhost and fail
+/// with "error sending request" — even though the sidecar is up (curl works).
+fn local_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Proxy HTTP requests to the sidecar through Rust, bypassing WebView restrictions
 /// on localhost (WKWebView / WebView2 block fetch() to http://127.0.0.1).
 #[tauri::command]
@@ -32,7 +43,7 @@ async fn proxy_request(
 ) -> Result<String, String> {
     let port = state.0;
     let url = format!("http://127.0.0.1:{}{}", port, path);
-    let client = reqwest::Client::new();
+    let client = local_client();
 
     let req = match method.to_uppercase().as_str() {
         "GET" => client.get(&url),
@@ -239,7 +250,7 @@ async fn proxy_upload(
 ) -> Result<String, String> {
     let port = state.0;
     let url = format!("http://127.0.0.1:{}{}", port, path);
-    let client = reqwest::Client::new();
+    let client = local_client();
 
     let mut form = reqwest::multipart::Form::new();
     for file in files {
@@ -274,7 +285,7 @@ async fn upload_files_from_paths(
 ) -> Result<String, String> {
     let port = state.0;
     let url = format!("http://127.0.0.1:{}{}", port, api_path);
-    let client = reqwest::Client::new();
+    let client = local_client();
 
     let mut form = reqwest::multipart::Form::new();
     for file_path in &file_paths {
