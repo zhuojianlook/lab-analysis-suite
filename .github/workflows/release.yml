@@ -81,7 +81,9 @@ jobs:
             bundles: nsis
           - os: ubuntu-22.04
             triple: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
+            # deb only: linuxdeploy (AppImage) chokes on the onedir engine's
+            # nested executable + .so files. deb packages the resource dir fine.
+            bundles: deb
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
