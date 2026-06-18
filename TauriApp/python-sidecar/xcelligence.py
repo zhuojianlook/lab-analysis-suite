@@ -129,6 +129,15 @@ def _process_file(pivot: pd.DataFrame, p: FileParams) -> pd.DataFrame:
     t0 = df.index[0]
     df.index = [(_round_quarter_hours(t - t0)) for t in df.index]
     df.index.name = "Time_h"
+    # Bin readings that fall in the same quarter-hour bucket (instruments that
+    # sample more often than every 15 min produce several rows per bucket).
+    # Averaging both performs the quarter-hour alignment and guarantees a unique
+    # index — without this, duplicate index labels make every downstream
+    # `.loc[t]` / `.at[t, col]` return a Series and crash the analysis.
+    if not df.index.is_unique:
+        df = df.groupby(level=0).mean()
+    df = df.sort_index()
+    df.index.name = "Time_h"
     # normalize: subtract the reference sample's per-timepoint mean
     ref_cols = [c for c in df.columns if c.split(" - ")[0] == p.normalize_sample]
     if ref_cols:

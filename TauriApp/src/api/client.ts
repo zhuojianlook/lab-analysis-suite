@@ -57,9 +57,18 @@ export async function apiRequest(path: string, method = "GET", body?: string): P
 /** Request + JSON parse, throwing on FastAPI `detail` error envelopes. */
 export async function apiJson<T>(path: string, method = "GET", body?: string): Promise<T> {
   const text = await apiRequest(path, method, body);
-  const parsed = JSON.parse(text);
+  let parsed: { detail?: unknown; error?: unknown } & Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // The sidecar returned a non-JSON body — typically Starlette's plain-text
+    // "Internal Server Error" on an unhandled exception. Surface it verbatim
+    // instead of a cryptic "Unexpected identifier" JSON parse error.
+    const snippet = (text || "").trim().slice(0, 400);
+    throw new Error(snippet ? `Server error: ${snippet}` : "Server returned an empty response.");
+  }
   if (parsed && parsed.detail) {
-    throw new Error(`API error: ${JSON.stringify(parsed.detail)}`);
+    throw new Error(`API error: ${typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail)}`);
   }
   return parsed as T;
 }

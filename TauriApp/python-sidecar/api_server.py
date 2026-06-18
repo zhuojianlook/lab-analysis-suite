@@ -12,9 +12,11 @@ import sys
 
 print("[api-server] booting (loading analysis libraries)…", flush=True)
 
+import traceback
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import config
@@ -43,7 +45,20 @@ class PrivateNetworkMiddleware(BaseHTTPMiddleware):
             resp.headers["Access-Control-Allow-Headers"] = "*"
             resp.headers["Access-Control-Allow-Private-Network"] = "true"
             return resp
-        resp = await call_next(request)
+        # Catch unhandled endpoint exceptions HERE (inside the outermost user
+        # middleware) and return a JSON envelope. The app-level
+        # exception_handler(Exception) does NOT work reliably with
+        # BaseHTTPMiddleware (the error escapes via ServerErrorMiddleware as
+        # plain-text "Internal Server Error"), which the JSON-parsing frontend
+        # surfaces as the cryptic "JSON Parse error: Unexpected identifier
+        # Internal". Catching at this layer guarantees a parseable error body.
+        try:
+            resp = await call_next(request)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[error] {request.method} {request.url.path}: {exc}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            msg = f"{type(exc).__name__}: {exc}"
+            resp = JSONResponse(status_code=500, content={"error": msg, "detail": msg})
         resp.headers["Access-Control-Allow-Private-Network"] = "true"
         return resp
 
