@@ -50,8 +50,9 @@ export function QpcrView() {
   const [analysis, setAnalysis] = useState<QpcrAnalyzeResult | null>(null);
 
   const [errorType, setErrorType] = useState<"SD" | "SEM">("SD");
+  const [layout, setLayout] = useState<"grouped" | "faceted">("grouped");
   const [title, setTitle] = useState("Fold change per gene");
-  const [xlabel, setXlabel] = useState("Sample");
+  const [xlabel, setXlabel] = useState("Gene");
   const [ylabel, setYlabel] = useState("Fold change");
   const [fontSize, setFontSize] = useState(14);
   const [dpi, setDpi] = useState(150);
@@ -135,6 +136,7 @@ export function QpcrView() {
         colors,
         labels,
         error_type: errorType,
+        layout,
         plot_type: plotType,
         show_points: showPoints,
         point_size: pointSize,
@@ -176,6 +178,13 @@ export function QpcrView() {
     samples.forEach((s, i) => { c[s] = PALETTE[i % PALETTE.length]; l[s] = s; });
     setColors(c);
     setLabels(l);
+  };
+
+  // Switch layout, swapping the x-axis label default (Gene ↔ Sample) only if
+  // the user hasn't typed a custom one.
+  const changeLayout = (v: "grouped" | "faceted") => {
+    setLayout(v);
+    setXlabel((cur) => (cur === "Gene" || cur === "Sample" || cur === "") ? (v === "grouped" ? "Gene" : "Sample") : cur);
   };
 
   const canAnalyze = upload && refGenes.length && targetGenes.length && control;
@@ -305,6 +314,11 @@ export function QpcrView() {
           <Typography variant="subtitle2" gutterBottom>4 · Figure</Typography>
           <Typography variant="caption" color="text.secondary">Display</Typography>
           <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap sx={{ mb: 1, mt: 0.5 }}>
+            <TextField select size="small" label="Layout" value={layout}
+              onChange={(e) => changeLayout(e.target.value as typeof layout)} sx={{ width: 160 }}>
+              <MenuItem value="grouped">Single graph</MenuItem>
+              <MenuItem value="faceted">One panel per gene</MenuItem>
+            </TextField>
             <TextField select size="small" label="Plot type" value={plotType}
               onChange={(e) => setPlotType(e.target.value as typeof plotType)} sx={{ width: 130 }}>
               <MenuItem value="bar">Bar</MenuItem>

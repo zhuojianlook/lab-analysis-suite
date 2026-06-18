@@ -2,9 +2,12 @@
 
 Ported from the standalone Streamlit qPCR app: parse paired LightCycler
 `*_qpcr.txt` (Cp per well) + `*_platemap.txt` (well -> Gene + Sample), compute
-ΔΔCt fold-change, run t-test or ANOVA+Tukey, and render a faceted ggplot2 bar
-chart with error bars + significance brackets (bracket geometry is computed
-here so the R template stays purely presentational).
+ΔΔCt fold-change, run t-test or ANOVA+Tukey, and render a ggplot2 chart with
+error bars + significance brackets. The default layout puts all genes on a
+single graph (genes on the x-axis, bars/violins dodged by sample); a faceted
+(one panel per gene) layout is also available. Bracket geometry — including the
+dodged x-positions for the grouped layout — is computed here so the R template
+stays purely presentational.
 """
 
 from __future__ import annotations
@@ -195,6 +198,7 @@ class PlotRequest(BaseModel):
     colors: Dict[str, str] = {}               # sample -> hex
     labels: Dict[str, str] = {}               # sample -> legend label
     error_type: str = "SD"                    # SD | SEM
+    layout: str = "grouped"                   # grouped (one graph, genes on x, dodged by sample) | faceted (one panel per gene)
     plot_type: str = "bar"                    # bar | violin | box | dot
     show_points: bool = False                 # overlay individual replicate points
     point_size: float = 1.8
@@ -250,9 +254,8 @@ def plot(body: PlotRequest):
     pts = pts[["Gene", "Sample", "value"]].dropna()
 
     sample_idx = {s: i + 1 for i, s in enumerate(body.sample_order)}
-    brackets = [(cg, sample_idx[s1], sample_idx[s2], star)
-                for (cg, s1, s2, _p, star) in _build_comparisons(body)
-                if s1 in sample_idx and s2 in sample_idx]
+    gene_idx = {g: i + 1 for i, g in enumerate(body.gene_order)}
+    n_samples = max(1, len(body.sample_order))
 
     colors = [body.colors.get(s, "#888888") for s in body.sample_order]
     labels = [body.labels.get(s, s) for s in body.sample_order]
@@ -260,21 +263,52 @@ def plot(body: PlotRequest):
     bg = "transparent" if body.transparent else "white"
     ptype = body.plot_type if body.plot_type in ("bar", "violin", "box", "dot") else "bar"
     star_size = max(2, body.font_size // 3)
+    faceted = str(body.layout).lower() == "faceted"
+    bw = max(0.05, float(body.bar_width))
 
-    if ptype == "bar":
-        geom = (f'p <- p + ggplot2::geom_col(data=summ, ggplot2::aes(Sample, mean, fill=Sample), width={body.bar_width}, colour="black", linewidth=0.3) + '
-                'ggplot2::geom_errorbar(data=summ, ggplot2::aes(Sample, ymin=pmax(0, mean-err), ymax=mean+err), width=0.25, linewidth=0.4)\n')
-    elif ptype == "violin":
-        geom = 'p <- p + ggplot2::geom_violin(data=dat, ggplot2::aes(Sample, value, fill=Sample), trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
-    elif ptype == "box":
-        geom = 'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(Sample, value, fill=Sample), outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
-    else:  # dot
-        geom = 'p <- p + ggplot2::stat_summary(data=dat, ggplot2::aes(Sample, value), fun=mean, geom="crossbar", width=0.5, linewidth=0.3)\n'
-
-    points_layer = (
-        f'p <- p + ggplot2::geom_jitter(data=dat, ggplot2::aes(Sample, value), width=0.12, height=0, size={body.point_size}, shape=21, fill="white", colour="black", stroke=0.4)\n'
-        if (body.show_points or ptype == "dot") else ""
-    )
+    if faceted:
+        # One panel per gene; the x-axis inside each panel is Sample.
+        if ptype == "bar":
+            geom = (f'p <- p + ggplot2::geom_col(data=summ, ggplot2::aes(Sample, mean, fill=Sample), width={bw}, colour="black", linewidth=0.3) + '
+                    'ggplot2::geom_errorbar(data=summ, ggplot2::aes(Sample, ymin=pmax(0, mean-err), ymax=mean+err), width=0.25, linewidth=0.4)\n')
+        elif ptype == "violin":
+            geom = 'p <- p + ggplot2::geom_violin(data=dat, ggplot2::aes(Sample, value, fill=Sample), trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
+        elif ptype == "box":
+            geom = 'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(Sample, value, fill=Sample), outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
+        else:  # dot (flat crossbar at the mean — fun.min/max=mean so ymin/ymax aren't NA)
+            geom = 'p <- p + ggplot2::stat_summary(data=dat, ggplot2::aes(Sample, value, fill=Sample), fun=mean, fun.min=mean, fun.max=mean, geom="crossbar", width=0.5, linewidth=0.3)\n'
+        points_layer = (
+            f'p <- p + ggplot2::geom_jitter(data=dat, ggplot2::aes(Sample, value), width=0.12, height=0, size={body.point_size}, shape=21, fill="white", colour="black", stroke=0.4)\n'
+            if (body.show_points or ptype == "dot") else ""
+        )
+        layout_layer = 'p <- p + ggplot2::facet_wrap(~Gene, scales="free_y")\n'
+        xangle_layer = 'p <- p + ggplot2::theme(axis.text.x=ggplot2::element_text(angle=45, hjust=1))\n'
+    else:
+        # Single graph: all genes on the x-axis, dodged by sample. preserve="single"
+        # keeps each sample in a fixed lane even when a gene is missing a sample,
+        # so the bars stay aligned with the Python-computed bracket x-positions.
+        dodge = f'ggplot2::position_dodge(width={bw}, preserve="single")'
+        if ptype == "bar":
+            geom = (f'p <- p + ggplot2::geom_col(data=summ, ggplot2::aes(Gene, mean, fill=Sample), position={dodge}, width={bw}, colour="black", linewidth=0.3) + '
+                    f'ggplot2::geom_errorbar(data=summ, ggplot2::aes(Gene, ymin=pmax(0, mean-err), ymax=mean+err, group=Sample), position={dodge}, width=0.2, linewidth=0.4)\n')
+        elif ptype == "violin":
+            geom = f'p <- p + ggplot2::geom_violin(data=dat, ggplot2::aes(Gene, value, fill=Sample), position={dodge}, width={bw}, trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
+        elif ptype == "box":
+            geom = f'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(Gene, value, fill=Sample), position={dodge}, width={bw}, outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
+        else:  # dot (flat crossbar at the mean, dodged by sample)
+            geom = f'p <- p + ggplot2::stat_summary(data=dat, ggplot2::aes(Gene, value, fill=Sample, group=Sample), fun=mean, fun.min=mean, fun.max=mean, geom="crossbar", width={bw}, linewidth=0.3, colour="black", position={dodge})\n'
+        # position_jitterdodge dodges by a MAPPED aesthetic (fill/colour/…), NOT
+        # by group= — so map colour=Sample (giving it real dodge lanes) and force
+        # the outlines back to black with an all-black, legend-less colour scale.
+        points_layer = (
+            f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(Gene, value, colour=Sample), '
+            f'position=ggplot2::position_jitterdodge(jitter.width=0.15, dodge.width={bw}), '
+            f'size={body.point_size}, shape=21, fill="white", stroke=0.4) + '
+            'ggplot2::scale_colour_manual(values=stats::setNames(rep("black", length(.cols)), names(.cols)), guide="none")\n'
+            if (body.show_points or ptype == "dot") else ""
+        )
+        layout_layer = ""
+        xangle_layer = ""
 
     if body.theme == "classic":
         theme_layer = f'p <- p + ggplot2::theme_classic(base_size={int(body.font_size)})\n'
@@ -292,6 +326,22 @@ def plot(body: PlotRequest):
         if body.transparent else ""
     )
 
+    # Significance brackets. Faceted layout uses integer Sample positions within
+    # each panel; grouped layout uses absolute dodged x-positions on the Gene
+    # axis: gene g (1-based) with S samples places sample j (1-based) at
+    # g + bw*((2j-1-S)/(2S)) — the centre of position_dodge(width=bw).
+    comps = _build_comparisons(body)
+    if faceted:
+        brackets = [(cg, sample_idx[s1], sample_idx[s2], star)
+                    for (cg, s1, s2, _p, star) in comps
+                    if cg in gene_idx and s1 in sample_idx and s2 in sample_idx]
+    else:
+        def _dx(gi: int, j: int) -> float:
+            return round(gi + bw * ((2 * j - 1 - n_samples) / (2.0 * n_samples)), 5)
+        brackets = [(cg, _dx(gene_idx[cg], sample_idx[s1]), _dx(gene_idx[cg], sample_idx[s2]), star)
+                    for (cg, s1, s2, _p, star) in comps
+                    if cg in gene_idx and s1 in sample_idx and s2 in sample_idx]
+
     if brackets:
         bgenes = _r_vec([b[0] for b in brackets])
         bx1 = "c(" + ", ".join(str(b[1]) for b in brackets) + ")"
@@ -303,11 +353,16 @@ def plot(body: PlotRequest):
         bracket_block = (
             f'bdf <- data.frame(Gene=factor({bgenes}, levels={_r_vec(body.gene_order)}), x1={bx1}, x2={bx2}, label={blabels}, stringsAsFactors=FALSE)\n'
             f'topdf <- as.data.frame({top_expr})\n'
-            'bdf <- merge(bdf, topdf, by="Gene")\n'
-            'bdf <- do.call(rbind, by(bdf, bdf$Gene, function(d) { d$rank <- seq_len(nrow(d)); d }))\n'
-            'bdf$y <- bdf$top * 1.06 + (bdf$rank - 1) * bdf$top * 0.12\n'
-            'p <- p + ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x2, y=y, yend=y), inherit.aes=FALSE, linewidth=0.4) + '
+            # left-join + drop brackets whose gene has no plotted data (else a
+            # 0-row bdf would crash geom_segment with "x1 not found").
+            'bdf <- merge(bdf, topdf, by="Gene", all.x=TRUE)\n'
+            'bdf <- bdf[!is.na(bdf$top), , drop=FALSE]\n'
+            'if (nrow(bdf) > 0) {\n'
+            '  bdf <- do.call(rbind, by(bdf, bdf$Gene, function(d) { d$rank <- seq_len(nrow(d)); d }))\n'
+            '  bdf$y <- bdf$top * 1.06 + (bdf$rank - 1) * bdf$top * 0.12\n'
+            '  p <- p + ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x2, y=y, yend=y), inherit.aes=FALSE, linewidth=0.4) + '
             f'ggplot2::geom_text(data=bdf, ggplot2::aes(x=(x1+x2)/2, y=y, label=label), inherit.aes=FALSE, vjust=-0.2, size={star_size})\n'
+            '}\n'
         )
     else:
         bracket_block = ""
@@ -323,9 +378,8 @@ summ <- dat %>% dplyr::group_by(Gene, Sample) %>% dplyr::summarise(mean=mean(val
 summ$err <- {'summ$sem' if body.error_type.upper() == 'SEM' else 'summ$sd'}
 summ$err[is.na(summ$err)] <- 0
 p <- ggplot2::ggplot()
-{geom}{points_layer}p <- p + ggplot2::facet_wrap(~Gene, scales="free_y") + ggplot2::scale_fill_manual(values=.cols, labels=.labs) + ggplot2::labs(title="{_resc(body.title)}", x="{_resc(body.xlabel)}", y="{_resc(body.ylabel)}", fill=NULL)
-{theme_layer}p <- p + ggplot2::theme(axis.text.x=ggplot2::element_text(angle=45, hjust=1))
-{bracket_block}{transparent_theme}mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
+{geom}{points_layer}{layout_layer}p <- p + ggplot2::scale_fill_manual(values=.cols, labels=.labs) + ggplot2::labs(title="{_resc(body.title)}", x="{_resc(body.xlabel)}", y="{_resc(body.ylabel)}", fill=NULL)
+{theme_layer}{xangle_layer}{bracket_block}{transparent_theme}mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
 mpfig_data(summ, "qpcr_summary")
 """
     res = r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=pts.to_csv(index=False), timeout_sec=120))
