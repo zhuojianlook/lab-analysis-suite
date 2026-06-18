@@ -1,10 +1,10 @@
 {
-  "version": "0.2.6",
-  "notes": "Update to v0.2.6",
-  "pub_date": "2026-06-17T07:33:38Z",
+  "version": "0.2.7",
+  "notes": "Update to v0.2.7",
+  "pub_date": "2026-06-18T02:56:53Z",
   "platforms": {
-    "darwin-aarch64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WmpvTlZyd3lnSTVrcm1kY0l4OGZyTzFrQU5HYnNUemUwZHpLNWVYN3lwcHRGNnRpY0ZqN1RDTVRmNGhqSEsvT25pSE9oa0JhSjdKQitkTzlBZlU4c1FFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNjgxMjY0CWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlLmFwcC50YXIuZ3oKaUh6MEJqQ2NvelVoUTdoU0dYa0IzWUlBcEQyaXVZcVZCSWR6ZU8xRHgxT1hUaVdoOEVKSXpjVTBlNmUxYXhuK0VHTzVYRUtKeWdSWmZVbjczUHh6Q2c9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.6/Lab.Analysis.Suite.app.tar.gz" },
-    "windows-x86_64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WmdncTlYSHF5ckRIQkhFd1Bka05HYnpLcWo0cy9Rc3ZNbTI2THp4ZlRjdUovd3VFd0txZ3BSNlRQdDZmdnZQeEhKMnNOVEtkTnpMRUhZdWhvL3AydHdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNjgxNTg2CWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlXzAuMi42X3g2NC1zZXR1cC5leGUKbXJPb1NWaXlBVnNhRGlkbXl4Y0lMQjJQcFNIY1NVWEVyZGxBYkVUVXFaOXhBNDBZQmRETEpZUEVuWjdxbWcrWTd1OWVDaVg2ZjQ3emc4RW9ML1UxQmc9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.6/Lab.Analysis.Suite_0.2.6_x64-setup.exe" },
-    "linux-x86_64":   { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WnBaMjRpQWczdlNXY1lybHZ4THlVaDFFQktkdjkwZTJ4NGQrMndPc0NYU0hCWWtEWWcvdWdIV2cwYlRkWER0OStvaktyY2ZqUUhaKzNqTVNRWE9pMHdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNjgxNDU3CWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlXzAuMi42X2FtZDY0LkFwcEltYWdlCkVENXVYZWtsWTY4akdLK0pDbG00SHpnL28ySk5XRFVZakxIcWZYeTFQamNZNURma2ZuaTVlcEhxbG01WjRaaEFvZVZlU2JpV1VHR0c5RjJ0cDBYYkF3PT0K", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.6/Lab.Analysis.Suite_0.2.6_amd64.AppImage" }
+    "darwin-aarch64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5Wm5nSURLdlQxTUtJcklWYlVoVnFneE1WKzEyeHRCd29kRmJJaXZqNUJieDhJcUFXTkpDRGNFTTBDWnMvS1FyM3A1NlFaeUM4WnNZZUxQZHAxbWFNZHdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNzUwOTYwCWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlLmFwcC50YXIuZ3oKeDNuanF0MjQrNFdkeEUzTWR2L1RobUlZNmFBM3VWUmUxaGZaekpudFBaaHBnZklibll2eGEycVFsanNteXpFaGViQytmNHF1Rll4TVJNMDZWeTVOQ1E9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.7/Lab.Analysis.Suite.app.tar.gz" },
+    "windows-x86_64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WmptOVg0cU1LQVlsRUYrUm03K2EzT0w5d1Z4V3M2TDIvVkl5QjdTd2JVbzNRb3NiU3dyMFlvUXRReWNSWXB2Rm9DTStZanFLdXhFbjR3NVM3NHFvRWc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNzUxMzgyCWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlXzAuMi43X3g2NC1zZXR1cC5leGUKLzI2RWJ2K0N4K0hwaitGdTdEL2JNWVBjM3Fhc3FpbEtWdkVoN0xsSTJwRFlyaEJNOG5XZjl2WnR4NEFBRFJkdXp4K2N4eGxUZUFtZXpnQWJLMTVXRFE9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.7/Lab.Analysis.Suite_0.2.7_x64-setup.exe" },
+    "linux-x86_64":   { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/v0.2.7/" }
   }
 }
