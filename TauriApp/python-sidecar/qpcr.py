@@ -186,7 +186,8 @@ def analyze(body: AnalyzeRequest):
 # ── Plot (ggplot2 via the R bridge) ─────────────────────────────────────────
 
 class PlotRequest(BaseModel):
-    summary: List[dict]                       # [{Gene,Sample,mean,sd,sem,n}]
+    points: List[dict] = []                   # per-replicate [{Gene, Sample, value}]
+    summary: List[dict] = []                  # fallback [{Gene,Sample,mean,sd,sem,n}]
     ttest_results: List[dict] = []
     anova_tukey_results: List[dict] = []
     gene_order: List[str]
@@ -194,6 +195,11 @@ class PlotRequest(BaseModel):
     colors: Dict[str, str] = {}               # sample -> hex
     labels: Dict[str, str] = {}               # sample -> legend label
     error_type: str = "SD"                    # SD | SEM
+    plot_type: str = "bar"                    # bar | violin | box | dot
+    show_points: bool = False                 # overlay individual replicate points
+    point_size: float = 1.8
+    bar_width: float = 0.7
+    theme: str = "prism"                      # prism | classic | minimal
     significance_level: float = 0.05
     hide_ns: bool = True
     title: str = "Fold change per gene"
@@ -232,83 +238,95 @@ def _build_comparisons(body: PlotRequest):
 
 @router.post("/api/qpcr/plot")
 def plot(body: PlotRequest):
-    sdf = pd.DataFrame(body.summary)
-    if sdf.empty:
-        return {"success": False, "stderr": "No summary data to plot.", "plots": []}
-    err_col = "sd" if body.error_type.upper() == "SD" else "sem"
-    sdf["err"] = sdf[err_col].fillna(0.0)
-    sdf = sdf[["Gene", "Sample", "mean", "err"]]
+    # Per-replicate points drive the plot (needed for points/violin/box); the
+    # summary (mean/err) for bars + brackets is computed in R from them.
+    pts = pd.DataFrame(body.points)
+    if pts.empty and body.summary:
+        s = pd.DataFrame(body.summary)
+        pts = s[["Gene", "Sample"]].copy()
+        pts["value"] = s["mean"]
+    if pts.empty or "value" not in pts.columns:
+        return {"success": False, "stderr": "No per-replicate data to plot.", "plots": []}
+    pts = pts[["Gene", "Sample", "value"]].dropna()
 
-    # bracket geometry (per gene, stacked above the tallest bar+err)
     sample_idx = {s: i + 1 for i, s in enumerate(body.sample_order)}
-    comps = _build_comparisons(body)
-    brackets = []  # Gene, x1, x2, y, label
-    for gene in body.gene_order:
-        gtops = sdf[sdf["Gene"] == gene]
-        if gtops.empty:
-            continue
-        base = float((gtops["mean"] + gtops["err"]).max())
-        base = base if base > 0 else 1.0
-        step = base * 0.10
-        k = 0
-        for (cg, s1, s2, p, star) in comps:
-            if cg != gene or s1 not in sample_idx or s2 not in sample_idx:
-                continue
-            y = base * 1.06 + k * step
-            brackets.append((gene, sample_idx[s1], sample_idx[s2], y, star))
-            k += 1
+    brackets = [(cg, sample_idx[s1], sample_idx[s2], star)
+                for (cg, s1, s2, _p, star) in _build_comparisons(body)
+                if s1 in sample_idx and s2 in sample_idx]
 
     colors = [body.colors.get(s, "#888888") for s in body.sample_order]
     labels = [body.labels.get(s, s) for s in body.sample_order]
-
     export_fmt = "tiff" if str(body.export_format).lower() in ("tiff", "tif") else "png"
     bg = "transparent" if body.transparent else "white"
+    ptype = body.plot_type if body.plot_type in ("bar", "violin", "box", "dot") else "bar"
+    star_size = max(2, body.font_size // 3)
+
+    if ptype == "bar":
+        geom = (f'p <- p + ggplot2::geom_col(data=summ, ggplot2::aes(Sample, mean, fill=Sample), width={body.bar_width}, colour="black", linewidth=0.3) + '
+                'ggplot2::geom_errorbar(data=summ, ggplot2::aes(Sample, ymin=pmax(0, mean-err), ymax=mean+err), width=0.25, linewidth=0.4)\n')
+    elif ptype == "violin":
+        geom = 'p <- p + ggplot2::geom_violin(data=dat, ggplot2::aes(Sample, value, fill=Sample), trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
+    elif ptype == "box":
+        geom = 'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(Sample, value, fill=Sample), outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
+    else:  # dot
+        geom = 'p <- p + ggplot2::stat_summary(data=dat, ggplot2::aes(Sample, value), fun=mean, geom="crossbar", width=0.5, linewidth=0.3)\n'
+
+    points_layer = (
+        f'p <- p + ggplot2::geom_jitter(data=dat, ggplot2::aes(Sample, value), width=0.12, height=0, size={body.point_size}, shape=21, fill="white", colour="black", stroke=0.4)\n'
+        if (body.show_points or ptype == "dot") else ""
+    )
+
+    if body.theme == "classic":
+        theme_layer = f'p <- p + ggplot2::theme_classic(base_size={int(body.font_size)})\n'
+    elif body.theme == "minimal":
+        theme_layer = f'p <- p + ggplot2::theme_minimal(base_size={int(body.font_size)})\n'
+    else:  # prism
+        theme_layer = (f'if (requireNamespace("ggprism", quietly=TRUE)) p <- p + ggprism::theme_prism(base_size={int(body.font_size)}) '
+                       f'else p <- p + ggplot2::theme_classic(base_size={int(body.font_size)})\n')
+
     transparent_theme = (
-        " + theme(plot.background=element_rect(fill='transparent', colour=NA), "
-        "panel.background=element_rect(fill='transparent', colour=NA), "
-        "legend.background=element_rect(fill='transparent', colour=NA), "
-        "legend.box.background=element_rect(fill='transparent', colour=NA), "
-        "legend.key=element_rect(fill='transparent', colour=NA))"
+        "p <- p + ggplot2::theme(plot.background=ggplot2::element_rect(fill='transparent', colour=NA), "
+        "panel.background=ggplot2::element_rect(fill='transparent', colour=NA), "
+        "legend.background=ggplot2::element_rect(fill='transparent', colour=NA), "
+        "legend.key=ggplot2::element_rect(fill='transparent', colour=NA))\n"
         if body.transparent else ""
     )
 
-    # bracket data.frame as an inline R literal
     if brackets:
-        # NOTE: keep this distinct from `bg` (the background colour) below — a
-        # name collision here previously corrupted the mpfig_render(bg=...) arg.
-        bgene = _r_vec([b[0] for b in brackets])
+        bgenes = _r_vec([b[0] for b in brackets])
         bx1 = "c(" + ", ".join(str(b[1]) for b in brackets) + ")"
         bx2 = "c(" + ", ".join(str(b[2]) for b in brackets) + ")"
-        by = "c(" + ", ".join(f"{b[3]:.6f}" for b in brackets) + ")"
-        bl = _r_vec([b[4] for b in brackets])
+        blabels = _r_vec([b[3] for b in brackets])
+        top_expr = ('summ %>% dplyr::group_by(Gene) %>% dplyr::summarise(top=max(mean+err, na.rm=TRUE), .groups="drop")'
+                    if ptype == "bar" else
+                    'dat %>% dplyr::group_by(Gene) %>% dplyr::summarise(top=max(value, na.rm=TRUE), .groups="drop")')
         bracket_block = (
-            f'bdf <- data.frame(Gene=factor({bgene}, levels={_r_vec(body.gene_order)}), '
-            f'x1={bx1}, x2={bx2}, y={by}, label={bl}, stringsAsFactors=FALSE)\n'
-            'p <- p + geom_segment(data=bdf, aes(x=x1, xend=x2, y=y, yend=y), inherit.aes=FALSE, linewidth=0.4) +\n'
-            '  geom_text(data=bdf, aes(x=(x1+x2)/2, y=y, label=label), inherit.aes=FALSE, vjust=-0.2, size=' + str(max(2, body.font_size // 3)) + ')\n'
+            f'bdf <- data.frame(Gene=factor({bgenes}, levels={_r_vec(body.gene_order)}), x1={bx1}, x2={bx2}, label={blabels}, stringsAsFactors=FALSE)\n'
+            f'topdf <- as.data.frame({top_expr})\n'
+            'bdf <- merge(bdf, topdf, by="Gene")\n'
+            'bdf <- do.call(rbind, by(bdf, bdf$Gene, function(d) { d$rank <- seq_len(nrow(d)); d }))\n'
+            'bdf$y <- bdf$top * 1.06 + (bdf$rank - 1) * bdf$top * 0.12\n'
+            'p <- p + ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x2, y=y, yend=y), inherit.aes=FALSE, linewidth=0.4) + '
+            f'ggplot2::geom_text(data=bdf, ggplot2::aes(x=(x1+x2)/2, y=y, label=label), inherit.aes=FALSE, vjust=-0.2, size={star_size})\n'
         )
     else:
         bracket_block = ""
 
     code = f"""
-library(ggplot2)
-data$Gene <- factor(data$Gene, levels={_r_vec(body.gene_order)})
-data$Sample <- factor(data$Sample, levels={_r_vec(body.sample_order)})
+suppressMessages({{ library(ggplot2); library(dplyr) }})
+dat <- data
+dat$Gene <- factor(dat$Gene, levels={_r_vec(body.gene_order)})
+dat$Sample <- factor(dat$Sample, levels={_r_vec(body.sample_order)})
 .cols <- {_r_vec(colors)}; names(.cols) <- {_r_vec(body.sample_order)}
 .labs <- {_r_vec(labels)}
-p <- ggplot(data, aes(x=Sample, y=mean, fill=Sample)) +
-  geom_col(width=0.7, colour="black", linewidth=0.3) +
-  geom_errorbar(aes(ymin=pmax(0, mean-err), ymax=mean+err), width=0.25, linewidth=0.4) +
-  facet_wrap(~Gene, scales="free_y") +
-  scale_fill_manual(values=.cols, labels=.labs) +
-  labs(title="{_resc(body.title)}", x="{_resc(body.xlabel)}", y="{_resc(body.ylabel)}", fill=NULL) +
-  theme_classic(base_size={int(body.font_size)}) +
-  theme(axis.text.x=element_text(angle=45, hjust=1))
-{bracket_block}
-p <- p{transparent_theme}
-mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
-mpfig_data(data, "qpcr_plot_data")
+summ <- dat %>% dplyr::group_by(Gene, Sample) %>% dplyr::summarise(mean=mean(value), sd=sd(value), sem=sd(value)/sqrt(dplyr::n()), .groups="drop")
+summ$err <- {'summ$sem' if body.error_type.upper() == 'SEM' else 'summ$sd'}
+summ$err[is.na(summ$err)] <- 0
+p <- ggplot2::ggplot()
+{geom}{points_layer}p <- p + ggplot2::facet_wrap(~Gene, scales="free_y") + ggplot2::scale_fill_manual(values=.cols, labels=.labs) + ggplot2::labs(title="{_resc(body.title)}", x="{_resc(body.xlabel)}", y="{_resc(body.ylabel)}", fill=NULL)
+{theme_layer}p <- p + ggplot2::theme(axis.text.x=ggplot2::element_text(angle=45, hjust=1))
+{bracket_block}{transparent_theme}mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
+mpfig_data(summ, "qpcr_summary")
 """
-    summary_csv = sdf.to_csv(index=False)
-    res = r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=summary_csv, timeout_sec=120))
+    res = r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=pts.to_csv(index=False), timeout_sec=120))
     return res

@@ -59,6 +59,11 @@ export function QpcrView() {
   const [plotHeight, setPlotHeight] = useState(800);
   const [exportFormat, setExportFormat] = useState<"png" | "tiff">("png");
   const [transparent, setTransparent] = useState(false);
+  const [plotType, setPlotType] = useState<"bar" | "violin" | "box" | "dot">("bar");
+  const [showPoints, setShowPoints] = useState(false);
+  const [pointSize, setPointSize] = useState(1.8);
+  const [barWidth, setBarWidth] = useState(0.7);
+  const [theme, setTheme] = useState<"prism" | "classic" | "minimal">("prism");
   const [sigLevel, setSigLevel] = useState(0.05);
   const [hideNs, setHideNs] = useState(true);
   const [colors, setColors] = useState<Record<string, string>>({});
@@ -122,6 +127,7 @@ export function QpcrView() {
     try {
       const res = await plotQpcr({
         summary: analysis.summary,
+        points: (analysis.analysis_data ?? []).map((r) => ({ Gene: r.Gene, Sample: r.Sample, value: r.Fold_Change })),
         ttest_results: analysis.ttest_results,
         anova_tukey_results: analysis.anova_tukey_results,
         gene_order: targetGenes,
@@ -129,6 +135,11 @@ export function QpcrView() {
         colors,
         labels,
         error_type: errorType,
+        plot_type: plotType,
+        show_points: showPoints,
+        point_size: pointSize,
+        bar_width: barWidth,
+        theme,
         significance_level: sigLevel,
         hide_ns: hideNs,
         title,
@@ -292,20 +303,45 @@ export function QpcrView() {
       {analysis?.summary?.length ? (
         <Paper variant="outlined" sx={{ p: 2 }}>
           <Typography variant="subtitle2" gutterBottom>4 · Figure</Typography>
-          <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap sx={{ mb: 1 }}>
+          <Typography variant="caption" color="text.secondary">Display</Typography>
+          <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap sx={{ mb: 1, mt: 0.5 }}>
+            <TextField select size="small" label="Plot type" value={plotType}
+              onChange={(e) => setPlotType(e.target.value as typeof plotType)} sx={{ width: 130 }}>
+              <MenuItem value="bar">Bar</MenuItem>
+              <MenuItem value="violin">Violin</MenuItem>
+              <MenuItem value="box">Box</MenuItem>
+              <MenuItem value="dot">Dot (mean)</MenuItem>
+            </TextField>
+            <TextField select size="small" label="Theme" value={theme}
+              onChange={(e) => setTheme(e.target.value as typeof theme)} sx={{ width: 120 }}>
+              <MenuItem value="prism">Prism</MenuItem>
+              <MenuItem value="classic">Classic</MenuItem>
+              <MenuItem value="minimal">Minimal</MenuItem>
+            </TextField>
             <TextField select size="small" label="Error bars" value={errorType}
-              onChange={(e) => setErrorType(e.target.value as "SD" | "SEM")} sx={{ width: 110 }}>
+              onChange={(e) => setErrorType(e.target.value as "SD" | "SEM")} sx={{ width: 100 }}>
               <MenuItem value="SD">SD</MenuItem>
               <MenuItem value="SEM">SEM</MenuItem>
             </TextField>
+            <FormControlLabel control={<Checkbox checked={showPoints} onChange={(e) => setShowPoints(e.target.checked)} />} label="Show points" />
+            {(showPoints || plotType === "dot") && (
+              <TextField size="small" type="number" label="Point size" value={pointSize}
+                onChange={(e) => setPointSize(Number(e.target.value) || 1.8)} inputProps={{ step: 0.2 }} sx={{ width: 100 }} />
+            )}
+            {plotType === "bar" && (
+              <TextField size="small" type="number" label="Bar width" value={barWidth}
+                onChange={(e) => setBarWidth(Number(e.target.value) || 0.7)} inputProps={{ step: 0.1 }} sx={{ width: 100 }} />
+            )}
             <TextField size="small" label="Title" value={title} onChange={(e) => setTitle(e.target.value)} />
-            <TextField size="small" label="X label" value={xlabel} onChange={(e) => setXlabel(e.target.value)} sx={{ width: 130 }} />
-            <TextField size="small" label="Y label" value={ylabel} onChange={(e) => setYlabel(e.target.value)} sx={{ width: 150 }} />
+            <TextField size="small" label="X label" value={xlabel} onChange={(e) => setXlabel(e.target.value)} sx={{ width: 120 }} />
+            <TextField size="small" label="Y label" value={ylabel} onChange={(e) => setYlabel(e.target.value)} sx={{ width: 140 }} />
             <TextField size="small" type="number" label="Font size" value={fontSize}
               onChange={(e) => setFontSize(Number(e.target.value) || 14)} sx={{ width: 100 }} />
-            <TextField select size="small" label="DPI" value={dpi} onChange={(e) => setDpi(Number(e.target.value))} sx={{ width: 100 }}>
-              {[100, 150, 300, 600].map((d) => <MenuItem key={d} value={d}>{d}</MenuItem>)}
-            </TextField>
+          </Stack>
+
+          <Divider sx={{ my: 1 }} />
+          <Typography variant="caption" color="text.secondary">Export &amp; format</Typography>
+          <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap sx={{ mb: 1, mt: 0.5 }}>
             <TextField size="small" type="number" label="Sig. level" value={sigLevel}
               onChange={(e) => setSigLevel(Number(e.target.value) || 0.05)} inputProps={{ step: 0.01 }} sx={{ width: 100 }} />
             <FormControlLabel control={<Checkbox checked={hideNs} onChange={(e) => setHideNs(e.target.checked)} />} label="Hide ns" />
@@ -313,8 +349,11 @@ export function QpcrView() {
               onChange={(e) => setPlotWidth(Number(e.target.value) || 1200)} inputProps={{ step: 100 }} sx={{ width: 110 }} />
             <TextField size="small" type="number" label="Height (px)" value={plotHeight}
               onChange={(e) => setPlotHeight(Number(e.target.value) || 800)} inputProps={{ step: 100 }} sx={{ width: 110 }} />
-            <TextField select size="small" label="Export" value={exportFormat}
-              onChange={(e) => setExportFormat(e.target.value as "png" | "tiff")} sx={{ width: 110 }}>
+            <TextField select size="small" label="DPI" value={dpi} onChange={(e) => setDpi(Number(e.target.value))} sx={{ width: 100 }}>
+              {[100, 150, 300, 600].map((d) => <MenuItem key={d} value={d}>{d}</MenuItem>)}
+            </TextField>
+            <TextField select size="small" label="Export format" value={exportFormat}
+              onChange={(e) => setExportFormat(e.target.value as "png" | "tiff")} sx={{ width: 130 }}>
               <MenuItem value="png">PNG</MenuItem>
               <MenuItem value="tiff">TIFF</MenuItem>
             </TextField>

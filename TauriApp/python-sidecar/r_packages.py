@@ -27,7 +27,7 @@ router = APIRouter()
 
 # tab -> required packages. "common" is merged into every tab.
 MANIFESTS: Dict[str, Dict[str, List[str]]] = {
-    "common":      {"cran": ["ggplot2", "dplyr", "tidyr", "scales", "ggrepel", "svglite", "RColorBrewer"], "bioc": []},
+    "common":      {"cran": ["ggplot2", "dplyr", "tidyr", "scales", "ggrepel", "svglite", "RColorBrewer", "ggprism"], "bioc": []},
     "qpcr":        {"cran": ["ggsignif", "rstatix"], "bioc": []},
     "xcelligence": {"cran": ["zoo"], "bioc": []},
     "rnaseq":      {"cran": ["pheatmap"], "bioc": ["DESeq2", "apeglm"]},
