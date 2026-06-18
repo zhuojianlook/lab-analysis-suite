@@ -1,6 +1,8 @@
 import { Alert, Box, Button, Stack } from "@mui/material";
 import DownloadIcon from "@mui/icons-material/Download";
+import CollectionsIcon from "@mui/icons-material/Collections";
 import { saveDownload } from "../../api/client";
+import { useFiguresStore } from "../../store/figuresStore";
 import type { RunRResponse } from "../../api/types";
 
 /** Render the plots (base64 PNG) returned by the R bridge, with per-plot
@@ -37,6 +39,13 @@ export function PlotResult({ result, baseName = "plot" }: { result: RunRResponse
                 onClick={() => saveDownload(`${baseName}_${i + 1}.png`, b64, "image/png")}
               >
                 Download PNG
+              </Button>
+              <Button
+                size="small"
+                startIcon={<CollectionsIcon />}
+                onClick={() => useFiguresStore.getState().add(b64, `${baseName}_${i + 1}`, baseName)}
+              >
+                Send to Figures
               </Button>
               {exp && (
                 <Button

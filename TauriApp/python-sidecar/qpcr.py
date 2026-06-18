@@ -274,13 +274,15 @@ def plot(body: PlotRequest):
 
     # bracket data.frame as an inline R literal
     if brackets:
-        bg = _r_vec([b[0] for b in brackets])
+        # NOTE: keep this distinct from `bg` (the background colour) below — a
+        # name collision here previously corrupted the mpfig_render(bg=...) arg.
+        bgene = _r_vec([b[0] for b in brackets])
         bx1 = "c(" + ", ".join(str(b[1]) for b in brackets) + ")"
         bx2 = "c(" + ", ".join(str(b[2]) for b in brackets) + ")"
         by = "c(" + ", ".join(f"{b[3]:.6f}" for b in brackets) + ")"
         bl = _r_vec([b[4] for b in brackets])
         bracket_block = (
-            f'bdf <- data.frame(Gene=factor({bg}, levels={_r_vec(body.gene_order)}), '
+            f'bdf <- data.frame(Gene=factor({bgene}, levels={_r_vec(body.gene_order)}), '
             f'x1={bx1}, x2={bx2}, y={by}, label={bl}, stringsAsFactors=FALSE)\n'
             'p <- p + geom_segment(data=bdf, aes(x=x1, xend=x2, y=y, yend=y), inherit.aes=FALSE, linewidth=0.4) +\n'
             '  geom_text(data=bdf, aes(x=(x1+x2)/2, y=y, label=label), inherit.aes=FALSE, vjust=-0.2, size=' + str(max(2, body.font_size // 3)) + ')\n'

@@ -14,6 +14,8 @@ import {
   RadioGroup,
   Stack,
   TextField,
+  ToggleButton,
+  ToggleButtonGroup,
   Typography,
 } from "@mui/material";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
@@ -27,6 +29,7 @@ import {
 import type { RunRResponse } from "../../api/types";
 import { RecordTable } from "../shared/RecordTable";
 import { PlotResult } from "../shared/PlotResult";
+import { QpcrManualEntry } from "./QpcrManualEntry";
 
 const PALETTE = ["#5a7fa8", "#63a66a", "#c1666b", "#d4a05a", "#8a6fae", "#4aa3a3", "#b07aa1", "#9c9c4a"];
 
@@ -36,6 +39,7 @@ export function QpcrView() {
   const [upload, setUpload] = useState<QpcrUploadResult | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [entryMode, setEntryMode] = useState<"files" | "manual">("files");
 
   const [useCommon, setUseCommon] = useState(true);
   const [refGenes, setRefGenes] = useState<string[]>([]);
@@ -145,14 +149,45 @@ export function QpcrView() {
     }
   };
 
+  const onManualLoad = (records: { Sample: string; Gene: string; Cp: number }[]) => {
+    setErr(null);
+    if (!records.length) { setErr("No complete wells (each needs Gene + Sample + Cp)."); return; }
+    const genes = Array.from(new Set(records.map((r) => r.Gene))).sort();
+    const samples = Array.from(new Set(records.map((r) => r.Sample))).sort();
+    setUpload({
+      pairs: [{ name: "manual", records: records as unknown as Record<string, unknown>[], n_rows: records.length }],
+      genes_common: genes, genes_all: genes, samples, errors: [],
+    });
+    setAnalysis(null);
+    setPlot(null);
+    const c: Record<string, string> = {};
+    const l: Record<string, string> = {};
+    samples.forEach((s, i) => { c[s] = PALETTE[i % PALETTE.length]; l[s] = s; });
+    setColors(c);
+    setLabels(l);
+  };
+
   const canAnalyze = upload && refGenes.length && targetGenes.length && control;
 
   return (
     <Box sx={{ p: 2, display: "flex", flexDirection: "column", gap: 2 }}>
       {err && <Alert severity="error" onClose={() => setErr(null)}>{err}</Alert>}
 
-      {/* 1. Upload */}
-      <Paper variant="outlined" sx={{ p: 2 }}>
+      {/* 1. Data input — upload files or enter manually */}
+      <ToggleButtonGroup
+        size="small"
+        exclusive
+        value={entryMode}
+        onChange={(_, v) => { if (v) setEntryMode(v); }}
+        sx={{ alignSelf: "flex-start" }}
+      >
+        <ToggleButton value="files" sx={{ textTransform: "none", px: 2 }}>Upload files</ToggleButton>
+        <ToggleButton value="manual" sx={{ textTransform: "none", px: 2 }}>Manual entry</ToggleButton>
+      </ToggleButtonGroup>
+
+      {entryMode === "manual" && <QpcrManualEntry onLoad={onManualLoad} />}
+
+      <Paper variant="outlined" sx={{ p: 2, display: entryMode === "files" ? "block" : "none" }}>
         <Typography variant="subtitle2" gutterBottom>1 · Upload qPCR + plate-map files</Typography>
         <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
           <Button component="label" variant="outlined" startIcon={<UploadFileIcon />}>

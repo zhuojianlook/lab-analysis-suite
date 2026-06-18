@@ -14,6 +14,7 @@ import { ScrnaView } from "../scrna/ScrnaView";
 import { SpatialView } from "../spatial/SpatialView";
 import { MicrobiomeView } from "../microbiome/MicrobiomeView";
 import { PlatemapView } from "../platemap/PlatemapView";
+import { FiguresView } from "../figures/FiguresView";
 
 const TABS = [
   { label: "qPCR", render: () => <RPackageGate tab="qpcr"><QpcrView /></RPackageGate> },
@@ -23,6 +24,7 @@ const TABS = [
   { label: "Spatial", render: () => <RPackageGate tab="spatial"><SpatialView /></RPackageGate> },
   { label: "16S rRNA", render: () => <RPackageGate tab="microbiome"><MicrobiomeView /></RPackageGate> },
   { label: "Plate Mapper", render: () => <PlatemapView /> },
+  { label: "Figures", render: () => <FiguresView /> },
 ] as const;
 
 type Status = "checking" | "ok" | "down";
