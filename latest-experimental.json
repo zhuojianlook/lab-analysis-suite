@@ -1,10 +1,10 @@
 {
-  "version": "0.2.8",
-  "notes": "Update to exp-0.2.8",
-  "pub_date": "2026-06-18T03:46:29Z",
+  "version": "0.2.9",
+  "notes": "Update to exp-0.2.9",
+  "pub_date": "2026-06-18T04:39:19Z",
   "platforms": {
-    "darwin-aarch64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WmxCb3pXbnIzTmJML3lVemY2dDRraVlEd0pwcFNpL3RORmZEV0ZFamNpdWdvY0I5ejJWb0xWdlN1Z2ZYcXR3RHpROVZkUlRSZTlwSzZyc0dlb3VXOVFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNzU0MDQxCWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlLmFwcC50YXIuZ3oKUVA5WGJuS1h3bkZkejZxVnhpU3haMjFxS0Q0alR0dGl5QitjeXp1UE8rZEIxaDYwQ05CLzlrUUdUbWZ2cEU1bDlFejRES3BOSndMTzRyNnlHdGFQRFE9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.8/Lab.Analysis.Suite.app.tar.gz" },
-    "windows-x86_64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WnByVCtpUEdycHBkWVdSaHFKK2Zhc0dGRHRlQUNBVlNCdFZ2WWJJTDgvZEZTYUZVNlZXZXZxNnNzZXpwbThOa1lieVJNelF0SEZoV1JNNnRia1EvZ2dFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNzU0MzU4CWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlXzAuMi44X3g2NC1zZXR1cC5leGUKVnlIUnUzaXpjV0lUODd4UzQwOWQ0RTBQaG5MV0REa2VlZUsyaFZ6eCtLam1PUHd2U1NZbDVseEhWeTFoWDg4eFpOS0tLOVlYeENtREE0SGpCbXkyREE9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.8/Lab.Analysis.Suite_0.2.8_x64-setup.exe" },
-    "linux-x86_64":   { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.8/" }
+    "darwin-aarch64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WmtqZGpFbjRqNHVsNDNzc3YxbXhZaXJ4UWhGdGFYNGVEMmlmRVRVdER3dnJmaEtOdG1aWHBadjNnOGdPVU5YbnJQdkU4Z3lhUDY5VVNkRFlTdmVSV2cwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNzU3MjAwCWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlLmFwcC50YXIuZ3oKdkVRNXdoVk1hRzBqZVdyZC9lU2dhVURWWjBCamE1Z1VXOWUwdFBzenpZQWVlNmg0WFJNNTc0blZoRGdzTEZrdERnVFZvSm9MVXJaZjNQYkpXcTdjQWc9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.9/Lab.Analysis.Suite.app.tar.gz" },
+    "windows-x86_64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5Wm9oaGhXeTBjdFlwcjNuYVBCZlp2WlpGamxaZk9SVUNVVHltNlBmYmhuTkNVVWUzdHRFWFJwZmlSYW1STFdjU20zd1FSa1JJM2VuaHFoNGVSRXlOK2drPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgxNzU3NTI5CWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlXzAuMi45X3g2NC1zZXR1cC5leGUKNTZES05DbkdEeXZuUEJISnRxb2VLL2RaVTQ0aWJsalE3Q3hzY2tBNTVJMGdRSkJqVW01NEJwN3JpRERaZEpBeEJnTFp4a0J1VjdvUnNVMEx4QUZ4QkE9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.9/Lab.Analysis.Suite_0.2.9_x64-setup.exe" },
+    "linux-x86_64":   { "signature": "", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.9/" }
   }
 }
