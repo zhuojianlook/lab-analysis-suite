@@ -8,17 +8,36 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ── 0. Decide the build matrix ────────────────────────────────────────────
+  # Experimental (exp-*) tags skip the Windows build to speed up iteration and
+  # keep experimental releases macOS/Linux-only. Stable (v*) tags and manual
+  # dispatch test-builds still build all three (so Windows breakage is caught
+  # before a stable release). One matrix object feeds both build jobs; the
+  # `bundles` field is unused by the sidecar job.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        shell: bash
+        run: |
+          MAC='{"os":"macos-14","triple":"aarch64-apple-darwin","bundles":"app"}'
+          WIN='{"os":"windows-latest","triple":"x86_64-pc-windows-msvc","bundles":"nsis"}'
+          LIN='{"os":"ubuntu-22.04","triple":"x86_64-unknown-linux-gnu","bundles":"deb"}'
+          if [[ "${GITHUB_REF_NAME}" == exp-* ]]; then
+            echo "Experimental tag (${GITHUB_REF_NAME}) — skipping Windows build."
+            echo "matrix={\"include\":[$MAC,$LIN]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Stable/dispatch (${GITHUB_REF_NAME}) — building all platforms."
+            echo "matrix={\"include\":[$MAC,$WIN,$LIN]}" >> "$GITHUB_OUTPUT"
+          fi
+
   # ── 1. Build the Python sidecar (PyInstaller) per platform ────────────────
   build-sidecar:
+    needs: setup
     strategy:
-      matrix:
-        include:
-          - os: macos-14            # Apple Silicon
-            triple: aarch64-apple-darwin
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-          - os: ubuntu-22.04        # oldest supported glibc
-            triple: x86_64-unknown-linux-gnu
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -68,22 +87,13 @@ jobs:
 
   # ── 2. Build the bundled R engine + the Tauri app per platform ────────────
   build-tauri:
-    needs: build-sidecar
+    needs: [setup, build-sidecar]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            triple: aarch64-apple-darwin
-            bundles: app
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-            bundles: nsis
-          - os: ubuntu-22.04
-            triple: x86_64-unknown-linux-gnu
-            # deb only: linuxdeploy (AppImage) chokes on the onedir engine's
-            # nested executable + .so files. deb packages the resource dir fine.
-            bundles: deb
+      # Same dynamic matrix as the sidecar job (Windows dropped on exp-* tags).
+      # Linux is deb-only: linuxdeploy (AppImage) chokes on the onedir engine's
+      # nested executable + .so files; deb packages the resource dir fine.
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -300,19 +310,33 @@ jobs:
           MAC_GH=$(echo "$MAC_TAR" | tr ' ' '.'); WIN_GH=$(echo "$WIN_EXE" | tr ' ' '.'); LIN_GH=$(echo "$LIN_APP" | tr ' ' '.')
 
           MANIFEST="latest.json"; [ "$CHANNEL" = "experimental" ] && MANIFEST="latest-experimental.json"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          # Only list a platform when its asset actually built — experimental
+          # builds skip Windows (no setup.exe), and Linux ships deb-only (no
+          # AppImage), so those platforms are omitted rather than left with a
+          # broken empty URL the updater would choke on.
+          PLATFORMS=""
+          add_platform() {
+            local key="$1" fname="$2" sig="$3"
+            [ -z "$fname" ] && return
+            [ -n "$PLATFORMS" ] && PLATFORMS="${PLATFORMS},"
+            PLATFORMS="${PLATFORMS}
+              \"${key}\": { \"signature\": \"${sig}\", \"url\": \"${BASE}/${fname}\" }"
+          }
+          add_platform "darwin-aarch64" "$MAC_GH" "$MAC_SIG"
+          add_platform "windows-x86_64" "$WIN_GH" "$WIN_SIG"
+          add_platform "linux-x86_64"   "$LIN_GH" "$LIN_SIG"
           cat > "artifacts/${MANIFEST}" << ENDJSON
           {
             "version": "${VERSION}",
             "notes": "Update to ${TAG}",
             "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "platforms": {
-              "darwin-aarch64": { "signature": "${MAC_SIG}", "url": "https://github.com/${REPO}/releases/download/${TAG}/${MAC_GH}" },
-              "windows-x86_64": { "signature": "${WIN_SIG}", "url": "https://github.com/${REPO}/releases/download/${TAG}/${WIN_GH}" },
-              "linux-x86_64":   { "signature": "${LIN_SIG}", "url": "https://github.com/${REPO}/releases/download/${TAG}/${LIN_GH}" }
+            "platforms": {${PLATFORMS}
             }
           }
           ENDJSON
           cat "artifacts/${MANIFEST}"
+          python3 -c "import json;json.load(open('artifacts/${MANIFEST}'))" && echo "manifest JSON valid"
       - name: Push manifest to updater branch
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
