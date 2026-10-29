@@ -79,6 +79,35 @@ export function notDetected(
   return out;
 }
 
+/** HSL (degrees, %, %) -> #rrggbb — the colour input and R both need hex. */
+function hslHex(h: number, s: number, l: number): string {
+  const sat = s / 100;
+  const lig = l / 100;
+  const a = sat * Math.min(lig, 1 - lig);
+  const f = (n: number) => {
+    const k = (n + h / 30) % 12;
+    return lig - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
+  };
+  const hex = (x: number) => Math.round(x * 255).toString(16).padStart(2, "0");
+  return `#${hex(f(0))}${hex(f(8))}${hex(f(4))}`;
+}
+
+/** Give each sample without a colour the first palette colour nobody uses yet,
+ *  then golden-angle hues once the palette runs out (no repeats past 8). */
+export function assignColors(prev: Record<string, string>, samples: string[], palette: string[]): Record<string, string> {
+  const next = { ...prev };
+  const used = new Set(Object.values(next).map((c) => c.toLowerCase()));
+  let extra = 0;
+  for (const s of samples) {
+    if (next[s]) continue;
+    let c = palette.find((p) => !used.has(p.toLowerCase()));
+    while (!c || used.has(c)) c = hslHex(Math.round((used.size + extra++) * 137.508) % 360, 45, 52);
+    next[s] = c;
+    used.add(c.toLowerCase());
+  }
+  return next;
+}
+
 /** Subset of a per-sample map (keeps request keys stable for live re-renders). */
 export function pick<T>(m: Record<string, T>, keys: string[]): Record<string, T> {
   return Object.fromEntries(keys.filter((k) => k in m).map((k) => [k, m[k]]));

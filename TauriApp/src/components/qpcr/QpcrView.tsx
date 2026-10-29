@@ -46,7 +46,7 @@ import {
   type QpcrLibraryRun,
 } from "../../api/client";
 import type { RunRResponse } from "../../api/types";
-import type { QpcrRecord } from "../../store/qpcrManualStore";
+import { useQpcrManualStore, type QpcrRecord } from "../../store/qpcrManualStore";
 import { RecordTable } from "../shared/RecordTable";
 import { PlotResult } from "../shared/PlotResult";
 import { Workspace } from "../shared/Workspace";
@@ -55,7 +55,7 @@ import { FileDropZone } from "../shared/FileDropZone";
 import { NumberField } from "../shared/NumberField";
 import { QpcrManualEntry } from "./QpcrManualEntry";
 import { QpcrOverview } from "./QpcrOverview";
-import { buildDataset, notDetected, pick } from "./qpcrData";
+import { assignColors, buildDataset, notDetected, pick } from "./qpcrData";
 
 const PALETTES: Record<string, string[]> = {
   Default: ["#5a7fa8", "#63a66a", "#c1666b", "#d4a05a", "#8a6fae", "#4aa3a3", "#b07aa1", "#9c9c4a"],
@@ -221,6 +221,7 @@ export function QpcrView() {
   const [method, setMethod] = useState<"auto" | "ttest" | "anova">("auto");
   const [analysis, setAnalysis] = useState<QpcrAnalyzeResult | null>(null);
   const [analyzedSel, setAnalyzedSel] = useState<Selection | null>(null);
+  const [analysisWarnings, setAnalysisWarnings] = useState<string[]>([]);
 
   // ── figure ────────────────────────────────────────────────────────────────
   const [layout, setLayout] = useState<"grouped" | "faceted">("grouped");
@@ -281,7 +282,8 @@ export function QpcrView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [ds, cpSamples.join("\u0000"), cpLimit],
   );
-  const selKey = JSON.stringify([refGenes, targetGenes, sampleOrder, method, useCommon, ds.runIds, excludeHigh ? cpLimit : null]);
+  // Everything that changes the analysis input (not view-only switches).
+  const selKey = JSON.stringify([refGenes, targetGenes, sampleOrder, method, ds.runIds, excludeHigh ? cpLimit : null]);
   const stale = !!analysis && analyzedSel?.key !== selKey;
   const canAnalyze = ds.runs.length > 0 && refGenes.length > 0 && targetGenes.length > 0 && !!control && experimental.length > 0;
   const toggle = (s: Step) => (o: boolean) => setOpen((p) => ({ ...p, [s]: o }));
@@ -347,6 +349,7 @@ export function QpcrView() {
         ...res.errors,
       ];
       if (!done.length && !problems.length) problems.push("No LightCycler pairs found — names must end in _qpcr.txt and _platemap.txt");
+      if (res.replaced.length) problems.push("A run with the same name was already in the library; its wells were replaced");
       setImportNote({ tone: problems.length ? "warning" : "success", text: [...done, ...problems].join(". ") + "." });
       if (done.length) setOpen((p) => ({ ...p, analysis: true }));
     } catch (e) {
@@ -380,7 +383,14 @@ export function QpcrView() {
   };
 
   const openManual = () => {
-    setManualName(`Manual ${nowLabel()}`);
+    // Re-opening a plate that was saved keeps its name, so saving an edit
+    // replaces that run instead of adding a duplicate next to it.
+    const { savedAs, values } = useQpcrManualStore.getState();
+    const hasWells = Object.values(values.Cp).some((v) => v.trim() !== "");
+    const savedRun = savedAs ? runs.find((r) => r.name === savedAs && r.source === "manual") : undefined;
+    let name = `Manual ${nowLabel()}`;
+    for (let n = 2; runs.some((r) => r.name === name); n++) name = `Manual ${nowLabel()} (${n})`;
+    setManualName(hasWells && savedRun ? savedRun.name : name);
     setManualErr(null);
     setManualOpen(true);
   };
@@ -393,6 +403,7 @@ export function QpcrView() {
     try {
       const res = await saveQpcrManualRun(name, records);
       if (res.error) { setManualErr(res.error); return; }
+      useQpcrManualStore.getState().setSavedAs(name);
       adoptLibrary(res, [name]);
       setManualOpen(false);
       setImportNote({ tone: "success", text: `${res.replaced ? "Updated" : "Added"} ${name}.` });
@@ -404,22 +415,24 @@ export function QpcrView() {
     }
   };
 
-  // When the included runs change: keep still-valid choices and colours and
-  // default the reference gene. (A changed run set also marks a finished
-  // analysis as stale via selKey.)
-  const datasetKey = JSON.stringify([ds.genesAll, ds.samples]);
+  // When the included runs (or the gene scope) change: keep still-valid choices
+  // and colours and default the reference gene. (A changed run set also marks a
+  // finished analysis as stale via selKey.) A default reference must be in
+  // EVERY ticked run — normalising runs to different references biases the
+  // fold change — so it comes from genesCommon whatever the scope switch says.
+  const datasetKey = JSON.stringify([ds.genesAll, ds.genesCommon, ds.samples, useCommon]);
   useEffect(() => {
-    const geneSet = new Set(ds.genesAll);
+    const geneSet = new Set(useCommon ? ds.genesCommon : ds.genesAll);
     const sampleSet = new Set(ds.samples);
     setRefGenes((prev) => {
       const kept = prev.filter((g) => geneSet.has(g));
-      return kept.length ? kept : ds.genesAll.filter((g) => HOUSEKEEPING.test(g));
+      return kept.length ? kept : ds.genesCommon.filter((g) => HOUSEKEEPING.test(g));
     });
     setTargetGenes((prev) => prev.filter((g) => geneSet.has(g)));
     setControl((prev) => (sampleSet.has(prev) ? prev : ""));
     setExperimental((prev) => prev.filter((s) => sampleSet.has(s)));
     // Colours/labels are only ever added, so an existing figure keeps its look.
-    setColors((prev) => ({ ...Object.fromEntries(ds.samples.map((s, i) => [s, PALETTES.Default[i % 8]])), ...prev }));
+    setColors((prev) => assignColors(prev, ds.samples, PALETTES.Default));
     setLabels((prev) => ({ ...Object.fromEntries(ds.samples.map((s) => [s, s])), ...prev }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [datasetKey]);
@@ -450,7 +463,7 @@ export function QpcrView() {
   };
 
   const runAnalysis = async () => {
-    if (!canAnalyze) return;
+    if (!canAnalyze || analyzing) return;
     setAnalyzing(true);
     setErr(null);
     try {
@@ -458,6 +471,7 @@ export function QpcrView() {
         run_ids: ds.runIds, cp_max: excludeHigh ? cpLimit : null,
         reference_genes: refGenes, target_genes: targetGenes, control, experimental, method,
       });
+      setAnalysisWarnings(res.warnings ?? []);
       if (res.error) { setErr({ step: "analysis", msg: res.error }); return; }
       const sel: Selection = { genes: targetGenes, refs: refGenes, samples: sampleOrder, key: selKey };
       setAnalysis(res);
@@ -482,24 +496,30 @@ export function QpcrView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paramsKey, liveUpdate, analysis, analyzedSel]);
 
+  const renderCp = async (params: typeof cpParams, key: string) => {
+    const seq = ++cpSeq.current;
+    cpKeyRendered.current = key;
+    setCpPlotting(true);
+    try {
+      const res = await plotQpcrCp(params);
+      if (seq !== cpSeq.current) return;
+      setCpPlot(res);
+      if (!res.success) cpKeyRendered.current = null; // let the next change (or Re-render) retry
+    } catch (e) {
+      if (seq !== cpSeq.current) return;
+      setCpPlot({ success: false, stdout: "", stderr: errMsg(e), plots: [], tables: [] });
+      cpKeyRendered.current = null;
+    } finally {
+      if (seq === cpSeq.current) setCpPlotting(false);
+    }
+  };
+
   // The Cp graph renders while its tab is open and follows the selection,
   // the Cp limit and the shared style settings.
   useEffect(() => {
     if (canvasTab !== "cp" || !ds.runIds.length || cpKey === cpKeyRendered.current) return;
     const params = cpParams;
-    const t = setTimeout(async () => {
-      const seq = ++cpSeq.current;
-      cpKeyRendered.current = cpKey;
-      setCpPlotting(true);
-      try {
-        const res = await plotQpcrCp(params);
-        if (seq === cpSeq.current) setCpPlot(res);
-      } catch (e) {
-        if (seq === cpSeq.current) setCpPlot({ success: false, stdout: "", stderr: errMsg(e), plots: [], tables: [] });
-      } finally {
-        if (seq === cpSeq.current) setCpPlotting(false);
-      }
-    }, cpKeyRendered.current === null ? 0 : 500);
+    const t = setTimeout(() => { void renderCp(params, cpKey); }, cpPlot ? 500 : 0);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cpKey, canvasTab]);
@@ -522,7 +542,7 @@ export function QpcrView() {
     if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey)) return;
     e.preventDefault();
     if (analysis && !stale) render();
-    else if (canAnalyze) void runAnalysis();
+    else if (canAnalyze && !analyzing) void runAnalysis();
   };
 
   // ── rail sections ─────────────────────────────────────────────────────────
@@ -540,7 +560,8 @@ export function QpcrView() {
     ? `${analyzedSel.genes.length} gene${analyzedSel.genes.length > 1 ? "s" : ""} × ${analyzedSel.samples.length} samples · ${testName}${stale ? " · changed" : ""}`
     : ds.runs.length ? "Pick genes and samples" : "Tick at least one run";
 
-  const filter = runFilter.trim().toLowerCase();
+  // The filter box only exists above 6 runs; ignore a leftover filter below that.
+  const filter = runs.length > 6 ? runFilter.trim().toLowerCase() : "";
   const shownRuns = filter ? runs.filter((r) => r.name.toLowerCase().includes(filter)) : runs;
 
   const dataSection = (
@@ -575,6 +596,9 @@ export function QpcrView() {
         <Typography variant="body2" color="text.secondary" sx={{ py: 1 }}>
           No runs yet. Runs you add are saved here and stay available next time.
         </Typography>
+      )}
+      {filter && !shownRuns.length && (
+        <Typography variant="body2" color="text.secondary" sx={{ py: 1 }}>No runs match “{runFilter.trim()}”.</Typography>
       )}
       <Stack spacing={0.25}>
         {shownRuns.map((r) => (
@@ -637,6 +661,7 @@ export function QpcrView() {
   const sampleOption = (props: HTMLAttributes<HTMLLIElement> & { key?: Key }, s: string) =>
     <OptionRow props={props} label={s} note={runsOf(ds.sampleRuns.get(s))} />;
   const lowTargets = targetGenes.filter((g) => lowCp.has(g));
+  const refsMissing = refGenes.filter((g) => (ds.geneRuns.get(g) ?? 0) < ds.runs.length);
 
   const analysisSection = (
     <RailSection step={2} title="Analysis" summary={analysisSummary} done={!!analysis && !stale}
@@ -650,9 +675,17 @@ export function QpcrView() {
         The lists show how many of the {ds.runs.length} ticked runs contain each gene or sample — the Overview tab maps them in full.
       </Typography>
       <Stack spacing={1.5}>
-        <Autocomplete multiple size="small" limitTags={4} options={genes} value={refGenes} renderOption={geneOption}
-          onChange={(_, v) => { setRefGenes(v); setTargetGenes((t) => t.filter((g) => !v.includes(g))); }}
-          renderInput={(p) => <TextField {...p} label="Reference (housekeeping) genes" />} />
+        <Box>
+          <Autocomplete multiple size="small" limitTags={4} options={genes} value={refGenes} renderOption={geneOption}
+            onChange={(_, v) => { setRefGenes(v); setTargetGenes((t) => t.filter((g) => !v.includes(g))); }}
+            renderInput={(p) => <TextField {...p} label="Reference (housekeeping) genes" />} />
+          {refsMissing.length > 0 && (
+            <Typography variant="caption" color="warning.main" component="div" sx={{ mt: 0.25 }}>
+              {refsMissing.join(", ")} {refsMissing.length > 1 ? "aren't" : "isn't"} in every ticked run — samples in runs
+              without {refsMissing.length > 1 ? "them" : "it"} are left out, so every run is normalised the same way.
+            </Typography>
+          )}
+        </Box>
         <Box>
           <Autocomplete multiple size="small" limitTags={6} options={genes.filter((g) => !refGenes.includes(g))}
             value={targetGenes} onChange={(_, v) => setTargetGenes(v)} renderOption={geneOption}
@@ -714,6 +747,11 @@ export function QpcrView() {
         <Typography variant="caption" color="warning.main" component="div" sx={{ mt: 0.75 }}>
           Runs or selections changed since the last run — re-run to update the figure.
         </Typography>
+      )}
+      {analysisWarnings.length > 0 && (
+        <Alert severity="warning" onClose={() => setAnalysisWarnings([])} sx={{ mt: 1.5 }}>
+          {analysisWarnings.map((w) => <div key={w}>{w}</div>)}
+        </Alert>
       )}
       {stepError("analysis")}
     </RailSection>
@@ -881,6 +919,9 @@ export function QpcrView() {
         <FormControlLabel sx={{ mr: 0 }}
           control={<Switch size="small" checked={excludeHigh} onChange={(e) => setExcludeHigh(e.target.checked)} />}
           label={<Typography variant="body2">Exclude wells ≥ Cp {cpLimit} from the analysis</Typography>} />
+        <Button size="small" startIcon={<RefreshIcon />} disabled={cpPlotting} onClick={() => void renderCp(cpParams, cpKey)}>
+          Re-render
+        </Button>
       </Stack>
       {lowShown.length > 0 && (
         <Alert severity="warning" sx={{ alignItems: "center" }}>

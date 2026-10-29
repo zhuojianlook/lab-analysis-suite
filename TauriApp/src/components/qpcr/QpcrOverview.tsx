@@ -1,4 +1,4 @@
-import type { CSSProperties, ReactNode } from "react";
+import { memo, type CSSProperties, type ReactNode } from "react";
 import { Box, Chip, Stack, Typography } from "@mui/material";
 import type { QpcrLibraryRun } from "../../api/client";
 import { RecordTable } from "../shared/RecordTable";
@@ -68,8 +68,10 @@ function Matrix({
 }
 
 /** What the included runs contain: a run summary, then genes x runs and
- *  samples x runs maps (well counts; amber = mostly at/above the Cp limit). */
-export function QpcrOverview({
+ *  samples x runs maps (well counts; amber = mostly at/above the Cp limit).
+ *  Memoised: the per-run maps are costly and the parent re-renders on every
+ *  keystroke, while these props only change with the data or selection. */
+export const QpcrOverview = memo(function QpcrOverview({
   ds, refGenes, targetGenes, cpLimit,
 }: {
   ds: Dataset; refGenes: string[]; targetGenes: string[]; cpLimit: number;
@@ -124,4 +126,4 @@ export function QpcrOverview({
       />
     </Stack>
   );
-}
+});

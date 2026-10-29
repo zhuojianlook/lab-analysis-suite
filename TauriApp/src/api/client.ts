@@ -275,6 +275,8 @@ export interface QpcrAnalyzeResult {
   summary: { Gene: string; Sample: string; mean: number; sd: number; sem: number; n: number }[];
   ttest_results: Record<string, unknown>[];
   anova_tukey_results: Record<string, unknown>[];
+  /** e.g. samples left out because a reference gene wasn't measured for them. */
+  warnings?: string[];
   error?: string;
 }
 

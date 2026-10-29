@@ -14,7 +14,7 @@ import datetime
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import pandas as pd
 
@@ -44,12 +44,18 @@ def db_path() -> str:
 
 @contextmanager
 def _connect():
-    con = sqlite3.connect(db_path())
     try:
+        con = sqlite3.connect(db_path(), timeout=15)
         con.executescript(_SCHEMA)
+    except sqlite3.DatabaseError as e:
+        raise RuntimeError(f"The qPCR run library at {db_path()} can't be opened ({e}).") from e
+    try:
         con.execute("PRAGMA foreign_keys = ON")
         yield con
         con.commit()
+    except BaseException:
+        con.rollback()
+        raise
     finally:
         con.close()
 
@@ -57,27 +63,35 @@ def _connect():
 def save_run(name: str, source: str, wells: pd.DataFrame) -> bool:
     """Insert a run, or replace the run with the same name. `wells` needs
     Well, Sample, Gene, Cp columns (Cp NaN = undetermined). Returns True if an
-    existing run was replaced."""
+    existing run was replaced.
+
+    A replaced run gets a NEW id (AUTOINCREMENT never reuses one): the UI keys
+    finished analyses and rendered graphs on run ids, so new data must look
+    like a new run or stale results would keep showing."""
     now = datetime.datetime.now().isoformat(timespec="seconds")
     rows = [
         (None if pd.isna(w) else str(w), str(s), str(g), None if pd.isna(c) else float(c))
         for w, s, g, c in wells[["Well", "Sample", "Gene", "Cp"]].itertuples(index=False)
     ]
     with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")  # one writer: no check-then-insert race on the name
         existing = con.execute("SELECT id FROM runs WHERE name = ?", (name,)).fetchone()
         if existing:
-            run_id = existing[0]
-            con.execute("DELETE FROM wells WHERE run_id = ?", (run_id,))
-            con.execute("UPDATE runs SET source = ?, added_at = ? WHERE id = ?", (source, now, run_id))
-        else:
-            run_id = con.execute(
-                "INSERT INTO runs (name, source, added_at) VALUES (?, ?, ?)", (name, source, now)
-            ).lastrowid
+            con.execute("DELETE FROM runs WHERE id = ?", (existing[0],))  # cascades to its wells
+        run_id = con.execute(
+            "INSERT INTO runs (name, source, added_at) VALUES (?, ?, ?)", (name, source, now)
+        ).lastrowid
         con.executemany(
             "INSERT INTO wells (run_id, well, sample, gene, cp) VALUES (?, ?, ?, ?, ?)",
             [(run_id, *r) for r in rows],
         )
     return existing is not None
+
+
+def find_run(name: str) -> Optional[dict]:
+    with _connect() as con:
+        row = con.execute("SELECT id, name, source FROM runs WHERE name = ?", (name,)).fetchone()
+    return {"id": row[0], "name": row[1], "source": row[2]} if row else None
 
 
 def delete_run(run_id: int) -> None:

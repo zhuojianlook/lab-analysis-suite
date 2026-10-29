@@ -6,18 +6,23 @@ export type QField = "Gene" | "Sample" | "Cp";
 interface QpcrManualState {
   plate: string;
   values: Record<QField, Record<string, string>>; // field -> well("A1") -> value
+  /** Library run this plate was last saved as — re-saving an edit replaces it. */
+  savedAs: string | null;
   setPlate: (p: string) => void;
   setCell: (field: QField, well: string, value: string) => void;
+  setSavedAs: (name: string | null) => void;
   clear: () => void;
 }
 
 export const useQpcrManualStore = create<QpcrManualState>((set) => ({
   plate: "96",
   values: { Gene: {}, Sample: {}, Cp: {} },
+  savedAs: null,
   setPlate: (plate) => set({ plate }),
   setCell: (field, well, value) =>
     set((s) => ({ values: { ...s.values, [field]: { ...s.values[field], [well]: value } } })),
-  clear: () => set({ values: { Gene: {}, Sample: {}, Cp: {} } }),
+  setSavedAs: (savedAs) => set({ savedAs }),
+  clear: () => set({ values: { Gene: {}, Sample: {}, Cp: {} }, savedAs: null }),
 }));
 
 export interface QpcrRecord { Well: string; Sample: string; Gene: string; Cp: number }
