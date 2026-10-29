@@ -101,13 +101,19 @@ class AnalyzeRequest(BaseModel):
 
 
 def _star(p: float, sig: float) -> str:
-    if p < sig / 100:
+    """GraphPad Prism (GP) style: * P≤0.05, ** P≤0.01, *** P≤0.001, **** P≤0.0001.
+    `sig` (α) only decides what counts as significant — a P above it is "ns" —
+    so each asterisk count always means the same P range, as in Prism.
+    Written as `not (p <= …)` so a NaN P (e.g. zero variance) reads as "ns"."""
+    if not (p <= sig and p <= 0.05):
+        return "ns"
+    if p <= 0.0001:
         return "****"
-    if p < sig / 10:
+    if p <= 0.001:
         return "***"
-    if p < sig:
+    if p <= 0.01:
         return "**"
-    return "ns"
+    return "*"
 
 
 @router.post("/api/qpcr/analyze")
@@ -165,10 +171,13 @@ def analyze(body: AnalyzeRequest):
                 try:
                     ols("Fold_Change ~ C(Sample)", data=sub).fit()
                     tuk = pairwise_tukeyhsd(endog=sub["Fold_Change"], groups=sub["Sample"], alpha=0.05)
-                    for row in tuk.summary().data[1:]:
+                    # The summary table rounds p-adj to 4 dp (7.8e-05 -> 0.0001), which
+                    # would put P just above 0.0001 into "****"; use the exact values
+                    # (same row order as the summary).
+                    for row, p_exact in zip(tuk.summary().data[1:], tuk.pvalues):
                         g1, g2, md, padj, lo, hi, rej = row
                         anova_tukey_results.append({"Gene": gene, "Group1": str(g1), "Group2": str(g2),
-                                                    "Mean_Diff": float(md), "p_val": float(padj),
+                                                    "Mean_Diff": float(md), "p_val": float(p_exact),
                                                     "Significant": bool(rej)})
                 except Exception:  # noqa: BLE001
                     pass

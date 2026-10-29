@@ -195,15 +195,17 @@ def process(body: ProcessRequest):
 # ── Endpoint bar stats (ANOVA + Tukey at a timepoint) ───────────────────────
 
 def _stars(p: float) -> str:
-    if p < 0.00005:
+    """GraphPad Prism (GP) style: * P≤0.05, ** P≤0.01, *** P≤0.001, **** P≤0.0001.
+    Written as `not (p <= …)` so a NaN P reads as "ns"."""
+    if not p <= 0.05:
+        return "ns"
+    if p <= 0.0001:
         return "****"
-    if p < 0.0005:
+    if p <= 0.001:
         return "***"
-    if p < 0.005:
+    if p <= 0.01:
         return "**"
-    if p < 0.05:
-        return "*"
-    return "ns"
+    return "*"
 
 
 class BarStatsRequest(BaseModel):
@@ -243,10 +245,12 @@ def bar_stats(body: BarStatsRequest):
                 flat = np.concatenate(groups)
                 labels = np.concatenate([[s] * len(g) for s, g in zip(body.samples, groups)])
                 tuk = pairwise_tukeyhsd(flat, labels, 0.05)
-                for row in tuk.summary().data[1:]:
+                # Exact p-adj: the summary table rounds to 4 dp, which matters at
+                # the 0.0001 cut-off (same row order as the summary).
+                for row, p_exact in zip(tuk.summary().data[1:], tuk.pvalues):
                     g1, g2, md, padj, lo, hi, rej = row
                     comparisons.append({"group1": str(g1), "group2": str(g2),
-                                        "p": float(padj), "star": _stars(float(padj)), "reject": bool(rej)})
+                                        "p": float(p_exact), "star": _stars(float(p_exact)), "reject": bool(rej)})
         except Exception:  # noqa: BLE001
             pass
     return {"time_h": float(t), "replicates": reps, "summary": summ.to_dict("records"),

@@ -560,7 +560,8 @@ export function QpcrView() {
       <RailHeading>Significance</RailHeading>
       <Grid2>
         <TextField select size="small" label="Threshold (α)" value={sigLevel} onChange={(e) => setSigLevel(Number(e.target.value))}>
-          {[0.1, 0.05, 0.01, 0.001].map((v) => <MenuItem key={v} value={v}>{v}</MenuItem>)}
+          {/* Stars use fixed Prism cut-offs, so α only hides weaker results; above 0.05 it would change nothing. */}
+          {[0.05, 0.01, 0.001].map((v) => <MenuItem key={v} value={v}>{v}</MenuItem>)}
         </TextField>
         <FormControlLabel sx={{ ml: 0 }}
           control={<Switch size="small" checked={hideNs} onChange={(e) => setHideNs(e.target.checked)} />}
