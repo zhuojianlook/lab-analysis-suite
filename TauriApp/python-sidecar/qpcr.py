@@ -13,6 +13,7 @@ stays purely presentational.
 from __future__ import annotations
 
 import io
+import itertools
 import math
 from typing import Dict, List, Optional
 
@@ -22,7 +23,6 @@ from fastapi import APIRouter, File, UploadFile
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from scipy.stats import ttest_ind
-from statsmodels.formula.api import ols
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
 import qpcr_library
@@ -32,6 +32,11 @@ router = APIRouter()
 
 # LightCycler export columns to drop (Include, Color, Concentration, Standard, Status)
 QPCR_DROP_COLS = [0, 1, 5, 6, 7]
+
+# Plate-map cells that mean "unassigned well" — pandas' default NA markers
+# minus "NA" and "None", which are plausible sample names.
+PLATEMAP_BLANKS = ["", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan", "1.#IND", "1.#QNAN",
+                   "<NA>", "N/A", "n/a", "NULL", "null", "NaN", "nan"]
 
 
 # ── Parsing ─────────────────────────────────────────────────────────────────
@@ -44,7 +49,7 @@ def _parse_pair_wells(qpcr_bytes: bytes, platemap_bytes: bytes) -> pd.DataFrame:
     # Plate-map labels are text: read them as such so an all-numeric Sample
     # column doesn't become "1.0" in one run and "1" in another, and a sample
     # literally named "NA" isn't read as missing.
-    dl = pd.read_csv(io.BytesIO(platemap_bytes), sep="\t", dtype=str, keep_default_na=False, na_values=[""])
+    dl = pd.read_csv(io.BytesIO(platemap_bytes), sep="\t", dtype=str, keep_default_na=False, na_values=PLATEMAP_BLANKS)
     if "Cell Position" in dl.columns:
         dl = dl.rename(columns={"Cell Position": "Pos"})
     dq["Pos"] = dq["Pos"].astype(str).str.strip()
@@ -90,7 +95,7 @@ async def _read_pairs(files: List[UploadFile]):
             target = qpcr_files
         else:
             continue
-        if stem in target:
+        if stem in target and target[stem] != data:  # the same file dropped twice is fine
             dupes.add(stem)
         target[stem] = data
         names.setdefault(stem, name)
@@ -142,6 +147,10 @@ def library():
 def _store_pairs(paired: Dict[str, tuple]):
     added, replaced, errors = [], [], []
     for stem, (qb, pb) in paired.items():
+        existing = qpcr_library.find_run(stem)
+        if existing and existing["source"] != "lightcycler":
+            errors.append(f"{stem}: a manually entered plate already has this name — rename or remove it first")
+            continue
         try:
             wells = _parse_pair_wells(qb, pb)
             if wells.empty:
@@ -167,6 +176,7 @@ async def library_import(files: List[UploadFile] = File(...)):
 class ManualRunRequest(BaseModel):
     name: str
     records: List[dict]             # [{Well?, Sample, Gene, Cp}]
+    replaces: Optional[str] = None  # the manual run this plate was saved as (rename)
 
 
 @router.post("/api/qpcr/library/manual")
@@ -183,7 +193,17 @@ def library_manual(body: ManualRunRequest):
     if "Well" not in df.columns:
         df["Well"] = None
     df["Cp"] = pd.to_numeric(df["Cp"], errors="coerce")
-    return {"replaced": qpcr_library.save_run(name, "manual", df), **_library()}
+    replaced = qpcr_library.save_run(name, "manual", df)
+    # Saved under a new name: that's a rename — drop the old copy so the plate
+    # isn't in the library (and ticked) twice.
+    renamed_from = None
+    old = (body.replaces or "").strip()
+    if old and old != name:
+        prev = qpcr_library.find_run(old)
+        if prev and prev["source"] == "manual":
+            qpcr_library.delete_run(prev["id"])
+            renamed_from = old
+    return {"replaced": replaced, "renamed_from": renamed_from, **_library()}
 
 
 class DeleteRunRequest(BaseModel):
@@ -235,22 +255,29 @@ def _star(p: Optional[float], sig: float) -> str:
     return "*"
 
 
+def _complete_samples(ref: pd.DataFrame, refs: List[str]) -> set:
+    """Samples for which every reference gene has at least one well."""
+    n = ref.groupby("Sample")["Gene"].nunique()
+    return set(n[n == len(refs)].index)
+
+
 @router.post("/api/qpcr/analyze")
 def analyze(body: AnalyzeRequest):
+    refs = list(dict.fromkeys(body.reference_genes))
+    if not refs:
+        return {"error": "Choose at least one reference gene."}
     frames = []
     for p in body.pairs or qpcr_library.load_records(body.run_ids):
         df = pd.DataFrame(p.get("records") or [])
         if df.empty:
             continue
         df["Cp"] = pd.to_numeric(df["Cp"], errors="coerce")
-        df = df.dropna(subset=["Cp"])                # undetermined wells
-        if body.cp_max is not None:
-            df = df[df["Cp"] < body.cp_max]
-        frames.append((p.get("name", ""), df))
+        measured = df.dropna(subset=["Cp"])          # undetermined wells
+        kept = measured[measured["Cp"] < body.cp_max] if body.cp_max is not None else measured
+        frames.append((p.get("name", ""), measured, kept))
     if not frames:
         return {"error": "No data."}
 
-    refs = list(dict.fromkeys(body.reference_genes))
     keep_samples = [body.control] + body.experimental
     # Fold change for the reference genes too: with a single reference it is ~1
     # by construction, but the figure can show it on request. (Not tested.)
@@ -258,20 +285,26 @@ def analyze(body: AnalyzeRequest):
 
     warnings = []
     combined = pd.DataFrame()
-    for run_name, df in frames:
+    for run_name, measured, df in frames:
         ref = df[df["Gene"].isin(refs)]
         # Normalise a sample only if EVERY reference gene was measured for it in
         # this run; pooling runs normalised to different reference sets gives a
         # false fold change.
-        n_refs = ref.groupby("Sample")["Gene"].nunique()
-        complete = set(n_refs[n_refs == len(refs)].index)
+        complete = _complete_samples(ref, refs)
         incomplete = sorted(s for s in set(df.loc[df["Gene"].isin(fc_genes), "Sample"]) - complete if s in keep_samples)
         if incomplete:
-            why = "below the Cp limit" if body.cp_max is not None else "measured"
-            warnings.append(f"{run_name}: {', '.join(incomplete)} left out — not every reference gene "
-                            f"({', '.join(refs)}) was {why} for {'it' if len(incomplete) == 1 else 'them'} in this run.")
-        avg_ref = (ref[ref["Sample"].isin(complete)].groupby("Sample")["Cp"].mean()
-                   .reset_index().rename(columns={"Cp": "Average_Ref_Cp"}))
+            measured_ok = _complete_samples(measured[measured["Gene"].isin(refs)], refs)
+            by_limit = [s for s in incomplete if s in measured_ok]
+            for group, why in (([s for s in incomplete if s not in measured_ok], "measured"),
+                               (by_limit, f"below the Cp limit ({body.cp_max:g})" if body.cp_max is not None else "measured")):
+                if group:
+                    warnings.append(f"{run_name}: {', '.join(group)} left out — not every reference gene "
+                                    f"({', '.join(refs)}) was {why} for {'it' if len(group) == 1 else 'them'} in this run.")
+        # Reference Cp per sample = mean of the per-gene means, so a reference
+        # gene that lost a replicate isn't under-weighted (a well-pooled mean
+        # shifted the fold change whenever replicate counts differed).
+        avg_ref = (ref[ref["Sample"].isin(complete)].groupby(["Sample", "Gene"])["Cp"].mean()
+                   .groupby("Sample").mean().reset_index().rename(columns={"Cp": "Average_Ref_Cp"}))
         tar = df[df["Gene"].isin(fc_genes)]
         m = pd.merge(tar, avg_ref, on="Sample")
         m["dCp"] = m["Cp"] - m["Average_Ref_Cp"]
@@ -294,6 +327,14 @@ def analyze(body: AnalyzeRequest):
     combined["SEM"] = grouped.transform(lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0.0)
 
     final = combined[combined["Sample"].isin(keep_samples)].copy()
+    present = set(final["Sample"])
+    not_compared = [s for s in body.experimental if s not in present]
+    if not_compared and len(not_compared) == len(body.experimental):
+        return {"error": "None of the samples to compare has usable data (check the reference genes and the Cp limit).",
+                "warnings": warnings}
+    if not_compared:
+        warnings.append(f"{', '.join(not_compared)} {'has' if len(not_compared) == 1 else 'have'} no usable data "
+                        f"and {'is' if len(not_compared) == 1 else 'are'} not compared.")
 
     # stats — target genes only (a reference gene's fold change is ~1 by construction)
     n_groups = len(body.experimental) + 1
@@ -309,29 +350,42 @@ def analyze(body: AnalyzeRequest):
                 if not (len(cvals) and len(evals)):
                     continue
                 # Welch's t needs >= 2 replicates per side; report the comparison either way.
-                t, p = ttest_ind(cvals, evals, equal_var=False) if len(cvals) > 1 and len(evals) > 1 else (None, None)
+                t = p = None
+                if len(cvals) > 1 and len(evals) > 1:
+                    t, p = (_num(v) for v in ttest_ind(cvals, evals, equal_var=False))
+                    if t is None:  # zero variance on both sides: t is inf/NaN and scipy's p=0 means nothing
+                        p = None
                 ttest_results.append({"Gene": gene, "Control": body.control, "Experimental": exp,
                                       "n_control": int(len(cvals)), "n_experimental": int(len(evals)),
-                                      "T_Statistic": _num(t), "p_val": _num(p)})
+                                      "T_Statistic": t, "p_val": p})
 
     anova_tukey_results = []
     if do_anova:
         for gene in body.target_genes:
             sub = final[final["Gene"] == gene]
-            if sub["Sample"].nunique() > 1:
-                try:
-                    ols("Fold_Change ~ C(Sample)", data=sub).fit()
-                    tuk = pairwise_tukeyhsd(endog=sub["Fold_Change"], groups=sub["Sample"], alpha=0.05)
-                    # The summary table rounds p-adj to 4 dp (7.8e-05 -> 0.0001), which
-                    # would put P just above 0.0001 into "****"; use the exact values
-                    # (same row order as the summary).
-                    for row, p_exact in zip(tuk.summary().data[1:], tuk.pvalues):
-                        g1, g2, md, padj, lo, hi, rej = row
-                        anova_tukey_results.append({"Gene": gene, "Group1": str(g1), "Group2": str(g2),
-                                                    "Mean_Diff": _num(md), "p_val": _num(p_exact),
-                                                    "Significant": bool(rej)})
-                except Exception:  # noqa: BLE001
-                    pass
+            if sub["Sample"].nunique() < 2:
+                continue
+            # No within-group variance anywhere (e.g. every well at the Cp cap, or
+            # one well per sample): Tukey's P is 0 or NaN, which means nothing.
+            if sub.groupby("Sample")["Fold_Change"].var(ddof=1).fillna(0).eq(0).all():
+                means = sub.groupby("Sample")["Fold_Change"].mean()
+                for g1, g2 in itertools.combinations(sorted(means.index), 2):
+                    anova_tukey_results.append({"Gene": gene, "Group1": str(g1), "Group2": str(g2),
+                                                "Mean_Diff": _num(means[g2] - means[g1]), "p_val": None,
+                                                "Significant": False})
+                continue
+            try:
+                tuk = pairwise_tukeyhsd(endog=sub["Fold_Change"], groups=sub["Sample"], alpha=0.05)
+                # The summary table rounds p-adj to 4 dp (7.8e-05 -> 0.0001), which
+                # would put P just above 0.0001 into "****"; use the exact values
+                # (same row order as the summary).
+                for row, p_exact in zip(tuk.summary().data[1:], tuk.pvalues):
+                    g1, g2, md, padj, lo, hi, rej = row
+                    anova_tukey_results.append({"Gene": gene, "Group1": str(g1), "Group2": str(g2),
+                                                "Mean_Diff": _num(md), "p_val": _num(p_exact),
+                                                "Significant": bool(rej)})
+            except Exception:  # noqa: BLE001
+                pass
 
     # per (Gene, Sample) summary for plotting
     summ = (final.groupby(["Gene", "Sample"])
@@ -487,15 +541,17 @@ def plot(body: PlotRequest):
         # the brackets — so a gene missing a sample leaves a gap rather than
         # shifting bars/points under the wrong significance star (position
         # dodges re-pack per gene and disagree with each other).
+        # position="identity" everywhere: geom_boxplot otherwise defaults to
+        # dodge2, which re-packs touching boxes off their lanes.
         if ptype == "bar":
-            geom = ('p <- p + ggplot2::geom_col(data=summ, ggplot2::aes(xp, mean, fill=Sample), width=.w, colour="black", linewidth=0.3) + '
-                    'ggplot2::geom_errorbar(data=summ, ggplot2::aes(xp, ymin=pmax(0, mean-err), ymax=mean+err), width=.w * 0.35, linewidth=0.4)\n')
+            geom = ('p <- p + ggplot2::geom_col(data=summ, ggplot2::aes(xp, mean, fill=Sample), position="identity", width=.w, colour="black", linewidth=0.3) + '
+                    'ggplot2::geom_errorbar(data=summ, ggplot2::aes(xp, ymin=pmax(0, mean-err), ymax=mean+err), position="identity", width=.w * 0.35, linewidth=0.4)\n')
         elif ptype == "violin":
-            geom = 'p <- p + ggplot2::geom_violin(data=dat, ggplot2::aes(xp, value, fill=Sample, group=interaction(Gene, Sample)), width=.w, trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
+            geom = 'p <- p + ggplot2::geom_violin(data=dat, ggplot2::aes(xp, value, fill=Sample, group=interaction(Gene, Sample)), position="identity", width=.w, trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
         elif ptype == "box":
-            geom = 'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(xp, value, fill=Sample, group=interaction(Gene, Sample)), width=.w, outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
+            geom = 'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(xp, value, fill=Sample, group=interaction(Gene, Sample)), position="identity", width=.w, outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
         else:  # dot (flat crossbar at the mean)
-            geom = 'p <- p + ggplot2::geom_crossbar(data=summ, ggplot2::aes(xp, y=mean, ymin=mean, ymax=mean, fill=Sample), width=.w * 0.9, linewidth=0.3, colour="black")\n'
+            geom = 'p <- p + ggplot2::geom_crossbar(data=summ, ggplot2::aes(xp, y=mean, ymin=mean, ymax=mean, fill=Sample), position="identity", width=.w * 0.9, linewidth=0.3, colour="black")\n'
         points_layer = (
             f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(xp, value), position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=1), size={body.point_size}, shape=21, fill="white", colour="black", stroke=0.4)\n'
             if show_pts else ""

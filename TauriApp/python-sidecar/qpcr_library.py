@@ -44,11 +44,14 @@ def db_path() -> str:
 
 @contextmanager
 def _connect():
+    con = None
     try:
         con = sqlite3.connect(db_path(), timeout=15)
         con.executescript(_SCHEMA)
     except sqlite3.DatabaseError as e:
-        raise RuntimeError(f"The qPCR run library at {db_path()} can't be opened ({e}).") from e
+        if con is not None:
+            con.close()
+        raise RuntimeError(f"The qPCR run library at {db_path()} couldn't be used ({e}).") from e
     try:
         con.execute("PRAGMA foreign_keys = ON")
         yield con

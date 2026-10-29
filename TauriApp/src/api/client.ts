@@ -272,7 +272,8 @@ export interface QpcrImportResult extends QpcrLibrary {
 
 export interface QpcrAnalyzeResult {
   analysis_data: Record<string, unknown>[];
-  summary: { Gene: string; Sample: string; mean: number; sd: number; sem: number; n: number }[];
+  /** sd/sem are null for a single replicate; p_val/T_Statistic in the test rows can be null (untestable). */
+  summary: { Gene: string; Sample: string; mean: number | null; sd: number | null; sem: number | null; n: number }[];
   ttest_results: Record<string, unknown>[];
   anova_tukey_results: Record<string, unknown>[];
   /** e.g. samples left out because a reference gene wasn't measured for them. */
@@ -289,11 +290,14 @@ export async function importQpcrRuns(files: File[]): Promise<QpcrImportResult> {
   return parseApi<QpcrImportResult>(await uploadFiles("/api/qpcr/library/import", files, "files"));
 }
 
+/** Save a manual plate. `replaces` = the manual run it was saved as before, so
+ *  saving under a new name renames it instead of leaving a second copy. */
 export async function saveQpcrManualRun(
   name: string,
   records: { Well?: string; Sample: string; Gene: string; Cp: number }[],
-): Promise<QpcrLibrary & { replaced?: boolean; error?: string }> {
-  return apiJson("/api/qpcr/library/manual", "POST", JSON.stringify({ name, records }));
+  replaces?: string | null,
+): Promise<QpcrLibrary & { replaced?: boolean; renamed_from?: string | null; error?: string }> {
+  return apiJson("/api/qpcr/library/manual", "POST", JSON.stringify({ name, records, replaces: replaces ?? null }));
 }
 
 export async function deleteQpcrRun(runId: number): Promise<QpcrLibrary> {

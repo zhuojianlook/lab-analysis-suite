@@ -12,14 +12,19 @@ export interface Dataset {
   /** How many of the included runs contain each gene / sample. */
   geneRuns: Map<string, number>;
   sampleRuns: Map<string, number>;
+  /** How many of the included runs have at least one DETERMINED Cp for each gene. */
+  geneDetectedRuns: Map<string, number>;
 }
 
 export function buildDataset(runs: QpcrLibraryRun[]): Dataset {
   const geneRuns = new Map<string, number>();
   const sampleRuns = new Map<string, number>();
+  const geneDetectedRuns = new Map<string, number>();
   for (const r of runs) {
     r.genes.forEach((g) => geneRuns.set(g, (geneRuns.get(g) ?? 0) + 1));
     r.samples.forEach((s) => sampleRuns.set(s, (sampleRuns.get(s) ?? 0) + 1));
+    new Set(r.cells.filter((c) => c.cps.length > 0).map((c) => c.gene))
+      .forEach((g) => geneDetectedRuns.set(g, (geneDetectedRuns.get(g) ?? 0) + 1));
   }
   const genesAll = [...geneRuns.keys()].sort();
   return {
@@ -31,6 +36,7 @@ export function buildDataset(runs: QpcrLibraryRun[]): Dataset {
     wells: runs.reduce((n, r) => n + r.n_wells, 0),
     geneRuns,
     sampleRuns,
+    geneDetectedRuns,
   };
 }
 
@@ -92,18 +98,20 @@ function hslHex(h: number, s: number, l: number): string {
   return `#${hex(f(0))}${hex(f(8))}${hex(f(4))}`;
 }
 
-/** Give each sample without a colour the first palette colour nobody uses yet,
- *  then golden-angle hues once the palette runs out (no repeats past 8). */
+/** Give each sample without a colour the first palette colour not used by the
+ *  current samples, then golden-angle hues once the palette runs out. Only the
+ *  current samples count as "used", so colours don't depend on which runs were
+ *  ticked earlier; the search is bounded, so huge sample sets just reuse colours. */
 export function assignColors(prev: Record<string, string>, samples: string[], palette: string[]): Record<string, string> {
   const next = { ...prev };
-  const used = new Set(Object.values(next).map((c) => c.toLowerCase()));
-  let extra = 0;
+  const used = new Set(samples.filter((s) => next[s]).map((s) => next[s].toLowerCase()));
+  let k = 0;
   for (const s of samples) {
     if (next[s]) continue;
     let c = palette.find((p) => !used.has(p.toLowerCase()));
-    while (!c || used.has(c)) c = hslHex(Math.round((used.size + extra++) * 137.508) % 360, 45, 52);
-    next[s] = c;
-    used.add(c.toLowerCase());
+    for (let tries = 0; (!c || used.has(c)) && tries < 720; tries++) c = hslHex(Math.round(k++ * 137.508) % 360, 45, 52);
+    next[s] = c!;
+    used.add(next[s].toLowerCase());
   }
   return next;
 }

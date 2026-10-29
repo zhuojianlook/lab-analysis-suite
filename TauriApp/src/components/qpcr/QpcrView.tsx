@@ -211,6 +211,7 @@ export function QpcrView() {
   const [manualName, setManualName] = useState("");
   const [manualErr, setManualErr] = useState<string | null>(null);
   const [savingManual, setSavingManual] = useState(false);
+  const savedAs = useQpcrManualStore((s) => s.savedAs);
 
   // ── analysis ──────────────────────────────────────────────────────────────
   const [useCommon, setUseCommon] = useState(true);
@@ -340,8 +341,10 @@ export function QpcrView() {
     setErr(null);
     setImportNote(null);
     try {
+      const tickedBefore = new Set(runs.filter((r) => includedIds.has(r.id)).map((r) => r.name));
       const res = await importQpcrRuns(fs);
-      adoptLibrary(res, [...res.added, ...res.replaced]);
+      // New runs are ticked; a replaced run (new id) keeps the tick state it had.
+      adoptLibrary(res, [...res.added, ...res.replaced.filter((n) => tickedBefore.has(n))]);
       const done = [res.added.length && `Added ${res.added.join(", ")}`, res.replaced.length && `Updated ${res.replaced.join(", ")}`]
         .filter(Boolean) as string[];
       const problems = [
@@ -382,18 +385,35 @@ export function QpcrView() {
     setIncludedIds(next);
   };
 
+  /** An unused "Manual <date time>" run name. */
+  const freshManualName = () => {
+    let name = `Manual ${nowLabel()}`;
+    for (let n = 2; runs.some((r) => r.name === name); n++) name = `Manual ${nowLabel()} (${n})`;
+    return name;
+  };
+
+  /** The library run the plate in the editor was last saved as, if it still exists. */
+  const savedManualRun = savedAs ? runs.find((r) => r.name === savedAs && r.source === "manual") : undefined;
+
   const openManual = () => {
     // Re-opening a plate that was saved keeps its name, so saving an edit
     // replaces that run instead of adding a duplicate next to it.
-    const { savedAs, values } = useQpcrManualStore.getState();
-    const hasWells = Object.values(values.Cp).some((v) => v.trim() !== "");
-    const savedRun = savedAs ? runs.find((r) => r.name === savedAs && r.source === "manual") : undefined;
-    let name = `Manual ${nowLabel()}`;
-    for (let n = 2; runs.some((r) => r.name === name); n++) name = `Manual ${nowLabel()} (${n})`;
-    setManualName(hasWells && savedRun ? savedRun.name : name);
+    const hasWells = Object.values(useQpcrManualStore.getState().values.Cp).some((v) => v.trim() !== "");
+    setManualName(hasWells && savedManualRun ? savedManualRun.name : freshManualName());
     setManualErr(null);
     setManualOpen(true);
   };
+
+  // "Clear" in the plate editor starts a new plate (savedAs -> null): give it a
+  // new name, or saving it would overwrite the plate that was saved before.
+  const prevSavedAs = useRef(savedAs);
+  useEffect(() => {
+    if (manualOpen && prevSavedAs.current && !savedAs && manualName.trim() === prevSavedAs.current) {
+      setManualName(freshManualName());
+    }
+    prevSavedAs.current = savedAs;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedAs]);
 
   const saveManual = async (records: QpcrRecord[]) => {
     const name = manualName.trim();
@@ -401,12 +421,16 @@ export function QpcrView() {
     setSavingManual(true);
     setManualErr(null);
     try {
-      const res = await saveQpcrManualRun(name, records);
+      // A changed name for a saved plate is a rename: the old run is removed.
+      const res = await saveQpcrManualRun(name, records, savedManualRun && savedManualRun.name !== name ? savedManualRun.name : null);
       if (res.error) { setManualErr(res.error); return; }
       useQpcrManualStore.getState().setSavedAs(name);
       adoptLibrary(res, [name]);
       setManualOpen(false);
-      setImportNote({ tone: "success", text: `${res.replaced ? "Updated" : "Added"} ${name}.` });
+      setImportNote({
+        tone: "success",
+        text: res.renamed_from ? `Renamed ${res.renamed_from} to ${name}.` : `${res.replaced ? "Updated" : "Added"} ${name}.`,
+      });
       setOpen((p) => ({ ...p, analysis: true }));
     } catch (e) {
       setManualErr(errMsg(e));
@@ -415,20 +439,20 @@ export function QpcrView() {
     }
   };
 
-  // When the included runs (or the gene scope) change: keep still-valid choices
-  // and colours and default the reference gene. (A changed run set also marks a
-  // finished analysis as stale via selKey.) A default reference must be in
-  // EVERY ticked run — normalising runs to different references biases the
-  // fold change — so it comes from genesCommon whatever the scope switch says.
-  const datasetKey = JSON.stringify([ds.genesAll, ds.genesCommon, ds.samples, useCommon]);
+  // When the included runs change: drop choices that no longer exist in any
+  // ticked run, keep colours, and default the reference gene. (A changed run set
+  // also marks a finished analysis as stale via selKey.) The "Only genes in
+  // every run" switch only narrows the pickers — it never deletes choices. A
+  // default reference must be in EVERY ticked run (normalising runs to different
+  // references biases the fold change), so it comes from genesCommon.
+  const datasetKey = JSON.stringify([ds.genesAll, ds.genesCommon, ds.samples]);
   useEffect(() => {
-    const geneSet = new Set(useCommon ? ds.genesCommon : ds.genesAll);
+    const geneSet = new Set(ds.genesAll);
     const sampleSet = new Set(ds.samples);
-    setRefGenes((prev) => {
-      const kept = prev.filter((g) => geneSet.has(g));
-      return kept.length ? kept : ds.genesCommon.filter((g) => HOUSEKEEPING.test(g));
-    });
-    setTargetGenes((prev) => prev.filter((g) => geneSet.has(g)));
+    const keptRefs = refGenes.filter((g) => geneSet.has(g));
+    const refs = keptRefs.length ? keptRefs : ds.genesCommon.filter((g) => HOUSEKEEPING.test(g));
+    setRefGenes(refs);
+    setTargetGenes((prev) => prev.filter((g) => geneSet.has(g) && !refs.includes(g)));
     setControl((prev) => (sampleSet.has(prev) ? prev : ""));
     setExperimental((prev) => prev.filter((s) => sampleSet.has(s)));
     // Colours/labels are only ever added, so an existing figure keeps its look.
@@ -466,6 +490,7 @@ export function QpcrView() {
     if (!canAnalyze || analyzing) return;
     setAnalyzing(true);
     setErr(null);
+    setAnalysisWarnings([]);
     try {
       const res = await analyzeQpcr({
         run_ids: ds.runIds, cp_max: excludeHigh ? cpLimit : null,
@@ -477,7 +502,8 @@ export function QpcrView() {
       setAnalysis(res);
       setAnalyzedSel(sel);
       setPlot(null);
-      setOpen({ data: false, analysis: false, figure: true });
+      // Keep the Analysis step open when samples were left out, so the warning is seen.
+      setOpen({ data: false, analysis: !!res.warnings?.length, figure: true });
       setCanvasTab("figure");
       void runPlot(res, sel); // render straight away
     } catch (e) {
@@ -490,11 +516,13 @@ export function QpcrView() {
   // Live preview: once a figure exists, re-render (debounced) whenever a
   // figure setting changes. Stale responses are dropped by plotSeq.
   useEffect(() => {
-    if (!liveUpdate || !analysis || !analyzedSel || figKey.current === null || paramsKey === figKey.current) return;
+    // Not while stale: the data behind this analysis changed, so re-rendering it
+    // would refresh an out-of-date figure (the canvas says to re-run instead).
+    if (!liveUpdate || stale || !analysis || !analyzedSel || figKey.current === null || paramsKey === figKey.current) return;
     const t = setTimeout(() => { void runPlot(analysis, analyzedSel); }, 650);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paramsKey, liveUpdate, analysis, analyzedSel]);
+  }, [paramsKey, liveUpdate, analysis, analyzedSel, stale]);
 
   const renderCp = async (params: typeof cpParams, key: string) => {
     const seq = ++cpSeq.current;
@@ -519,7 +547,9 @@ export function QpcrView() {
   useEffect(() => {
     if (canvasTab !== "cp" || !ds.runIds.length || cpKey === cpKeyRendered.current) return;
     const params = cpParams;
-    const t = setTimeout(() => { void renderCp(params, cpKey); }, cpPlot ? 500 : 0);
+    // First render right away; later ones debounced (also while one is in flight).
+    // Skip if Re-render already drew this exact graph during the wait.
+    const t = setTimeout(() => { if (cpKeyRendered.current !== cpKey) void renderCp(params, cpKey); }, cpPlot || cpPlotting ? 500 : 0);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cpKey, canvasTab]);
@@ -557,7 +587,7 @@ export function QpcrView() {
   const testName = analysis?.anova_tukey_results.length ? "ANOVA + Tukey"
     : analysis?.ttest_results.length ? "t-test" : "no test";
   const analysisSummary = analysis && analyzedSel
-    ? `${analyzedSel.genes.length} gene${analyzedSel.genes.length > 1 ? "s" : ""} × ${analyzedSel.samples.length} samples · ${testName}${stale ? " · changed" : ""}`
+    ? `${analyzedSel.genes.length} gene${analyzedSel.genes.length > 1 ? "s" : ""} × ${analyzedSel.samples.length} samples · ${testName}${analysisWarnings.length ? " · samples left out" : ""}${stale ? " · changed" : ""}`
     : ds.runs.length ? "Pick genes and samples" : "Tick at least one run";
 
   // The filter box only exists above 6 runs; ignore a leftover filter below that.
@@ -661,7 +691,11 @@ export function QpcrView() {
   const sampleOption = (props: HTMLAttributes<HTMLLIElement> & { key?: Key }, s: string) =>
     <OptionRow props={props} label={s} note={runsOf(ds.sampleRuns.get(s))} />;
   const lowTargets = targetGenes.filter((g) => lowCp.has(g));
-  const refsMissing = refGenes.filter((g) => (ds.geneRuns.get(g) ?? 0) < ds.runs.length);
+  // A reference that's absent — or only undetermined — in some ticked run.
+  const refsMissing = refGenes.filter((g) => (ds.geneDetectedRuns.get(g) ?? 0) < ds.runs.length);
+  // With the scope switch on, keep current choices selectable even if they
+  // aren't in every run (the switch narrows the list; it never removes choices).
+  const withChosen = (opts: string[], chosen: string[]) => [...opts, ...chosen.filter((g) => !opts.includes(g))];
 
   const analysisSection = (
     <RailSection step={2} title="Analysis" summary={analysisSummary} done={!!analysis && !stale}
@@ -676,18 +710,18 @@ export function QpcrView() {
       </Typography>
       <Stack spacing={1.5}>
         <Box>
-          <Autocomplete multiple size="small" limitTags={4} options={genes} value={refGenes} renderOption={geneOption}
+          <Autocomplete multiple size="small" limitTags={4} options={withChosen(genes, refGenes)} value={refGenes} renderOption={geneOption}
             onChange={(_, v) => { setRefGenes(v); setTargetGenes((t) => t.filter((g) => !v.includes(g))); }}
             renderInput={(p) => <TextField {...p} label="Reference (housekeeping) genes" />} />
           {refsMissing.length > 0 && (
             <Typography variant="caption" color="warning.main" component="div" sx={{ mt: 0.25 }}>
-              {refsMissing.join(", ")} {refsMissing.length > 1 ? "aren't" : "isn't"} in every ticked run — samples in runs
+              {refsMissing.join(", ")} {refsMissing.length > 1 ? "aren't" : "isn't"} detected in every ticked run — samples
               without {refsMissing.length > 1 ? "them" : "it"} are left out, so every run is normalised the same way.
             </Typography>
           )}
         </Box>
         <Box>
-          <Autocomplete multiple size="small" limitTags={6} options={genes.filter((g) => !refGenes.includes(g))}
+          <Autocomplete multiple size="small" limitTags={6} options={withChosen(genes, targetGenes).filter((g) => !refGenes.includes(g))}
             value={targetGenes} onChange={(_, v) => setTargetGenes(v)} renderOption={geneOption}
             renderInput={(p) => <TextField {...p} label="Target genes" />} />
           <QuickPicks allLabel="All non-reference" onClear={() => setTargetGenes([])}
@@ -699,6 +733,8 @@ export function QpcrView() {
           )}
         </Box>
         <TextField select size="small" label="Control (calibrator) sample" value={control}
+          // The menu items carry a run-coverage caption; show only the name once chosen.
+          slotProps={{ select: { renderValue: (v) => v as string } }}
           onChange={(e) => { setControl(e.target.value); setExperimental((x) => x.filter((s) => s !== e.target.value)); }}>
           {samples.map((s) => (
             <MenuItem key={s} value={s}>
@@ -906,7 +942,14 @@ export function QpcrView() {
       } />
     )
   ) : (
-    <FigureView result={plot} busy={plotting} baseName="qpcr_plot" fitHeight="calc(100vh - 140px)" />
+    <Stack spacing={1.5} sx={{ minHeight: 0 }}>
+      {stale && (
+        <Alert severity="info" action={canAnalyze ? <Button color="inherit" size="small" onClick={() => void runAnalysis()}>Re-run</Button> : undefined}>
+          Runs or selections changed since this figure was made — re-run the analysis to update it.
+        </Alert>
+      )}
+      <FigureView result={plot} busy={plotting} baseName="qpcr_plot" fitHeight={stale ? "calc(100vh - 200px)" : "calc(100vh - 140px)"} />
+    </Stack>
   );
 
   const cpBody = (
@@ -990,7 +1033,12 @@ export function QpcrView() {
         <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 2, pr: 1 }}>
           Plate editor
           <TextField size="small" label="Run name" value={manualName} onChange={(e) => setManualName(e.target.value)}
-            sx={{ width: 280 }} helperText={runs.some((r) => r.name === manualName.trim()) ? "Saving will replace the run with this name" : " "} />
+            sx={{ width: 280 }}
+            helperText={
+              savedManualRun && manualName.trim() && manualName.trim() !== savedManualRun.name
+                ? `Saving renames “${savedManualRun.name}”${runs.some((r) => r.name === manualName.trim()) ? " and replaces the run with this name" : ""}`
+                : runs.some((r) => r.name === manualName.trim()) ? "Saving will replace the run with this name" : " "
+            } />
           <Box sx={{ flexGrow: 1 }} />
           <IconButton aria-label="Close" onClick={() => setManualOpen(false)}><CloseIcon /></IconButton>
         </DialogTitle>
