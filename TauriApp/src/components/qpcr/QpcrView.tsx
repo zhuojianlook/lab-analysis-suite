@@ -661,7 +661,7 @@ export function QpcrView() {
     )
   ) : (
     <Box sx={{ position: "relative", alignSelf: "flex-start", maxWidth: "100%" }}>
-      <PlotResult result={plot} baseName="qpcr_plot" fitHeight="calc(100vh - 250px)" />
+      <PlotResult result={plot} baseName="qpcr_plot" fitHeight="calc(100vh - 140px)" />
       {plotting && (
         <Box sx={{ position: "absolute", inset: 0, bgcolor: "rgba(28,28,30,0.35)", display: "grid", placeItems: "center", borderRadius: 1 }}>
           <CircularProgress size={28} />
