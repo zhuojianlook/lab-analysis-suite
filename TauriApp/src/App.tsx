@@ -29,6 +29,13 @@ const darkTheme = createTheme({
         root: { textTransform: "none", fontSize: "0.75rem" },
       },
     },
+    // Sentence case everywhere, matching MuiButton (MUI defaults these to ALL CAPS).
+    MuiToggleButton: {
+      styleOverrides: { root: { textTransform: "none", fontSize: "0.75rem" } },
+    },
+    MuiTab: {
+      styleOverrides: { root: { textTransform: "none" } },
+    },
     MuiSelect: { defaultProps: { size: "small" } },
     MuiSlider: { defaultProps: { size: "small" } },
     MuiTextField: { defaultProps: { size: "small", variant: "outlined" } },

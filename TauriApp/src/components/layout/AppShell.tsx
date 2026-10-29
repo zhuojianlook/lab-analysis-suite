@@ -31,6 +31,9 @@ type Status = "checking" | "ok" | "down";
 
 export function AppShell() {
   const [tab, setTab] = useState(0);
+  // Tabs mount on first visit and then stay mounted (hidden), so switching
+  // tabs keeps each tab's data, results, running jobs and scroll position.
+  const [visited, setVisited] = useState<ReadonlySet<number>>(() => new Set([0]));
   const [aboutOpen, setAboutOpen] = useState(false);
   const [health, setHealth] = useState<Status>("checking");
   const [engineErr, setEngineErr] = useState("");
@@ -115,7 +118,10 @@ export function AppShell() {
         </Toolbar>
         <Tabs
           value={tab}
-          onChange={(_, v) => setTab(v)}
+          onChange={(_, v: number) => {
+            setTab(v);
+            setVisited((s) => (s.has(v) ? s : new Set(s).add(v)));
+          }}
           variant="scrollable"
           scrollButtons="auto"
           sx={{ minHeight: 40, borderTop: "1px solid", borderColor: "divider" }}
@@ -126,7 +132,20 @@ export function AppShell() {
         </Tabs>
       </AppBar>
       <RStatusBanner />
-      <Box sx={{ flexGrow: 1, overflow: "auto", bgcolor: "background.default" }}>{TABS[tab].render()}</Box>
+      <Box sx={{ flexGrow: 1, minHeight: 0, position: "relative", bgcolor: "background.default" }}>
+        {TABS.map((t, i) =>
+          visited.has(i) ? (
+            <Box
+              key={t.label}
+              role="tabpanel"
+              hidden={tab !== i}
+              sx={{ position: "absolute", inset: 0, overflow: "auto", display: tab === i ? "block" : "none" }}
+            >
+              {t.render()}
+            </Box>
+          ) : null,
+        )}
+      </Box>
       <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
     </Box>
   );

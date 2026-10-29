@@ -10,7 +10,8 @@ import type {
   RunRResponse,
 } from "./types";
 
-const DEFAULT_BASE = "http://127.0.0.1:8765";
+// Browser-preview fallback only; inside Tauri every call goes through the Rust proxy.
+const DEFAULT_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8765";
 
 let _invoke: ((cmd: string, args: Record<string, unknown>) => Promise<unknown>) | null = null;
 let _invokeReady = false;

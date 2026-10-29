@@ -6,8 +6,17 @@ import { useFiguresStore } from "../../store/figuresStore";
 import type { RunRResponse } from "../../api/types";
 
 /** Render the plots (base64 PNG) returned by the R bridge, with per-plot
- *  download and an error panel when the R run failed. */
-export function PlotResult({ result, baseName = "plot" }: { result: RunRResponse | null; baseName?: string }) {
+ *  download and an error panel when the R run failed. `fitHeight` (a CSS
+ *  length) caps the image height so a whole figure fits in a viewport. */
+export function PlotResult({
+  result,
+  baseName = "plot",
+  fitHeight,
+}: {
+  result: RunRResponse | null;
+  baseName?: string;
+  fitHeight?: string;
+}) {
   if (!result) return null;
   if (!result.success) {
     return (
@@ -30,7 +39,14 @@ export function PlotResult({ result, baseName = "plot" }: { result: RunRResponse
               component="img"
               src={`data:image/png;base64,${b64}`}
               alt={`${baseName} ${i + 1}`}
-              sx={{ maxWidth: "100%", border: "1px solid", borderColor: "divider", borderRadius: 1, background: "#fff" }}
+              sx={{
+                maxWidth: "100%",
+                border: "1px solid",
+                borderColor: "divider",
+                borderRadius: 1,
+                background: "#fff",
+                ...(fitHeight && { display: "block", maxHeight: fitHeight, width: "auto", objectFit: "contain" }),
+              }}
             />
             <Box sx={{ mt: 0.5, display: "flex", gap: 1, flexWrap: "wrap" }}>
               <Button
