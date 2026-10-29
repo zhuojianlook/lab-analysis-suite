@@ -20,13 +20,15 @@ export const useQpcrManualStore = create<QpcrManualState>((set) => ({
   clear: () => set({ values: { Gene: {}, Sample: {}, Cp: {} } }),
 }));
 
+export interface QpcrRecord { Well: string; Sample: string; Gene: string; Cp: number }
+
 /** Wells where Gene + Sample + numeric Cp are all present → qPCR records. */
 export function buildQpcrRecords(
   values: Record<QField, Record<string, string>>,
   plate: string,
-): { Sample: string; Gene: string; Cp: number }[] {
+): QpcrRecord[] {
   const { rows, cols } = plateSpec(plate);
-  const recs: { Sample: string; Gene: string; Cp: number }[] = [];
+  const recs: QpcrRecord[] = [];
   for (const r of rows) {
     for (const c of cols) {
       const w = `${r}${c}`;
@@ -35,7 +37,7 @@ export function buildQpcrRecords(
       const cp = (values.Cp[w] || "").trim();
       if (g && s && cp !== "") {
         const n = Number(cp);
-        if (!Number.isNaN(n)) recs.push({ Sample: s, Gene: g, Cp: n });
+        if (!Number.isNaN(n)) recs.push({ Well: w, Sample: s, Gene: g, Cp: n });
       }
     }
   }

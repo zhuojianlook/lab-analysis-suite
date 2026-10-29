@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Box, Button, MenuItem, Paper, Stack, Tab, Tabs, TextField, Typography } from "@mui/material";
 import { plateSpec, PLATE_DIMS } from "../../store/platemapStore";
-import { useQpcrManualStore, buildQpcrRecords, type QField } from "../../store/qpcrManualStore";
+import { useQpcrManualStore, buildQpcrRecords, type QField, type QpcrRecord } from "../../store/qpcrManualStore";
 
 const FIELDS: QField[] = ["Gene", "Sample", "Cp"];
 
@@ -31,12 +31,14 @@ function Cell({ field, well }: { field: QField; well: string }) {
 }
 
 /** Manual qPCR data entry: a plate grid with Gene / Sample / Cp per well
- *  (replaces uploading *_qpcr.txt + *_platemap.txt). Calls onLoad with the
- *  assembled records, which feed the same analysis flow as the file path. */
+ *  (an alternative to *_qpcr.txt + *_platemap.txt). Calls onLoad with the
+ *  assembled records; the qPCR view saves them to the run library. */
 export function QpcrManualEntry({
   onLoad,
+  busy,
 }: {
-  onLoad: (recs: { Sample: string; Gene: string; Cp: number }[]) => void;
+  onLoad: (recs: QpcrRecord[]) => void;
+  busy?: boolean;
 }) {
   const plate = useQpcrManualStore((s) => s.plate);
   const setPlate = useQpcrManualStore((s) => s.setPlate);
@@ -98,10 +100,10 @@ export function QpcrManualEntry({
       <Box sx={{ mt: 1.5 }}>
         <Button
           variant="contained"
-          disabled={count === 0}
+          disabled={count === 0 || busy}
           onClick={() => onLoad(buildQpcrRecords(useQpcrManualStore.getState().values, plate))}
         >
-          Load {count} well{count === 1 ? "" : "s"} into analysis
+          Save {count} well{count === 1 ? "" : "s"} to the library
         </Button>
       </Box>
     </Paper>

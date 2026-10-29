@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type HTMLAttributes, type Key, type KeyboardEvent, type ReactNode } from "react";
 import {
   Alert,
   Autocomplete,
   Box,
   Button,
+  Checkbox,
   Chip,
   CircularProgress,
   Dialog,
@@ -25,18 +26,27 @@ import {
   Typography,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import GridOnIcon from "@mui/icons-material/GridOn";
+import GridViewIcon from "@mui/icons-material/GridView";
 import InsertChartOutlinedIcon from "@mui/icons-material/InsertChartOutlined";
+import ScatterPlotIcon from "@mui/icons-material/ScatterPlot";
 import TableChartIcon from "@mui/icons-material/TableChart";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import {
   analyzeQpcr,
+  deleteQpcrRun,
+  getQpcrLibrary,
+  importQpcrRuns,
   plotQpcr,
-  uploadQpcr,
+  plotQpcrCp,
+  saveQpcrManualRun,
   type QpcrAnalyzeResult,
-  type QpcrUploadResult,
+  type QpcrLibrary,
+  type QpcrLibraryRun,
 } from "../../api/client";
 import type { RunRResponse } from "../../api/types";
+import type { QpcrRecord } from "../../store/qpcrManualStore";
 import { RecordTable } from "../shared/RecordTable";
 import { PlotResult } from "../shared/PlotResult";
 import { Workspace } from "../shared/Workspace";
@@ -44,6 +54,8 @@ import { RailHeading, RailSection } from "../shared/RailSection";
 import { FileDropZone } from "../shared/FileDropZone";
 import { NumberField } from "../shared/NumberField";
 import { QpcrManualEntry } from "./QpcrManualEntry";
+import { QpcrOverview } from "./QpcrOverview";
+import { buildDataset, notDetected, pick } from "./qpcrData";
 
 const PALETTES: Record<string, string[]> = {
   Default: ["#5a7fa8", "#63a66a", "#c1666b", "#d4a05a", "#8a6fae", "#4aa3a3", "#b07aa1", "#9c9c4a"],
@@ -56,26 +68,26 @@ const HOUSEKEEPING = /^(GAPDH|ACTB|B2M|HPRT1?|RPLP0|TBP|PPIA|GUSB|YWHAZ|UBC|HMBS
 
 const MOD_KEY = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform) ? "⌘" : "Ctrl";
 
+// Which library runs are ticked — remembered between launches (best-effort).
+const PREF_INCLUDED = "las.qpcr.includedRuns";
+const readIncluded = (): number[] | null => {
+  try { const v = localStorage.getItem(PREF_INCLUDED); return v ? (JSON.parse(v) as number[]) : null; } catch { return null; }
+};
+const writeIncluded = (ids: Iterable<number>) => {
+  try { localStorage.setItem(PREF_INCLUDED, JSON.stringify([...ids])); } catch { /* ignore */ }
+};
+
 type Step = "data" | "analysis" | "figure";
 type StepError = { step: Step; msg: string } | null;
-type Selection = { genes: string[]; samples: string[]; key: string };
-interface FilePair { stem: string; qpcr?: File; platemap?: File }
+type Selection = { genes: string[]; refs: string[]; samples: string[]; key: string };
+type CanvasTab = "overview" | "cp" | "figure" | "results";
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-/** Group files into LightCycler pairs by stem (mirrors the sidecar's _stem). */
-function pairFiles(files: File[]): { pairs: FilePair[]; ignored: File[] } {
-  const byStem = new Map<string, FilePair>();
-  const ignored: File[] = [];
-  for (const f of files) {
-    const kind = f.name.endsWith("_qpcr.txt") ? "qpcr" : f.name.endsWith("_platemap.txt") ? "platemap" : null;
-    if (!kind) { ignored.push(f); continue; }
-    const stem = f.name.slice(0, f.name.length - (kind === "qpcr" ? 9 : 13));
-    const p = byStem.get(stem) ?? { stem };
-    p[kind] = f;
-    byStem.set(stem, p);
-  }
-  return { pairs: [...byStem.values()].sort((a, b) => a.stem.localeCompare(b.stem)), ignored };
+function nowLabel() {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 /** Caption + slider with the current value shown on the right. */
@@ -110,16 +122,32 @@ function QuickPicks({ onAll, onClear, allLabel }: { onAll: () => void; onClear: 
   );
 }
 
-/** Guidance shown on the canvas before there is a figure. */
+/** Autocomplete option with a right-aligned note (run coverage, Cp warning). */
+function OptionRow({ props, label, note, warn }: {
+  props: HTMLAttributes<HTMLLIElement> & { key?: Key }; label: string; note: string; warn?: string;
+}) {
+  const { key, ...rest } = props;
+  return (
+    <li key={key} {...rest}>
+      <Box sx={{ display: "flex", alignItems: "center", gap: 1, width: "100%" }}>
+        <Box component="span" sx={{ flexGrow: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>{label}</Box>
+        {warn && <Typography variant="caption" color="warning.main" noWrap>{warn}</Typography>}
+        <Typography variant="caption" color="text.secondary" noWrap>{note}</Typography>
+      </Box>
+    </li>
+  );
+}
+
+/** Guidance shown on the canvas before there is anything to show. */
 function CanvasEmpty({ active, action }: { active: number; action?: ReactNode }) {
   const steps = [
-    "Load data — drop LightCycler *_qpcr.txt + *_platemap.txt pairs, or type Cp values on a plate.",
-    "Choose reference and target genes, the control and the samples to compare, then run ΔΔCt.",
+    "Add runs to the library — drop LightCycler *_qpcr.txt + *_platemap.txt pairs, or type Cp values on a plate. They stay in the library for next time.",
+    "Tick the runs to analyse, choose reference and target genes, the control and the samples to compare, then run ΔΔCt.",
     "Style the figure on the left — it re-renders live — and export it as PNG or TIFF.",
   ];
   return (
     <Box sx={{ flexGrow: 1, display: "grid", placeItems: "center", py: 6 }}>
-      <Box sx={{ maxWidth: 460 }}>
+      <Box sx={{ maxWidth: 480 }}>
         <InsertChartOutlinedIcon sx={{ fontSize: 40, color: "text.disabled" }} />
         <Typography variant="h6" sx={{ mt: 1, mb: 1 }}>qPCR ΔΔCt analysis</Typography>
         {steps.map((t, i) => (
@@ -143,13 +171,46 @@ function CanvasEmpty({ active, action }: { active: number; action?: ReactNode })
   );
 }
 
+/** A rendered figure that stays visible (dimmed) while a newer one renders. */
+function FigureView({ result, busy, baseName, fitHeight }: {
+  result: RunRResponse; busy: boolean; baseName: string; fitHeight: string;
+}) {
+  return (
+    <Box sx={{ position: "relative", alignSelf: "flex-start", maxWidth: "100%" }}>
+      <PlotResult result={result} baseName={baseName} fitHeight={fitHeight} />
+      {busy && (
+        <Box sx={{ position: "absolute", inset: 0, bgcolor: "rgba(28,28,30,0.35)", display: "grid", placeItems: "center", borderRadius: 1 }}>
+          <CircularProgress size={28} />
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+const Rendering = ({ what }: { what: string }) => (
+  <Box sx={{ flexGrow: 1, display: "grid", placeItems: "center" }}>
+    <Stack alignItems="center" spacing={1.5}>
+      <CircularProgress size={28} />
+      <Typography variant="body2" color="text.secondary">Rendering the {what} in R…</Typography>
+    </Stack>
+  </Box>
+);
+
 export function QpcrView() {
-  // ── data ──────────────────────────────────────────────────────────────────
-  const [entryMode, setEntryMode] = useState<"files" | "manual">("files");
-  const [files, setFiles] = useState<File[]>([]);
-  const [dropHighCp, setDropHighCp] = useState(false);
-  const [upload, setUpload] = useState<QpcrUploadResult | null>(null);
+  // ── run library ───────────────────────────────────────────────────────────
+  const [library, setLibrary] = useState<QpcrLibraryRun[] | null>(null);
+  const [libraryPath, setLibraryPath] = useState("");
+  const [includedIds, setIncludedIds] = useState<ReadonlySet<number>>(() => new Set());
+  const [importing, setImporting] = useState(false);
+  const [importNote, setImportNote] = useState<{ tone: "success" | "warning"; text: string } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<number | null>(null);
+  const [runFilter, setRunFilter] = useState("");
+  const [cpLimit, setCpLimit] = useState(35);
+  const [excludeHigh, setExcludeHigh] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
+  const [manualName, setManualName] = useState("");
+  const [manualErr, setManualErr] = useState<string | null>(null);
+  const [savingManual, setSavingManual] = useState(false);
 
   // ── analysis ──────────────────────────────────────────────────────────────
   const [useCommon, setUseCommon] = useState(true);
@@ -164,6 +225,7 @@ export function QpcrView() {
   // ── figure ────────────────────────────────────────────────────────────────
   const [layout, setLayout] = useState<"grouped" | "faceted">("grouped");
   const [plotType, setPlotType] = useState<"bar" | "violin" | "box" | "dot">("bar");
+  const [showRefs, setShowRefs] = useState(false);
   const [theme, setTheme] = useState<"prism" | "classic" | "minimal">("prism");
   const [errorType, setErrorType] = useState<"SD" | "SEM">("SD");
   const [showPoints, setShowPoints] = useState(false);
@@ -184,31 +246,49 @@ export function QpcrView() {
   const [transparent, setTransparent] = useState(false);
   const [plot, setPlot] = useState<RunRResponse | null>(null);
   const [liveUpdate, setLiveUpdate] = useState(true);
+  const [cpPlot, setCpPlot] = useState<RunRResponse | null>(null);
 
   // ── ui ────────────────────────────────────────────────────────────────────
   const [open, setOpen] = useState<Record<Step, boolean>>({ data: true, analysis: false, figure: false });
-  const [canvasTab, setCanvasTab] = useState<"figure" | "results">("figure");
-  const [uploading, setUploading] = useState(false);
+  const [canvasTab, setCanvasTab] = useState<CanvasTab>("overview");
   const [analyzing, setAnalyzing] = useState(false);
   const [plotting, setPlotting] = useState(false);
+  const [cpPlotting, setCpPlotting] = useState(false);
   const [err, setErr] = useState<StepError>(null);
 
-  const uploadSeq = useRef(0);
   const plotSeq = useRef(0);
-  /** Params key of the last requested render; null until the first one. */
+  const cpSeq = useRef(0);
+  /** Params key of the last requested fold-change render; null until the first one. */
   const figKey = useRef<string | null>(null);
+  /** Params key of the last requested Cp render. */
+  const cpKeyRendered = useRef<string | null>(null);
 
-  const genes = upload ? (useCommon ? upload.genes_common : upload.genes_all) : [];
-  const samples = upload?.samples ?? [];
+  // ── derived data ──────────────────────────────────────────────────────────
+  const runs = library ?? [];
+  const includedKey = [...includedIds].sort((a, b) => a - b).join(",");
+  const ds = useMemo(
+    () => buildDataset(runs.filter((r) => includedIds.has(r.id))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [library, includedKey],
+  );
+  const genes = useCommon ? ds.genesCommon : ds.genesAll;
+  const samples = ds.samples;
   const sampleOrder = control ? [control, ...experimental] : experimental;
-  const selKey = JSON.stringify([refGenes, targetGenes, sampleOrder, method, useCommon]);
+  const cpGenes = targetGenes.length ? [...refGenes, ...targetGenes.filter((g) => !refGenes.includes(g))] : ds.genesAll;
+  const cpSamples = experimental.length ? sampleOrder : samples;
+  const lowCp = useMemo(
+    () => notDetected(ds.runs, ds.genesAll, cpSamples, cpLimit),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ds, cpSamples.join("\u0000"), cpLimit],
+  );
+  const selKey = JSON.stringify([refGenes, targetGenes, sampleOrder, method, useCommon, ds.runIds, excludeHigh ? cpLimit : null]);
   const stale = !!analysis && analyzedSel?.key !== selKey;
-  const canAnalyze = !!upload && refGenes.length > 0 && targetGenes.length > 0 && !!control && experimental.length > 0;
-  const isManual = upload?.pairs.length === 1 && upload.pairs[0].name === "manual";
+  const canAnalyze = ds.runs.length > 0 && refGenes.length > 0 && targetGenes.length > 0 && !!control && experimental.length > 0;
   const toggle = (s: Step) => (o: boolean) => setOpen((p) => ({ ...p, [s]: o }));
 
   const buildParams = (sel: Selection) => ({
-    gene_order: sel.genes, sample_order: sel.samples, colors, labels,
+    gene_order: showRefs ? [...sel.refs.filter((r) => !sel.genes.includes(r)), ...sel.genes] : sel.genes,
+    sample_order: sel.samples, colors: pick(colors, sel.samples), labels: pick(labels, sel.samples),
     error_type: errorType, layout, plot_type: plotType, show_points: showPoints,
     point_size: pointSize, bar_width: barWidth, theme, significance_level: sigLevel,
     hide_ns: hideNs, title, xlabel, ylabel, font_size: fontSize,
@@ -216,74 +296,135 @@ export function QpcrView() {
   });
   const paramsKey = analyzedSel ? JSON.stringify(buildParams(analyzedSel)) : "";
 
-  // ── actions ───────────────────────────────────────────────────────────────
+  const cpParams = {
+    run_ids: ds.runIds, gene_order: cpGenes, sample_order: cpSamples, reference_genes: refGenes, cp_limit: cpLimit,
+    colors: pick(colors, cpSamples), labels: pick(labels, cpSamples), theme, point_size: pointSize,
+    font_size: fontSize, width: plotWidth, height: plotHeight, dpi, export_format: exportFormat, transparent,
+  };
+  const cpKey = JSON.stringify(cpParams);
 
-  /** Adopt a freshly loaded dataset: keep still-valid choices and colours,
-   *  default the reference gene, and move the user on to the analysis step. */
-  const applyLoaded = (res: QpcrUploadResult) => {
-    setUpload(res);
-    setAnalysis(null);
-    setAnalyzedSel(null);
-    setPlot(null);
-    figKey.current = null;
-    const geneSet = new Set(res.genes_all);
-    const sampleSet = new Set(res.samples);
+  // ── library actions ───────────────────────────────────────────────────────
+
+  /** Adopt a library listing; optionally tick the runs named in `include`. */
+  const adoptLibrary = (lib: QpcrLibrary, include: string[] = []) => {
+    setLibrary(lib.runs);
+    setLibraryPath(lib.path);
+    setIncludedIds((prev) => {
+      const ids = new Set(lib.runs.map((r) => r.id));
+      const next = new Set([...prev].filter((id) => ids.has(id)));
+      lib.runs.forEach((r) => { if (include.includes(r.name)) next.add(r.id); });
+      writeIncluded(next);
+      return next;
+    });
+  };
+
+  const loadLibrary = async () => {
+    setErr(null);
+    try {
+      const lib = await getQpcrLibrary();
+      const saved = readIncluded();
+      const ids = new Set(lib.runs.map((r) => r.id));
+      setLibrary(lib.runs);
+      setLibraryPath(lib.path);
+      setIncludedIds(new Set(saved === null ? ids : saved.filter((id) => ids.has(id))));
+    } catch (e) {
+      setErr({ step: "data", msg: `Couldn't open the run library: ${errMsg(e)}` });
+    }
+  };
+  useEffect(() => { void loadLibrary(); }, []);
+
+  const importFiles = async (fs: File[]) => {
+    setImporting(true);
+    setErr(null);
+    setImportNote(null);
+    try {
+      const res = await importQpcrRuns(fs);
+      adoptLibrary(res, [...res.added, ...res.replaced]);
+      const done = [res.added.length && `Added ${res.added.join(", ")}`, res.replaced.length && `Updated ${res.replaced.join(", ")}`]
+        .filter(Boolean) as string[];
+      const problems = [
+        ...res.unpaired.map((n) => `${n} has no matching ${n.endsWith("_qpcr.txt") ? "plate map" : "qPCR file"}`),
+        ...res.errors,
+      ];
+      if (!done.length && !problems.length) problems.push("No LightCycler pairs found — names must end in _qpcr.txt and _platemap.txt");
+      setImportNote({ tone: problems.length ? "warning" : "success", text: [...done, ...problems].join(". ") + "." });
+      if (done.length) setOpen((p) => ({ ...p, analysis: true }));
+    } catch (e) {
+      setErr({ step: "data", msg: errMsg(e) });
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const removeRun = async (id: number) => {
+    setConfirmDelete(null);
+    try {
+      adoptLibrary(await deleteQpcrRun(id));
+    } catch (e) {
+      setErr({ step: "data", msg: errMsg(e) });
+    }
+  };
+
+  const toggleRun = (id: number) =>
+    setIncludedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      writeIncluded(next);
+      return next;
+    });
+
+  const setAllRuns = (on: boolean) => {
+    const next = new Set(on ? runs.map((r) => r.id) : []);
+    writeIncluded(next);
+    setIncludedIds(next);
+  };
+
+  const openManual = () => {
+    setManualName(`Manual ${nowLabel()}`);
+    setManualErr(null);
+    setManualOpen(true);
+  };
+
+  const saveManual = async (records: QpcrRecord[]) => {
+    const name = manualName.trim();
+    if (!name) { setManualErr("Give the plate a name."); return; }
+    setSavingManual(true);
+    setManualErr(null);
+    try {
+      const res = await saveQpcrManualRun(name, records);
+      if (res.error) { setManualErr(res.error); return; }
+      adoptLibrary(res, [name]);
+      setManualOpen(false);
+      setImportNote({ tone: "success", text: `${res.replaced ? "Updated" : "Added"} ${name}.` });
+      setOpen((p) => ({ ...p, analysis: true }));
+    } catch (e) {
+      setManualErr(errMsg(e));
+    } finally {
+      setSavingManual(false);
+    }
+  };
+
+  // When the included runs change: keep still-valid choices and colours and
+  // default the reference gene. (A changed run set also marks a finished
+  // analysis as stale via selKey.)
+  const datasetKey = JSON.stringify([ds.genesAll, ds.samples]);
+  useEffect(() => {
+    const geneSet = new Set(ds.genesAll);
+    const sampleSet = new Set(ds.samples);
     setRefGenes((prev) => {
       const kept = prev.filter((g) => geneSet.has(g));
-      return kept.length ? kept : res.genes_all.filter((g) => HOUSEKEEPING.test(g));
+      return kept.length ? kept : ds.genesAll.filter((g) => HOUSEKEEPING.test(g));
     });
     setTargetGenes((prev) => prev.filter((g) => geneSet.has(g)));
     setControl((prev) => (sampleSet.has(prev) ? prev : ""));
     setExperimental((prev) => prev.filter((s) => sampleSet.has(s)));
-    setColors((prev) => Object.fromEntries(res.samples.map((s, i) => [s, prev[s] ?? PALETTES.Default[i % 8]])));
-    setLabels((prev) => Object.fromEntries(res.samples.map((s) => [s, prev[s] ?? s])));
-    // Open the next step but leave Data open, so further runs can still be dropped.
-    if (res.pairs.length) setOpen((p) => ({ ...p, analysis: true, figure: false }));
-  };
+    // Colours/labels are only ever added, so an existing figure keeps its look.
+    setColors((prev) => ({ ...Object.fromEntries(ds.samples.map((s, i) => [s, PALETTES.Default[i % 8]])), ...prev }));
+    setLabels((prev) => ({ ...Object.fromEntries(ds.samples.map((s) => [s, s])), ...prev }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [datasetKey]);
 
-  const doUpload = async (fs: File[], drop: boolean) => {
-    const { pairs } = pairFiles(fs);
-    if (!pairs.some((p) => p.qpcr && p.platemap)) return;
-    const send = pairs.flatMap((p) => [p.qpcr, p.platemap]).filter((f): f is File => !!f);
-    const seq = ++uploadSeq.current;
-    setUploading(true);
-    setErr(null);
-    try {
-      const res = await uploadQpcr(send, drop);
-      if (seq === uploadSeq.current) applyLoaded(res);
-    } catch (e) {
-      if (seq === uploadSeq.current) setErr({ step: "data", msg: errMsg(e) });
-    } finally {
-      if (seq === uploadSeq.current) setUploading(false);
-    }
-  };
-
-  /** Add dropped/picked files to the set (same name replaces) and re-upload. */
-  const addFiles = (incoming: File[]) => {
-    const byName = new Map(files.map((f) => [f.name, f]));
-    incoming.forEach((f) => byName.set(f.name, f));
-    const next = [...byName.values()];
-    setFiles(next);
-    void doUpload(next, dropHighCp);
-  };
-
-  const removePair = (stem: string) => {
-    const next = files.filter((f) => f.name !== `${stem}_qpcr.txt` && f.name !== `${stem}_platemap.txt`);
-    setFiles(next);
-    if (pairFiles(next).pairs.some((p) => p.qpcr && p.platemap)) void doUpload(next, dropHighCp);
-    else { setUpload(null); setAnalysis(null); setAnalyzedSel(null); setPlot(null); figKey.current = null; }
-  };
-
-  const onManualLoad = (records: { Sample: string; Gene: string; Cp: number }[]) => {
-    if (!records.length) return;
-    const g = Array.from(new Set(records.map((r) => r.Gene))).sort();
-    const s = Array.from(new Set(records.map((r) => r.Sample))).sort();
-    applyLoaded({
-      pairs: [{ name: "manual", records: records as unknown as Record<string, unknown>[], n_rows: records.length }],
-      genes_common: g, genes_all: g, samples: s, errors: [],
-    });
-    setManualOpen(false);
-  };
+  // ── analysis + figures ────────────────────────────────────────────────────
 
   const runPlot = async (a: QpcrAnalyzeResult, sel: Selection) => {
     if (!a.summary?.length) return;
@@ -309,16 +450,16 @@ export function QpcrView() {
   };
 
   const runAnalysis = async () => {
-    if (!upload || !canAnalyze) return;
+    if (!canAnalyze) return;
     setAnalyzing(true);
     setErr(null);
     try {
       const res = await analyzeQpcr({
-        pairs: upload.pairs, reference_genes: refGenes, target_genes: targetGenes,
-        control, experimental, method,
+        run_ids: ds.runIds, cp_max: excludeHigh ? cpLimit : null,
+        reference_genes: refGenes, target_genes: targetGenes, control, experimental, method,
       });
       if (res.error) { setErr({ step: "analysis", msg: res.error }); return; }
-      const sel: Selection = { genes: targetGenes, samples: sampleOrder, key: selKey };
+      const sel: Selection = { genes: targetGenes, refs: refGenes, samples: sampleOrder, key: selKey };
       setAnalysis(res);
       setAnalyzedSel(sel);
       setPlot(null);
@@ -341,6 +482,28 @@ export function QpcrView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paramsKey, liveUpdate, analysis, analyzedSel]);
 
+  // The Cp graph renders while its tab is open and follows the selection,
+  // the Cp limit and the shared style settings.
+  useEffect(() => {
+    if (canvasTab !== "cp" || !ds.runIds.length || cpKey === cpKeyRendered.current) return;
+    const params = cpParams;
+    const t = setTimeout(async () => {
+      const seq = ++cpSeq.current;
+      cpKeyRendered.current = cpKey;
+      setCpPlotting(true);
+      try {
+        const res = await plotQpcrCp(params);
+        if (seq === cpSeq.current) setCpPlot(res);
+      } catch (e) {
+        if (seq === cpSeq.current) setCpPlot({ success: false, stdout: "", stderr: errMsg(e), plots: [], tables: [] });
+      } finally {
+        if (seq === cpSeq.current) setCpPlotting(false);
+      }
+    }, cpKeyRendered.current === null ? 0 : 500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cpKey, canvasTab]);
+
   // Swap the x-axis label default (Gene ↔ Sample) unless the user typed one.
   const changeLayout = (v: "grouped" | "faceted") => {
     setLayout(v);
@@ -349,7 +512,7 @@ export function QpcrView() {
 
   const applyPalette = (name: string) => {
     const pal = PALETTES[name];
-    const order = analyzedSel?.samples ?? samples;
+    const order = analyzedSel?.samples ?? cpSamples;
     setColors((prev) => ({ ...prev, ...Object.fromEntries(order.map((s, i) => [s, pal[i % pal.length]])) }));
   };
 
@@ -364,115 +527,158 @@ export function QpcrView() {
 
   // ── rail sections ─────────────────────────────────────────────────────────
 
-  const { pairs: filePairs, ignored } = pairFiles(files);
-  const loadedRows = new Map((upload?.pairs ?? []).map((p) => [p.name, p.n_rows]));
-  const totalWells = (upload?.pairs ?? []).reduce((n, p) => n + p.n_rows, 0);
   const stepError = (s: Step) =>
     err?.step === s ? <Alert severity="error" onClose={() => setErr(null)} sx={{ mt: 1.5 }}>{err.msg}</Alert> : null;
 
-  const dataSummary = upload?.pairs.length
-    ? isManual
-      ? `Manual plate · ${totalWells} wells · ${samples.length} samples`
-      : `${upload.pairs.length} run${upload.pairs.length > 1 ? "s" : ""} · ${totalWells} wells · ${samples.length} samples`
-    : "Drop LightCycler exports or enter Cp values";
+  const dataSummary = !library ? "Opening the run library…"
+    : !runs.length ? "Library is empty — add runs"
+      : `${ds.runs.length} of ${runs.length} run${runs.length > 1 ? "s" : ""} · ${ds.wells} wells · ${samples.length} samples`;
 
   const testName = analysis?.anova_tukey_results.length ? "ANOVA + Tukey"
     : analysis?.ttest_results.length ? "t-test" : "no test";
   const analysisSummary = analysis && analyzedSel
     ? `${analyzedSel.genes.length} gene${analyzedSel.genes.length > 1 ? "s" : ""} × ${analyzedSel.samples.length} samples · ${testName}${stale ? " · changed" : ""}`
-    : upload ? "Pick genes and samples" : "Load data first";
+    : ds.runs.length ? "Pick genes and samples" : "Tick at least one run";
+
+  const filter = runFilter.trim().toLowerCase();
+  const shownRuns = filter ? runs.filter((r) => r.name.toLowerCase().includes(filter)) : runs;
 
   const dataSection = (
-    <RailSection step={1} title="Data" summary={dataSummary} done={!!upload?.pairs.length}
+    <RailSection step={1} title="Data" summary={dataSummary} done={ds.runs.length > 0}
       expanded={open.data} onToggle={toggle("data")}>
-      <ToggleButtonGroup fullWidth exclusive size="small" value={entryMode}
-        onChange={(_, v) => { if (v) setEntryMode(v); }} sx={{ mb: 1.5 }}>
-        <ToggleButton value="files">Files</ToggleButton>
-        <ToggleButton value="manual">Manual entry</ToggleButton>
-      </ToggleButtonGroup>
-
-      {entryMode === "files" ? (
-        <>
-          <FileDropZone accept=".txt" onFiles={addFiles} title="Drop qPCR + plate-map files"
-            hint="*_qpcr.txt with its *_platemap.txt — or click to browse" />
-          {filePairs.length > 0 && (
-            <Stack spacing={0.5} sx={{ mt: 1.5 }}>
-              {filePairs.map((p) => {
-                const rows = loadedRows.get(p.stem);
-                return (
-                  <Stack key={p.stem} direction="row" spacing={0.75} alignItems="center">
-                    <Tooltip title={p.stem}>
-                      <Typography variant="body2" noWrap sx={{ flexGrow: 1, minWidth: 0 }}>{p.stem}</Typography>
-                    </Tooltip>
-                    {p.qpcr && p.platemap ? (
-                      <Chip size="small" color="success" variant="outlined"
-                        label={rows !== undefined ? `${rows} wells` : "paired"} />
-                    ) : (
-                      <Chip size="small" color="warning" variant="outlined"
-                        label={p.qpcr ? "needs plate map" : "needs qPCR file"} />
-                    )}
-                    <IconButton size="small" aria-label={`Remove ${p.stem}`} onClick={() => removePair(p.stem)}>
-                      <CloseIcon sx={{ fontSize: 16 }} />
-                    </IconButton>
-                  </Stack>
-                );
-              })}
-              {ignored.length > 0 && (
-                <Typography variant="caption" color="text.secondary">
-                  Ignored {ignored.map((f) => f.name).join(", ")} — names must end in _qpcr.txt or _platemap.txt.
-                </Typography>
-              )}
-            </Stack>
-          )}
-          <FormControlLabel sx={{ mt: 1, ml: -0.5 }}
-            control={<Switch size="small" checked={dropHighCp} onChange={(e) => {
-              setDropHighCp(e.target.checked);
-              void doUpload(files, e.target.checked);
-            }} />}
-            label={<Typography variant="body2">Exclude wells with Cp ≥ 35</Typography>} />
-          {uploading && <LinearProgress sx={{ mt: 1 }} />}
-        </>
-      ) : (
-        <>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-            Type the gene, sample and Cp for each well on a plate grid.
-          </Typography>
-          <Button fullWidth variant="outlined" startIcon={<GridOnIcon />} onClick={() => setManualOpen(true)}>
-            {isManual ? "Edit plate" : "Open plate editor"}
-          </Button>
-        </>
+      <FileDropZone accept=".txt" onFiles={importFiles} title="Add runs to the library"
+        hint="Drop *_qpcr.txt + *_platemap.txt pairs — or click to browse" />
+      <Button fullWidth size="small" startIcon={<GridOnIcon />} onClick={openManual} sx={{ mt: 0.75 }}>
+        Enter a plate manually
+      </Button>
+      {importing && <LinearProgress sx={{ mt: 1 }} />}
+      {importNote && (
+        <Alert severity={importNote.tone} onClose={() => setImportNote(null)} sx={{ mt: 1 }}>{importNote.text}</Alert>
       )}
-      {upload?.errors?.length ? <Alert severity="warning" sx={{ mt: 1.5 }}>{upload.errors.join("; ")}</Alert> : null}
+
+      <Stack direction="row" alignItems="center" sx={{ mt: 2, mb: 0.5 }}>
+        <Typography variant="overline" color="text.secondary" sx={{ fontSize: 10.5, letterSpacing: 0.8, lineHeight: 1.6, flexGrow: 1 }}>
+          Library{runs.length ? ` · ${runs.length} run${runs.length > 1 ? "s" : ""}` : ""}
+        </Typography>
+        {runs.length > 1 && (
+          <>
+            <Button size="small" onClick={() => setAllRuns(true)} sx={{ minWidth: 0, px: 0.75 }}>All</Button>
+            <Button size="small" color="inherit" onClick={() => setAllRuns(false)} sx={{ minWidth: 0, px: 0.75, color: "text.secondary" }}>None</Button>
+          </>
+        )}
+      </Stack>
+      {runs.length > 6 && (
+        <TextField size="small" fullWidth placeholder="Filter runs" value={runFilter}
+          onChange={(e) => setRunFilter(e.target.value)} sx={{ mb: 0.75 }} />
+      )}
+      {library && !runs.length && (
+        <Typography variant="body2" color="text.secondary" sx={{ py: 1 }}>
+          No runs yet. Runs you add are saved here and stay available next time.
+        </Typography>
+      )}
+      <Stack spacing={0.25}>
+        {shownRuns.map((r) => (
+          <Box key={r.id} sx={{ display: "flex", alignItems: "center", gap: 0.5, borderRadius: 1, pr: 0.5, "&:hover": { bgcolor: "action.hover" } }}>
+            <Checkbox size="small" checked={includedIds.has(r.id)} onChange={() => toggleRun(r.id)}
+              slotProps={{ input: { "aria-label": `Include ${r.name}` } }} sx={{ p: 0.75 }} />
+            <Box sx={{ minWidth: 0, flexGrow: 1, cursor: "pointer", py: 0.25 }} onClick={() => toggleRun(r.id)}>
+              <Stack direction="row" spacing={0.75} alignItems="center">
+                <Typography variant="body2" noWrap>{r.name}</Typography>
+                {r.source === "manual" && <Chip size="small" variant="outlined" label="manual" sx={{ height: 17, fontSize: 10 }} />}
+              </Stack>
+              <Typography variant="caption" color="text.secondary" noWrap component="div">
+                {r.n_wells} wells · {r.genes.length} genes · {r.samples.length} samples
+              </Typography>
+            </Box>
+            {confirmDelete === r.id ? (
+              <>
+                <Button size="small" color="error" onClick={() => removeRun(r.id)} sx={{ minWidth: 0, px: 0.75 }}>Remove</Button>
+                <Button size="small" color="inherit" onClick={() => setConfirmDelete(null)} sx={{ minWidth: 0, px: 0.75 }}>Keep</Button>
+              </>
+            ) : (
+              <Tooltip title="Remove from library">
+                <IconButton size="small" aria-label={`Remove ${r.name} from the library`} onClick={() => setConfirmDelete(r.id)}>
+                  <DeleteOutlineIcon sx={{ fontSize: 17 }} />
+                </IconButton>
+              </Tooltip>
+            )}
+          </Box>
+        ))}
+      </Stack>
+
+      <RailHeading>Cp limit</RailHeading>
+      <Stack direction="row" spacing={1} alignItems="center">
+        <NumberField size="small" label="Cp limit" value={cpLimit} onCommit={setCpLimit} min={10} max={45} step={0.5} sx={{ width: 96 }} />
+        <FormControlLabel sx={{ mr: 0 }}
+          control={<Switch size="small" checked={excludeHigh} onChange={(e) => setExcludeHigh(e.target.checked)} />}
+          label={<Typography variant="body2">Exclude wells at or above it</Typography>} />
+      </Stack>
+      <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }}>
+        Wells at or above the limit (and undetermined wells) count as not detected. The Cp values graph marks it with a dotted line.
+      </Typography>
+      {libraryPath && (
+        <Typography variant="caption" color="text.disabled" component="div" sx={{ mt: 1, wordBreak: "break-all" }}>
+          Library file: {libraryPath}
+        </Typography>
+      )}
       {stepError("data")}
+      {!library && err?.step === "data" && (
+        <Button size="small" startIcon={<RefreshIcon />} onClick={() => void loadLibrary()} sx={{ mt: 1 }}>Retry</Button>
+      )}
     </RailSection>
   );
 
+  const runsOf = (n: number | undefined) => `${n ?? 0}/${ds.runs.length} runs`;
+  const geneOption = (props: HTMLAttributes<HTMLLIElement> & { key?: Key }, g: string) => {
+    const low = lowCp.get(g);
+    return <OptionRow props={props} label={g} note={runsOf(ds.geneRuns.get(g))}
+      warn={low ? `≥ Cp ${cpLimit} in ${low.length}` : undefined} />;
+  };
+  const sampleOption = (props: HTMLAttributes<HTMLLIElement> & { key?: Key }, s: string) =>
+    <OptionRow props={props} label={s} note={runsOf(ds.sampleRuns.get(s))} />;
+  const lowTargets = targetGenes.filter((g) => lowCp.has(g));
+
   const analysisSection = (
     <RailSection step={2} title="Analysis" summary={analysisSummary} done={!!analysis && !stale}
-      disabled={!upload?.pairs.length} expanded={open.analysis} onToggle={toggle("analysis")}>
-      {upload && upload.pairs.length > 1 && (
-        <FormControlLabel sx={{ ml: -0.5, mb: 1 }}
+      disabled={!ds.runs.length} expanded={open.analysis} onToggle={toggle("analysis")}>
+      {ds.runs.length > 1 && (
+        <FormControlLabel sx={{ ml: -0.5, mb: 0.5 }}
           control={<Switch size="small" checked={useCommon} onChange={(e) => setUseCommon(e.target.checked)} />}
-          label={<Typography variant="body2">Only genes in every run ({upload.genes_common.length} of {upload.genes_all.length})</Typography>} />
+          label={<Typography variant="body2">Only genes in every run ({ds.genesCommon.length} of {ds.genesAll.length})</Typography>} />
       )}
+      <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1.25 }}>
+        The lists show how many of the {ds.runs.length} ticked runs contain each gene or sample — the Overview tab maps them in full.
+      </Typography>
       <Stack spacing={1.5}>
-        <Autocomplete multiple size="small" limitTags={4} options={genes} value={refGenes}
+        <Autocomplete multiple size="small" limitTags={4} options={genes} value={refGenes} renderOption={geneOption}
           onChange={(_, v) => { setRefGenes(v); setTargetGenes((t) => t.filter((g) => !v.includes(g))); }}
           renderInput={(p) => <TextField {...p} label="Reference (housekeeping) genes" />} />
         <Box>
           <Autocomplete multiple size="small" limitTags={6} options={genes.filter((g) => !refGenes.includes(g))}
-            value={targetGenes} onChange={(_, v) => setTargetGenes(v)}
+            value={targetGenes} onChange={(_, v) => setTargetGenes(v)} renderOption={geneOption}
             renderInput={(p) => <TextField {...p} label="Target genes" />} />
           <QuickPicks allLabel="All non-reference" onClear={() => setTargetGenes([])}
             onAll={() => setTargetGenes(genes.filter((g) => !refGenes.includes(g)))} />
+          {lowTargets.length > 0 && (
+            <Typography variant="caption" color="warning.main" component="div">
+              {lowTargets.join(", ")} {lowTargets.length > 1 ? "are" : "is"} at or above Cp {cpLimit} in some samples — see Cp values.
+            </Typography>
+          )}
         </Box>
         <TextField select size="small" label="Control (calibrator) sample" value={control}
           onChange={(e) => { setControl(e.target.value); setExperimental((x) => x.filter((s) => s !== e.target.value)); }}>
-          {samples.map((s) => <MenuItem key={s} value={s}>{s}</MenuItem>)}
+          {samples.map((s) => (
+            <MenuItem key={s} value={s}>
+              <Box sx={{ display: "flex", width: "100%", gap: 1 }}>
+                <Box component="span" sx={{ flexGrow: 1 }}>{s}</Box>
+                <Typography variant="caption" color="text.secondary">{runsOf(ds.sampleRuns.get(s))}</Typography>
+              </Box>
+            </MenuItem>
+          ))}
         </TextField>
         <Box>
           <Autocomplete multiple size="small" limitTags={6} options={samples.filter((s) => s !== control)}
-            value={experimental} onChange={(_, v) => setExperimental(v)}
+            value={experimental} onChange={(_, v) => setExperimental(v)} renderOption={sampleOption}
             renderInput={(p) => <TextField {...p} label="Compare against control" helperText="Plotted in this order, after the control" />} />
           <QuickPicks allLabel="All others" onClear={() => setExperimental([])}
             onAll={() => setExperimental(samples.filter((s) => s !== control))} />
@@ -490,13 +696,14 @@ export function QpcrView() {
         {method === "auto" ? "Welch t-test for two groups, ANOVA + Tukey HSD for three or more."
           : method === "ttest" ? "Welch t-test of each sample against the control."
           : "One-way ANOVA with Tukey HSD post-hoc comparisons."}
+        {excludeHigh ? ` Wells at or above Cp ${cpLimit} are excluded.` : ""}
       </Typography>
 
       <Button fullWidth variant="contained" sx={{ mt: 2 }} disabled={!canAnalyze || analyzing} onClick={runAnalysis}
         startIcon={analyzing ? <CircularProgress size={14} color="inherit" /> : undefined}>
         {analysis && !stale ? "Re-run analysis" : "Run ΔΔCt analysis"}
       </Button>
-      {!canAnalyze && (
+      {!canAnalyze && ds.runs.length > 0 && (
         <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.75 }}>
           Needs {[!refGenes.length && "a reference gene", !targetGenes.length && "a target gene",
             !control && "a control sample", !experimental.length && "a sample to compare"]
@@ -505,14 +712,14 @@ export function QpcrView() {
       )}
       {stale && (
         <Typography variant="caption" color="warning.main" component="div" sx={{ mt: 0.75 }}>
-          Selections changed since the last run — re-run to update the figure.
+          Runs or selections changed since the last run — re-run to update the figure.
         </Typography>
       )}
       {stepError("analysis")}
     </RailSection>
   );
 
-  const plotSamples = analyzedSel?.samples ?? [];
+  const plotSamples = analyzedSel?.samples ?? cpSamples;
   const figureSection = (
     <RailSection step={3} title="Figure" done={!!plot?.success} disabled={!analysis}
       summary={analysis ? `${layout === "grouped" ? "Single graph" : "Panel per gene"} · ${plotType} · ${theme}` : "Run the analysis first"}
@@ -530,7 +737,12 @@ export function QpcrView() {
         <ToggleButton value="box">Box</ToggleButton>
         <ToggleButton value="dot">Dot</ToggleButton>
       </ToggleButtonGroup>
-      <Box sx={{ mt: 1.5 }}>
+      <Tooltip placement="right" title="ΔΔCt normalises each sample to the reference, so a single reference gene sits at ≈ 1 everywhere. Its raw Cp (stability across samples) is on the Cp values tab.">
+        <FormControlLabel sx={{ ml: -0.5, mt: 0.5 }}
+          control={<Switch size="small" checked={showRefs} onChange={(e) => setShowRefs(e.target.checked)} />}
+          label={<Typography variant="body2">Show reference genes</Typography>} />
+      </Tooltip>
+      <Box sx={{ mt: 1 }}>
         <Grid2>
           <TextField select size="small" label="Theme" value={theme} onChange={(e) => setTheme(e.target.value as typeof theme)}>
             <MenuItem value="prism">Prism</MenuItem>
@@ -644,30 +856,49 @@ export function QpcrView() {
 
   // ── canvas ────────────────────────────────────────────────────────────────
 
+  const noData = !ds.runs.length;
+  const lowShown = cpGenes.filter((g) => lowCp.has(g));
+
   const figureBody = !analysis ? (
-    <CanvasEmpty active={upload?.pairs.length ? 1 : 0} />
+    <CanvasEmpty active={noData ? 0 : 1} />
   ) : !plot ? (
-    plotting ? (
-      <Box sx={{ flexGrow: 1, display: "grid", placeItems: "center" }}>
-        <Stack alignItems="center" spacing={1.5}>
-          <CircularProgress size={28} />
-          <Typography variant="body2" color="text.secondary">Rendering the figure in R…</Typography>
-        </Stack>
-      </Box>
-    ) : (
+    plotting ? <Rendering what="figure" /> : (
       <CanvasEmpty active={2} action={
         <Button variant="contained" onClick={render} disabled={stale} startIcon={<RefreshIcon />}>Render figure</Button>
       } />
     )
   ) : (
-    <Box sx={{ position: "relative", alignSelf: "flex-start", maxWidth: "100%" }}>
-      <PlotResult result={plot} baseName="qpcr_plot" fitHeight="calc(100vh - 140px)" />
-      {plotting && (
-        <Box sx={{ position: "absolute", inset: 0, bgcolor: "rgba(28,28,30,0.35)", display: "grid", placeItems: "center", borderRadius: 1 }}>
-          <CircularProgress size={28} />
-        </Box>
+    <FigureView result={plot} busy={plotting} baseName="qpcr_plot" fitHeight="calc(100vh - 140px)" />
+  );
+
+  const cpBody = (
+    <Stack spacing={1.5} sx={{ flexGrow: 1, minHeight: 0 }}>
+      <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap" useFlexGap>
+        <Typography variant="caption" color="text.secondary" sx={{ flexGrow: 1, minWidth: 260 }}>
+          {targetGenes.length ? "Reference and target genes" : "All genes"}, {experimental.length ? "selected samples" : "all samples"},{" "}
+          {ds.runs.length} run{ds.runs.length > 1 ? "s" : ""}. Each dot is a well and each bar the mean; the dotted line is the Cp limit ({cpLimit}).
+        </Typography>
+        <FormControlLabel sx={{ mr: 0 }}
+          control={<Switch size="small" checked={excludeHigh} onChange={(e) => setExcludeHigh(e.target.checked)} />}
+          label={<Typography variant="body2">Exclude wells ≥ Cp {cpLimit} from the analysis</Typography>} />
+      </Stack>
+      {lowShown.length > 0 && (
+        <Alert severity="warning" sx={{ alignItems: "center" }}>
+          <Typography variant="body2" sx={{ mb: 0.75 }}>
+            Not detected (at or above Cp {cpLimit} in half or more of the wells) — remove a target with its ×:
+          </Typography>
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+            {lowShown.map((g) => (
+              <Chip key={g} size="small" variant="outlined" color="warning"
+                label={`${g} · ${lowCp.get(g)!.join(", ")}`}
+                onDelete={targetGenes.includes(g) ? () => setTargetGenes((t) => t.filter((x) => x !== g)) : undefined} />
+            ))}
+          </Stack>
+        </Alert>
       )}
-    </Box>
+      {cpPlot ? <FigureView result={cpPlot} busy={cpPlotting} baseName="qpcr_cp" fitHeight="calc(100vh - 230px)" />
+        : <Rendering what="Cp graph" />}
+    </Stack>
   );
 
   const resultsBody = analysis ? (
@@ -683,39 +914,48 @@ export function QpcrView() {
     </Stack>
   ) : null;
 
+  const body = canvasTab === "figure" ? figureBody
+    : noData ? <CanvasEmpty active={0} />
+      : canvasTab === "overview" ? <QpcrOverview ds={ds} refGenes={refGenes} targetGenes={targetGenes} cpLimit={cpLimit} />
+        : canvasTab === "cp" ? cpBody : resultsBody;
+
+  const tabSx = { minHeight: 44 };
   return (
     <>
       <Workspace rail={<>{dataSection}{analysisSection}{figureSection}</>} railFooter={railFooter} onKeyDown={onKeyDown}>
         <Box sx={{ display: "flex", alignItems: "center", px: 2, borderBottom: 1, borderColor: "divider", flexShrink: 0, minHeight: 44 }}>
-          <Tabs value={canvasTab} onChange={(_, v) => setCanvasTab(v)} sx={{ minHeight: 44 }}>
-            <Tab value="figure" label="Figure" icon={<InsertChartOutlinedIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={{ minHeight: 44 }} />
-            <Tab value="results" label="Results" disabled={!analysis} icon={<TableChartIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={{ minHeight: 44 }} />
+          <Tabs value={canvasTab} onChange={(_, v) => setCanvasTab(v)} variant="scrollable" scrollButtons={false} sx={tabSx}>
+            <Tab value="overview" label="Overview" disabled={noData} icon={<GridViewIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
+            <Tab value="cp" label="Cp values" disabled={noData} icon={<ScatterPlotIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
+            <Tab value="figure" label="Fold change" icon={<InsertChartOutlinedIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
+            <Tab value="results" label="Results" disabled={!analysis} icon={<TableChartIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
           </Tabs>
           <Box sx={{ flexGrow: 1 }} />
-          {plotting ? (
+          {(canvasTab === "figure" ? plotting : canvasTab === "cp" && cpPlotting) ? (
             <Stack direction="row" spacing={1} alignItems="center">
               <CircularProgress size={12} />
               <Typography variant="caption" color="text.secondary">Rendering…</Typography>
             </Stack>
-          ) : plot?.success ? (
-            <Typography variant="caption" color="text.secondary">
+          ) : (canvasTab === "figure" ? plot?.success : canvasTab === "cp" && cpPlot?.success) ? (
+            <Typography variant="caption" color="text.secondary" noWrap>
               {plotWidth} × {plotHeight} px · {dpi} dpi · {exportFormat.toUpperCase()}
             </Typography>
           ) : null}
         </Box>
-        <Box sx={{ p: 2, flexGrow: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
-          {canvasTab === "figure" ? figureBody : resultsBody}
-        </Box>
+        <Box sx={{ p: 2, flexGrow: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>{body}</Box>
       </Workspace>
 
       <Dialog open={manualOpen} onClose={() => setManualOpen(false)} fullWidth maxWidth="xl">
-        <DialogTitle sx={{ display: "flex", alignItems: "center", pr: 1 }}>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 2, pr: 1 }}>
           Plate editor
+          <TextField size="small" label="Run name" value={manualName} onChange={(e) => setManualName(e.target.value)}
+            sx={{ width: 280 }} helperText={runs.some((r) => r.name === manualName.trim()) ? "Saving will replace the run with this name" : " "} />
           <Box sx={{ flexGrow: 1 }} />
           <IconButton aria-label="Close" onClick={() => setManualOpen(false)}><CloseIcon /></IconButton>
         </DialogTitle>
         <DialogContent dividers>
-          <QpcrManualEntry onLoad={onManualLoad} />
+          {manualErr && <Alert severity="error" sx={{ mb: 1.5 }} onClose={() => setManualErr(null)}>{manualErr}</Alert>}
+          <QpcrManualEntry onLoad={saveManual} busy={savingManual} />
         </DialogContent>
       </Dialog>
     </>

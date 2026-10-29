@@ -1,0 +1,85 @@
+import type { QpcrLibraryRun } from "../../api/client";
+
+/** The runs included in an analysis, combined. */
+export interface Dataset {
+  runs: QpcrLibraryRun[];
+  runIds: number[];
+  genesAll: string[];
+  /** Genes present in every included run. */
+  genesCommon: string[];
+  samples: string[];
+  wells: number;
+  /** How many of the included runs contain each gene / sample. */
+  geneRuns: Map<string, number>;
+  sampleRuns: Map<string, number>;
+}
+
+export function buildDataset(runs: QpcrLibraryRun[]): Dataset {
+  const geneRuns = new Map<string, number>();
+  const sampleRuns = new Map<string, number>();
+  for (const r of runs) {
+    r.genes.forEach((g) => geneRuns.set(g, (geneRuns.get(g) ?? 0) + 1));
+    r.samples.forEach((s) => sampleRuns.set(s, (sampleRuns.get(s) ?? 0) + 1));
+  }
+  const genesAll = [...geneRuns.keys()].sort();
+  return {
+    runs,
+    runIds: runs.map((r) => r.id).sort((a, b) => a - b),
+    genesAll,
+    genesCommon: genesAll.filter((g) => geneRuns.get(g) === runs.length),
+    samples: [...sampleRuns.keys()].sort(),
+    wells: runs.reduce((n, r) => n + r.n_wells, 0),
+    geneRuns,
+    sampleRuns,
+  };
+}
+
+/** Wells and how many of them are undetermined or at/above `limit`, for one
+ *  gene x sample across `runs`. */
+export function wellCounts(runs: QpcrLibraryRun[], gene: string, sample: string | null, limit: number) {
+  let n = 0;
+  let high = 0;
+  const cps: number[] = [];
+  for (const r of runs) {
+    for (const c of r.cells) {
+      if (c.gene !== gene || (sample !== null && c.sample !== sample)) continue;
+      n += c.cps.length + c.n_nd;
+      high += c.n_nd + c.cps.filter((v) => v >= limit).length;
+      cps.push(...c.cps);
+    }
+  }
+  return { n, high, cps };
+}
+
+/** Genes that are effectively not detected in some samples: for a gene x
+ *  sample, at least half of its wells are undetermined or at/above the Cp
+ *  limit (LightCycler reports wells that never amplified at its cycle cap,
+ *  e.g. exactly 35). Returns gene -> the samples where that happens. */
+export function notDetected(
+  runs: QpcrLibraryRun[], genes: string[], samples: string[], limit: number,
+): Map<string, string[]> {
+  const agg = new Map<string, { n: number; high: number }>();
+  for (const r of runs) {
+    for (const c of r.cells) {
+      const k = `${c.gene}\u0000${c.sample}`;
+      const a = agg.get(k) ?? { n: 0, high: 0 };
+      a.n += c.cps.length + c.n_nd;
+      a.high += c.n_nd + c.cps.filter((v) => v >= limit).length;
+      agg.set(k, a);
+    }
+  }
+  const out = new Map<string, string[]>();
+  for (const g of genes) {
+    const bad = samples.filter((s) => {
+      const a = agg.get(`${g}\u0000${s}`);
+      return !!a && a.n > 0 && a.high / a.n >= 0.5;
+    });
+    if (bad.length) out.set(g, bad);
+  }
+  return out;
+}
+
+/** Subset of a per-sample map (keeps request keys stable for live re-renders). */
+export function pick<T>(m: Record<string, T>, keys: string[]): Record<string, T> {
+  return Object.fromEntries(keys.filter((k) => k in m).map((k) => [k, m[k]]));
+}

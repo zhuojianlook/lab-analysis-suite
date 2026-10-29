@@ -57,7 +57,12 @@ export async function apiRequest(path: string, method = "GET", body?: string): P
 
 /** Request + JSON parse, throwing on FastAPI `detail` error envelopes. */
 export async function apiJson<T>(path: string, method = "GET", body?: string): Promise<T> {
-  const text = await apiRequest(path, method, body);
+  return parseApi<T>(await apiRequest(path, method, body));
+}
+
+/** Parse a sidecar response body, throwing on non-JSON bodies and on FastAPI
+ *  `detail` error envelopes. */
+function parseApi<T>(text: string): T {
   let parsed: { detail?: unknown; error?: unknown } & Record<string, unknown>;
   try {
     parsed = JSON.parse(text);
@@ -240,11 +245,28 @@ export async function jobStatus(tab: string, jobId: string): Promise<RJobStatus>
 
 // ── qPCR ────────────────────────────────────────────────
 
-export interface QpcrUploadResult {
-  pairs: { name: string; records: Record<string, unknown>[]; n_rows: number }[];
-  genes_common: string[];
-  genes_all: string[];
+/** Measured Cp values (+ undetermined count) for one gene x sample in a run. */
+export interface QpcrLibraryCell { gene: string; sample: string; cps: number[]; n_nd: number }
+
+export interface QpcrLibraryRun {
+  id: number;
+  name: string;
+  source: "lightcycler" | "manual";
+  added_at: string;
+  n_wells: number;
+  n_undetermined: number;
+  genes: string[];
   samples: string[];
+  cells: QpcrLibraryCell[];
+}
+
+/** The persistent run library (SQLite in the app-data dir). */
+export interface QpcrLibrary { runs: QpcrLibraryRun[]; path: string }
+
+export interface QpcrImportResult extends QpcrLibrary {
+  added: string[];
+  replaced: string[];
+  unpaired: string[];
   errors: string[];
 }
 
@@ -256,9 +278,28 @@ export interface QpcrAnalyzeResult {
   error?: string;
 }
 
-export async function uploadQpcr(files: File[], dropHighCp: boolean): Promise<QpcrUploadResult> {
-  const text = await uploadFiles(`/api/qpcr/upload?drop_high_cp=${dropHighCp}`, files, "files");
-  return JSON.parse(text) as QpcrUploadResult;
+export async function getQpcrLibrary(): Promise<QpcrLibrary> {
+  return apiJson<QpcrLibrary>("/api/qpcr/library");
+}
+
+/** Parse LightCycler *_qpcr.txt + *_platemap.txt pairs into the library (same name replaces). */
+export async function importQpcrRuns(files: File[]): Promise<QpcrImportResult> {
+  return parseApi<QpcrImportResult>(await uploadFiles("/api/qpcr/library/import", files, "files"));
+}
+
+export async function saveQpcrManualRun(
+  name: string,
+  records: { Well?: string; Sample: string; Gene: string; Cp: number }[],
+): Promise<QpcrLibrary & { replaced?: boolean; error?: string }> {
+  return apiJson("/api/qpcr/library/manual", "POST", JSON.stringify({ name, records }));
+}
+
+export async function deleteQpcrRun(runId: number): Promise<QpcrLibrary> {
+  return apiJson<QpcrLibrary>("/api/qpcr/library/delete", "POST", JSON.stringify({ run_id: runId }));
+}
+
+export async function plotQpcrCp(body: Record<string, unknown>): Promise<RunRResponse> {
+  return apiJson<RunRResponse>("/api/qpcr/plot-cp", "POST", JSON.stringify(body));
 }
 
 export async function analyzeQpcr(body: Record<string, unknown>): Promise<QpcrAnalyzeResult> {

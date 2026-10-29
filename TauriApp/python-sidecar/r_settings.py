@@ -21,6 +21,11 @@ APP_IDENTIFIER = "LabAnalysisSuite"
 
 
 def app_data_dir() -> str:
+    # Dev/test override, so a preview engine never touches the installed app's data.
+    override = os.environ.get("LAS_DATA_DIR")
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
     system = platform.system()
     if system == "Darwin":
         base = os.path.expanduser("~/Library/Application Support")

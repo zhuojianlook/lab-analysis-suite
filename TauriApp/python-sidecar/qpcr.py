@@ -23,6 +23,7 @@ from scipy.stats import ttest_ind
 from statsmodels.formula.api import ols
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
+import qpcr_library
 import r_bridge
 
 router = APIRouter()
@@ -33,19 +34,54 @@ QPCR_DROP_COLS = [0, 1, 5, 6, 7]
 
 # ── Parsing ─────────────────────────────────────────────────────────────────
 
-def _parse_pair(qpcr_bytes: bytes, platemap_bytes: bytes, drop_high_cp: bool) -> pd.DataFrame:
+def _parse_pair_wells(qpcr_bytes: bytes, platemap_bytes: bytes) -> pd.DataFrame:
+    """Every plate-mapped well with its position and Cp (NaN = undetermined),
+    unfiltered — what the run library stores."""
     dq = pd.read_csv(io.BytesIO(qpcr_bytes), sep="\t", skiprows=1)
     dq = dq.drop(dq.columns[QPCR_DROP_COLS], axis=1)
     dl = pd.read_csv(io.BytesIO(platemap_bytes), sep="\t")
     if "Cell Position" in dl.columns:
         dl = dl.rename(columns={"Cell Position": "Pos"})
-    merged = pd.merge(dq, dl, on="Pos", how="left").dropna()
+    merged = pd.merge(dq, dl, on="Pos", how="inner").dropna(subset=["Sample", "Gene"])
     merged["Cp"] = pd.to_numeric(merged["Cp"], errors="coerce")
-    merged = merged.dropna(subset=["Cp"])
+    merged["Sample"] = merged["Sample"].astype(str).str.strip()
+    merged["Gene"] = merged["Gene"].astype(str).str.strip()
+    return merged.rename(columns={"Pos": "Well"})[["Well", "Sample", "Gene", "Cp"]].reset_index(drop=True)
+
+
+def _parse_pair(qpcr_bytes: bytes, platemap_bytes: bytes, drop_high_cp: bool) -> pd.DataFrame:
+    df = _parse_pair_wells(qpcr_bytes, platemap_bytes).dropna(subset=["Cp"])
     if drop_high_cp:
-        merged = merged[merged["Cp"] < 35]
-    keep = [c for c in ("Sample", "Gene", "Cp") if c in merged.columns]
-    return merged[keep].reset_index(drop=True)
+        df = df[df["Cp"] < 35]
+    return df[["Sample", "Gene", "Cp"]].reset_index(drop=True)
+
+
+def _records(df: pd.DataFrame) -> List[dict]:
+    """DataFrame -> JSON-safe records (NaN/inf -> None; JSON has no NaN, and an
+    SD over a single replicate is NaN)."""
+    clean = df.replace([np.inf, -np.inf], np.nan)
+    return clean.astype(object).where(clean.notna(), None).to_dict("records")
+
+
+async def _read_pairs(files: List[UploadFile]):
+    """Group uploaded files into LightCycler pairs by stem.
+    Returns ({stem: (qpcr_bytes, platemap_bytes)}, [unpaired file names])."""
+    qpcr_files: Dict[str, bytes] = {}
+    plate_files: Dict[str, bytes] = {}
+    names: Dict[str, str] = {}
+    for f in files:
+        data = await f.read()
+        name = f.filename or ""
+        if name.endswith("_platemap.txt"):
+            plate_files[_stem(name)] = data
+        elif name.endswith("_qpcr.txt"):
+            qpcr_files[_stem(name)] = data
+        else:
+            continue
+        names.setdefault(_stem(name), name)
+    paired = {s: (qpcr_files[s], plate_files[s]) for s in sorted(set(qpcr_files) & set(plate_files))}
+    unpaired = sorted(names[s] for s in (set(qpcr_files) ^ set(plate_files)))
+    return paired, unpaired
 
 
 def _stem(name: str) -> str:
@@ -55,24 +91,12 @@ def _stem(name: str) -> str:
 
 @router.post("/api/qpcr/upload")
 async def upload(files: List[UploadFile] = File(...), drop_high_cp: bool = False):
-    qpcr_files: Dict[str, bytes] = {}
-    plate_files: Dict[str, bytes] = {}
-    for f in files:
-        data = await f.read()
-        name = f.filename or ""
-        if name.endswith("_platemap.txt"):
-            plate_files[_stem(name)] = data
-        elif name.endswith("_qpcr.txt"):
-            qpcr_files[_stem(name)] = data
-        else:
-            # tolerate unsuffixed: guess by header later — skip for now
-            continue
-
+    paired, _unpaired = await _read_pairs(files)
     pairs = []
     errors = []
-    for stem in sorted(set(qpcr_files) & set(plate_files)):
+    for stem, (qb, pb) in paired.items():
         try:
-            df = _parse_pair(qpcr_files[stem], plate_files[stem], drop_high_cp)
+            df = _parse_pair(qb, pb, drop_high_cp)
             pairs.append({"name": stem, "records": df.to_dict("records"), "n_rows": len(df)})
         except Exception as e:  # noqa: BLE001
             errors.append(f"{stem}: {e}")
@@ -89,10 +113,69 @@ async def upload(files: List[UploadFile] = File(...), drop_high_cp: bool = False
             "samples": samples, "errors": errors}
 
 
+# ── Run library (persistent; see qpcr_library) ──────────────────────────────
+
+def _library() -> dict:
+    return {"runs": qpcr_library.list_runs(), "path": qpcr_library.db_path()}
+
+
+@router.get("/api/qpcr/library")
+def library():
+    return _library()
+
+
+@router.post("/api/qpcr/library/import")
+async def library_import(files: List[UploadFile] = File(...)):
+    """Parse LightCycler pairs and store them (same run name replaces)."""
+    paired, unpaired = await _read_pairs(files)
+    added, replaced, errors = [], [], []
+    for stem, (qb, pb) in paired.items():
+        try:
+            wells = _parse_pair_wells(qb, pb)
+            if wells.empty:
+                errors.append(f"{stem}: no wells matched the plate map.")
+                continue
+            (replaced if qpcr_library.save_run(stem, "lightcycler", wells) else added).append(stem)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{stem}: {e}")
+    return {"added": added, "replaced": replaced, "unpaired": unpaired, "errors": errors, **_library()}
+
+
+class ManualRunRequest(BaseModel):
+    name: str
+    records: List[dict]             # [{Well?, Sample, Gene, Cp}]
+
+
+@router.post("/api/qpcr/library/manual")
+def library_manual(body: ManualRunRequest):
+    name = body.name.strip()
+    if not name:
+        return {"error": "Give the plate a name."}
+    df = pd.DataFrame(body.records)
+    if df.empty:
+        return {"error": "No complete wells (each needs Gene + Sample + Cp)."}
+    if "Well" not in df.columns:
+        df["Well"] = None
+    df["Cp"] = pd.to_numeric(df["Cp"], errors="coerce")
+    return {"replaced": qpcr_library.save_run(name, "manual", df), **_library()}
+
+
+class DeleteRunRequest(BaseModel):
+    run_id: int
+
+
+@router.post("/api/qpcr/library/delete")
+def library_delete(body: DeleteRunRequest):
+    qpcr_library.delete_run(body.run_id)
+    return _library()
+
+
 # ── ΔΔCt analysis + stats ───────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
-    pairs: List[dict]               # [{name, records:[{Sample,Gene,Cp}]}]
+    pairs: List[dict] = []          # ad-hoc data: [{name, records:[{Sample,Gene,Cp}]}]
+    run_ids: List[int] = []         # or library runs (used when pairs is empty)
+    cp_max: Optional[float] = None  # exclude wells with Cp >= cp_max; None keeps all
     reference_genes: List[str]
     target_genes: List[str]
     control: str
@@ -118,15 +201,28 @@ def _star(p: float, sig: float) -> str:
 
 @router.post("/api/qpcr/analyze")
 def analyze(body: AnalyzeRequest):
-    frames = [pd.DataFrame(p["records"]) for p in body.pairs if p.get("records")]
+    frames = []
+    for p in body.pairs or qpcr_library.load_records(body.run_ids):
+        df = pd.DataFrame(p.get("records") or [])
+        if df.empty:
+            continue
+        df["Cp"] = pd.to_numeric(df["Cp"], errors="coerce")
+        df = df.dropna(subset=["Cp"])                # undetermined wells
+        if body.cp_max is not None:
+            df = df[df["Cp"] < body.cp_max]
+        frames.append(df)
     if not frames:
         return {"error": "No data."}
+
+    # Fold change for the reference genes too: with a single reference it is ~1
+    # by construction, but the figure can show it on request.
+    fc_genes = list(dict.fromkeys(body.target_genes + body.reference_genes))
 
     combined = pd.DataFrame()
     for df in frames:
         ref = df[df["Gene"].isin(body.reference_genes)]
         avg_ref = ref.groupby("Sample")["Cp"].mean().reset_index().rename(columns={"Cp": "Average_Ref_Cp"})
-        tar = df[df["Gene"].isin(body.target_genes)]
+        tar = df[df["Gene"].isin(fc_genes)]
         m = pd.merge(tar, avg_ref, on="Sample")
         m["dCp"] = m["Cp"] - m["Average_Ref_Cp"]
         combined = pd.concat([combined, m], ignore_index=True)
@@ -154,7 +250,7 @@ def analyze(body: AnalyzeRequest):
 
     ttest_results = []
     if do_ttest:
-        for gene in body.target_genes:
+        for gene in fc_genes:
             cvals = final[(final["Sample"] == body.control) & (final["Gene"] == gene)]["Fold_Change"]
             for exp in body.experimental:
                 evals = final[(final["Sample"] == exp) & (final["Gene"] == gene)]["Fold_Change"]
@@ -165,7 +261,7 @@ def analyze(body: AnalyzeRequest):
 
     anova_tukey_results = []
     if do_anova:
-        for gene in body.target_genes:
+        for gene in fc_genes:
             sub = final[final["Gene"] == gene]
             if sub["Sample"].nunique() > 1:
                 try:
@@ -188,8 +284,8 @@ def analyze(body: AnalyzeRequest):
                  n=("Fold_Change", "size")).reset_index())
 
     return {
-        "analysis_data": final.drop(columns=[c for c in ("Average_Ref_Cp",) if c in final]).to_dict("records"),
-        "summary": summ.to_dict("records"),
+        "analysis_data": _records(final.drop(columns=[c for c in ("Average_Ref_Cp",) if c in final])),
+        "summary": _records(summ),
         "ttest_results": ttest_results,
         "anova_tukey_results": anova_tukey_results,
     }
@@ -232,6 +328,24 @@ def _resc(s: str) -> str:
 
 def _r_vec(items: List[str]) -> str:
     return "c(" + ", ".join(f'"{_resc(i)}"' for i in items) + ")"
+
+
+def _theme_layer(theme: str, font_size: int) -> str:
+    if theme == "classic":
+        return f'p <- p + ggplot2::theme_classic(base_size={int(font_size)})\n'
+    if theme == "minimal":
+        return f'p <- p + ggplot2::theme_minimal(base_size={int(font_size)})\n'
+    return (f'if (requireNamespace("ggprism", quietly=TRUE)) p <- p + ggprism::theme_prism(base_size={int(font_size)}) '
+            f'else p <- p + ggplot2::theme_classic(base_size={int(font_size)})\n')
+
+
+def _transparent_layer(transparent: bool) -> str:
+    if not transparent:
+        return ""
+    return ("p <- p + ggplot2::theme(plot.background=ggplot2::element_rect(fill='transparent', colour=NA), "
+            "panel.background=ggplot2::element_rect(fill='transparent', colour=NA), "
+            "legend.background=ggplot2::element_rect(fill='transparent', colour=NA), "
+            "legend.key=ggplot2::element_rect(fill='transparent', colour=NA))\n")
 
 
 def _build_comparisons(body: PlotRequest):
@@ -319,21 +433,8 @@ def plot(body: PlotRequest):
         layout_layer = ""
         xangle_layer = ""
 
-    if body.theme == "classic":
-        theme_layer = f'p <- p + ggplot2::theme_classic(base_size={int(body.font_size)})\n'
-    elif body.theme == "minimal":
-        theme_layer = f'p <- p + ggplot2::theme_minimal(base_size={int(body.font_size)})\n'
-    else:  # prism
-        theme_layer = (f'if (requireNamespace("ggprism", quietly=TRUE)) p <- p + ggprism::theme_prism(base_size={int(body.font_size)}) '
-                       f'else p <- p + ggplot2::theme_classic(base_size={int(body.font_size)})\n')
-
-    transparent_theme = (
-        "p <- p + ggplot2::theme(plot.background=ggplot2::element_rect(fill='transparent', colour=NA), "
-        "panel.background=ggplot2::element_rect(fill='transparent', colour=NA), "
-        "legend.background=ggplot2::element_rect(fill='transparent', colour=NA), "
-        "legend.key=ggplot2::element_rect(fill='transparent', colour=NA))\n"
-        if body.transparent else ""
-    )
+    theme_layer = _theme_layer(body.theme, body.font_size)
+    transparent_theme = _transparent_layer(body.transparent)
 
     # Significance brackets. Faceted layout uses integer Sample positions within
     # each panel; grouped layout uses absolute dodged x-positions on the Gene
@@ -393,3 +494,79 @@ mpfig_data(summ, "qpcr_summary")
 """
     res = r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=pts.to_csv(index=False), timeout_sec=120))
     return res
+
+
+# ── Raw Cp plot (QC: reference-gene stability + detection limit) ────────────
+
+class CpPlotRequest(BaseModel):
+    run_ids: List[int] = []                   # library runs (or pairs, as for analyze)
+    pairs: List[dict] = []
+    gene_order: List[str]
+    sample_order: List[str]
+    reference_genes: List[str] = []           # labelled "(ref)" on the axis
+    cp_limit: float = 35.0                    # dotted line; Cp at/above = not detected
+    colors: Dict[str, str] = {}
+    labels: Dict[str, str] = {}
+    theme: str = "prism"
+    point_size: float = 1.8
+    font_size: int = 14
+    title: str = "Raw Cp values"
+    width: int = 1200
+    height: int = 800
+    dpi: int = 150
+    export_format: str = "png"
+    transparent: bool = False
+
+
+@router.post("/api/qpcr/plot-cp")
+def plot_cp(body: CpPlotRequest):
+    """Raw Cp per gene x sample, reference genes included, with a dotted line at
+    the Cp limit so genes near or past detection are easy to spot and exclude."""
+    rows = [(r.get("Gene"), r.get("Sample"), r.get("Cp"))
+            for p in body.pairs or qpcr_library.load_records(body.run_ids)
+            for r in p.get("records") or []]
+    df = pd.DataFrame(rows, columns=["Gene", "Sample", "Cp"])
+    df["Cp"] = pd.to_numeric(df["Cp"], errors="coerce")
+    df = df[df["Gene"].isin(body.gene_order) & df["Sample"].isin(body.sample_order)].dropna(subset=["Cp"])
+    if df.empty:
+        return {"success": False, "stderr": "No Cp values for the selected genes and samples.", "plots": []}
+
+    genes = [g for g in body.gene_order if g in set(df["Gene"])]
+    refs = [g for g in genes if g in set(body.reference_genes)]
+    genes = refs + [g for g in genes if g not in set(refs)]          # references first
+    samples = [s for s in body.sample_order if s in set(df["Sample"])]
+    angled = len(genes) > 8
+    # A two-line "(ref)" label collides with its neighbours once labels are angled.
+    xlabels = [(f"{g} (ref)" if angled else f"{g}\n(ref)") if g in refs else g for g in genes]
+    colors = [body.colors.get(s, "#888888") for s in samples]
+    labels = [body.labels.get(s, s) for s in samples]
+    lim = float(body.cp_limit)
+    export_fmt = "tiff" if str(body.export_format).lower() in ("tiff", "tif") else "png"
+    bg = "transparent" if body.transparent else "white"
+    divider = (f'p <- p + ggplot2::geom_vline(xintercept={len(refs) + 0.5}, colour="grey75", linewidth=0.4)\n'
+               if 0 < len(refs) < len(genes) else "")
+    xangle = ('p <- p + ggplot2::theme(axis.text.x=ggplot2::element_text(angle=45, hjust=1))\n'
+              if angled else "")
+
+    code = f"""
+suppressMessages({{ library(ggplot2); library(dplyr) }})
+dat <- data
+dat$Gene <- factor(dat$Gene, levels={_r_vec(genes)})
+dat$Sample <- factor(dat$Sample, levels={_r_vec(samples)})
+.cols <- {_r_vec(colors)}; names(.cols) <- {_r_vec(samples)}
+.lim <- {lim}
+dw <- 0.8
+p <- ggplot2::ggplot(dat, ggplot2::aes(Gene, Cp, fill=Sample))
+p <- p + ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin=.lim, ymax=Inf, fill="#c1666b", alpha=0.08)
+{divider}p <- p + ggplot2::stat_summary(ggplot2::aes(group=Sample), fun=mean, fun.min=mean, fun.max=mean, geom="crossbar", width=dw * 0.9, linewidth=0.3, colour="black", position=ggplot2::position_dodge(width=dw, preserve="single"))
+p <- p + ggplot2::geom_point(shape=21, colour="black", stroke=0.3, size={body.point_size}, position=ggplot2::position_jitterdodge(jitter.width=0.12, jitter.height=0, dodge.width=dw))
+p <- p + ggplot2::geom_hline(yintercept=.lim, linetype="dotted", colour="#c1666b", linewidth=0.8)
+p <- p + ggplot2::annotate("text", x=Inf, y=.lim, label=sprintf("Cp %g", .lim), hjust=1.05, vjust=-0.6, colour="#c1666b", size={max(3, body.font_size / 3.5):.2f})
+p <- p + ggplot2::expand_limits(y=.lim + 1)
+p <- p + ggplot2::scale_fill_manual(values=.cols, labels={_r_vec(labels)}) + ggplot2::scale_x_discrete(labels={_r_vec(xlabels)})
+p <- p + ggplot2::labs(title="{_resc(body.title)}", x=NULL, y="Cp", fill=NULL)
+{_theme_layer(body.theme, body.font_size)}{xangle}{_transparent_layer(body.transparent)}mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
+summ <- dat %>% dplyr::group_by(Gene, Sample) %>% dplyr::summarise(mean_Cp=mean(Cp), sd=sd(Cp), n=dplyr::n(), n_at_or_above_limit=sum(Cp >= .lim), .groups="drop")
+mpfig_data(summ, "qpcr_cp_summary")
+"""
+    return r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=df.to_csv(index=False), timeout_sec=120))
