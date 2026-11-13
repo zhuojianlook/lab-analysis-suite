@@ -7,6 +7,7 @@ import BubbleChartIcon from "@mui/icons-material/BubbleChart";
 import BlurOnIcon from "@mui/icons-material/BlurOn";
 import GrainIcon from "@mui/icons-material/Grain";
 import GridOnIcon from "@mui/icons-material/GridOn";
+import BarChartIcon from "@mui/icons-material/BarChart";
 import CollectionsIcon from "@mui/icons-material/Collections";
 import type { SvgIconComponent } from "@mui/icons-material";
 import { checkHealth, lastHealthError, getSidecarError } from "../../api/client";
@@ -22,6 +23,7 @@ import { ScrnaView } from "../scrna/ScrnaView";
 import { SpatialView } from "../spatial/SpatialView";
 import { MicrobiomeView } from "../microbiome/MicrobiomeView";
 import { PlatemapView } from "../platemap/PlatemapView";
+import { GraphView } from "../graph/GraphView";
 import { FiguresView } from "../figures/FiguresView";
 import { NavSidebar, type NavStatus } from "./NavSidebar";
 
@@ -40,6 +42,7 @@ const TOOLS: Tool[] = [
   { id: "scrnaseq", label: "scRNA-seq", group: "Sequencing", icon: BubbleChartIcon, render: () => <RPackageGate tab="scrnaseq"><ScrnaView /></RPackageGate> },
   { id: "spatial", label: "Spatial", group: "Sequencing", icon: BlurOnIcon, render: () => <RPackageGate tab="spatial"><SpatialView /></RPackageGate> },
   { id: "microbiome", label: "16S rRNA", group: "Sequencing", icon: GrainIcon, render: () => <RPackageGate tab="microbiome"><MicrobiomeView /></RPackageGate> },
+  { id: "graph", label: "Graphs", group: "Tools", icon: BarChartIcon, render: () => <RPackageGate tab="graph"><GraphView /></RPackageGate> },
   { id: "platemap", label: "Plate Mapper", group: "Tools", icon: GridOnIcon, render: () => <PlatemapView /> },
   { id: "figures", label: "Figures", group: "Tools", icon: CollectionsIcon, render: () => <FiguresView /> },
 ];
@@ -83,7 +86,7 @@ export function AppShell() {
     setCollapsed((c) => { writePref(PREF_COLLAPSED, c ? "0" : "1"); return !c; });
   };
 
-  // ⌘/Ctrl + 1…8 jumps to a tool.
+  // ⌘/Ctrl + 1…9 jumps to a tool (Graphs = 7, Plate Mapper = 8, Figures = 9).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || !/^[1-9]$/.test(e.key)) return;

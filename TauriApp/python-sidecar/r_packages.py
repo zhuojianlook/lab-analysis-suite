@@ -34,6 +34,7 @@ MANIFESTS: Dict[str, Dict[str, List[str]]] = {
     "scrnaseq":    {"cran": ["Seurat", "Matrix", "harmony", "presto", "hdf5r", "data.table"], "bioc": ["glmGamPoi", "SingleR", "celldex", "scDblFinder"]},
     "spatial":     {"cran": ["Seurat", "Rfast2", "hdf5r"], "bioc": []},
     "microbiome":  {"cran": ["vegan", "ape", "tidyr"], "bioc": ["phyloseq", "dada2", "ANCOMBC"]},
+    "graph":       {"cran": [], "bioc": []},
 }
 
 

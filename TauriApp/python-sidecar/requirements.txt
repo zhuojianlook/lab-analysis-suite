@@ -7,7 +7,7 @@ python-multipart>=0.0.6
 # matplotlib / Pillow / opencv here — keeps the sidecar small).
 numpy>=1.24
 pandas>=2.0
-scipy>=1.10
+scipy>=1.11            # scipy.stats.dunnett (Graphs tool)
 statsmodels>=0.14
 
 # Excel I/O (xCELLigence .xlsx input; Plate Mapper / results .xlsx export)

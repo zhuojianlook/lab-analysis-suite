@@ -103,7 +103,7 @@ app.include_router(r_packages_router)
 
 # Tab routers are added as each tab is implemented (Phase 2). Imported lazily
 # so the sidecar still boots while a module is a work in progress.
-for _mod in ("platemap", "qpcr", "xcelligence", "rnaseq", "scrna", "spatial", "microbiome"):
+for _mod in ("platemap", "qpcr", "xcelligence", "rnaseq", "scrna", "spatial", "microbiome", "graph"):
     try:
         _m = __import__(_mod)
         if hasattr(_m, "router"):

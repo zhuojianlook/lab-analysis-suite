@@ -64,6 +64,7 @@ jobs:
             --hidden-import=config --hidden-import=r_bridge \
             --hidden-import=r_settings --hidden-import=r_packages --hidden-import=rjobs \
             --hidden-import=platemap --hidden-import=qpcr --hidden-import=qpcr_library \
+            --hidden-import=graph --hidden-import=graph_stats --hidden-import=graph_plot --hidden-import=graph_library \
             --hidden-import=xcelligence --hidden-import=rnaseq \
             --hidden-import=scrna --hidden-import=spatial --hidden-import=microbiome \
             --collect-all pandas --collect-all numpy --collect-all scipy \
