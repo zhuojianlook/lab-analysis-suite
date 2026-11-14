@@ -669,8 +669,14 @@ export function defaultFigure(t: Template, nSeries: number, xTitle = "X"): Graph
     dpi: 150,
     export_format: "png",
     transparent: false,
+    fig_label: "Fig. 1",
+    n_unit: "",
   }, nSeries);
 }
+
+/** Figure fields that only feed the generated legend text: saved with the
+ *  document, but never part of the plot request (or the plot key). */
+export const LEGEND_ONLY_KEYS = ["fig_label", "n_unit"] as const;
 
 const HEX = /^#[0-9a-fA-F]{6}$/;
 
@@ -679,8 +685,10 @@ const HEX = /^#[0-9a-fA-F]{6}$/;
 export function effectiveFigure(f: GraphFigure, table: GraphTable): GraphFigure {
   const n = table.col_titles.length;
   const sized = resizeSeries(f, Math.max(n, f.colors.length));
+  // legend-only fields: never part of the plot request / plotKey (typing them must not re-render)
+  const { fig_label: _fl, n_unit: _nu, ...plot } = f;
   return {
-    ...f,
+    ...plot,
     colors: sized.colors.slice(0, n).map((c, i) => (HEX.test(c) ? c : PALETTES.Default[i % PALETTES.Default.length])),
     labels: sized.labels.slice(0, n).map((l, i) => l.trim() || table.col_titles[i]),
   };

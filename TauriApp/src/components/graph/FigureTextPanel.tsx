@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
-  Box, Button, Checkbox, Divider, FormControlLabel, IconButton, Stack, Tooltip, Typography,
+  Box, Button, Checkbox, Divider, FormControlLabel, IconButton, Stack, TextField, Tooltip, Typography,
 } from "@mui/material";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import CheckIcon from "@mui/icons-material/Check";
@@ -11,7 +11,9 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import {
   getGraphSoftware, type AnalyzeResult, type GraphAnalysis, type GraphFigure, type GraphTable, type SoftwareVersions,
 } from "../../api/graph";
-import { buildFigureText, normalityApplies, type FigureText } from "./figureText";
+import {
+  buildFigureText, countWords, LEGEND_WORDS_HARD, LEGEND_WORDS_SOFT, normalityApplies, type FigureText, type FigureTextInput,
+} from "./figureText";
 
 /* Auto-generated figure legend + statistical methods beside the rendered
    figure. The text is a pure function of the document (figureText.ts), so it
@@ -118,17 +120,61 @@ function CopyButton({ text, label = "Copy", what, disabled }: { text: string; la
   );
 }
 
-function TextBlock({ heading, text, what, disabled }: { heading: string; text: string; what: string; disabled?: boolean }) {
+function TextBlock({ heading, text, what, disabled, warnOver }: {
+  heading: string; text: string; what: string; disabled?: boolean;
+  /** Word count above which a gentle warning is shown (legend only). */
+  warnOver?: number;
+}) {
+  const words = countWords(text);
+  // Nature: "fewer than 250 words", so 250 itself is already too many
+  const over = warnOver !== undefined && words >= warnOver;
   return (
     <Box>
-      <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1} sx={{ mb: 0.5 }}>
-        <Typography variant="overline" color="text.secondary" sx={{ lineHeight: 1.6, fontSize: 10.5, letterSpacing: 0.8 }}>
+      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
+        <Typography variant="overline" color="text.secondary" sx={{ lineHeight: 1.6, fontSize: 10.5, letterSpacing: 0.8, flexGrow: 1, minWidth: 0 }}>
           {heading}
         </Typography>
+        {text && (
+          <Typography variant="caption" color={over ? "warning.main" : "text.secondary"} noWrap sx={{ fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
+            {words} {words === 1 ? "word" : "words"}
+          </Typography>
+        )}
         <CopyButton text={text} what={what} disabled={disabled} />
       </Stack>
       <Typography variant="body2" sx={{ userSelect: "text", whiteSpace: "pre-wrap", lineHeight: 1.6, cursor: "text" }}>
         {text}
+      </Typography>
+      {over && (
+        <Typography variant="caption" color="warning.main" component="div" role="status" sx={{ mt: 0.5 }}>
+          {words} words: Nature asks for fewer than {LEGEND_WORDS_SOFT} words at initial submission (fewer
+          than {LEGEND_WORDS_HARD} in its formatting guide).
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
+/** The two legend inputs. Saved with the analysis (figure settings) but
+ *  legend-only: they never reach the R render. */
+function LegendFields({ figLabel, unit, onChange, stacked }: {
+  figLabel: string; unit: string; onChange: (patch: { fig_label?: string; n_unit?: string }) => void;
+  /** One field per line (the narrow panel beside the figure). */
+  stacked: boolean;
+}) {
+  const id = useId();
+  return (
+    <Box>
+      <Box sx={{ display: "grid", gridTemplateColumns: stacked ? "1fr" : "repeat(auto-fit, minmax(220px, 1fr))", gap: 1.5 }}>
+        <TextField size="small" id={`${id}-label`} label="Figure label" placeholder="Fig. 1" value={figLabel}
+          onChange={(e) => onChange({ fig_label: e.target.value })}
+          slotProps={{ inputLabel: { shrink: true }, htmlInput: { maxLength: 60, spellCheck: false } }} />
+        <TextField size="small" id={`${id}-unit`} label="Each value is one…" placeholder="e.g. mouse"
+          value={unit} onChange={(e) => onChange({ n_unit: e.target.value })}
+          slotProps={{ inputLabel: { shrink: true }, htmlInput: { maxLength: 80 } }} />
+      </Box>
+      <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5, lineHeight: 1.4 }}>
+        Singular, e.g. “mouse” or “independent cell culture”: used for “Each dot represents…” and n. Saved with the
+        analysis; does not redraw the graph.
       </Typography>
     </Box>
   );
@@ -136,6 +182,7 @@ function TextBlock({ heading, text, what, disabled }: { heading: string; text: s
 
 export function FigureTextPanel({
   table, analysis, figure, result, busy, stale, error, renderFailed, side, panelWidth = 340, open, onToggle,
+  figLabel, unit, onLegendFields,
 }: {
   table: GraphTable;
   /** effectiveAnalysis(...): what was sent to the engine. */
@@ -158,20 +205,30 @@ export function FigureTextPanel({
   panelWidth?: number;
   open: boolean;
   onToggle: (open: boolean) => void;
+  /** Figure label for the legend ("Fig. 1"; "" = none). Legend-only, saved with the document. */
+  figLabel: string;
+  /** "Each value is one…" (singular unit of n; "" = not stated). Legend-only, saved with the document. */
+  unit: string;
+  onLegendFields: (patch: { fig_label?: string; n_unit?: string }) => void;
 }) {
   const software = useSoftware();
   const [normality, setNormality] = useState(() => readPref(PREF_NORMALITY) === "1");
   const showNormality = normalityApplies(table.template, analysis.test);
 
-  const fresh = useMemo<FigureText>(
-    () => buildFigureText({ table, analysis, figure, result, software, options: { normality: showNormality && normality } }),
+  // Everything but the two legend-only fields, which apply live even while busy.
+  const base = useMemo<FigureTextInput>(
+    () => ({ table, analysis, figure, result, software, options: { normality: showNormality && normality } }),
     [table, analysis, figure, result, software, normality, showNormality],
   );
-  // While the statistics for new data are computing, keep the previous text
-  // (dimmed) instead of flashing the "no statistics" variant.
-  const [settled, setSettled] = useState<FigureText>(fresh);
-  useEffect(() => { if (!busy) setSettled(fresh); }, [busy, fresh]);
-  const text = busy ? settled : fresh;
+  // While the statistics for new data are computing, keep the previous
+  // inputs (text dimmed) instead of flashing the "no statistics" variant.
+  const [settled, setSettled] = useState<FigureTextInput>(base);
+  useEffect(() => { if (!busy) setSettled(base); }, [busy, base]);
+  const shown = busy ? settled : base;
+  const text = useMemo<FigureText>(
+    () => buildFigureText({ ...shown, options: { ...shown.options, figLabel, unit } }),
+    [shown, figLabel, unit],
+  );
 
   const notes = useMemo(() => {
     if (busy || !error || result) return text.notes;
@@ -225,52 +282,56 @@ export function FigureTextPanel({
         </Tooltip>
       </Stack>
 
-      <Stack spacing={1.75} sx={{ p: 1.5, opacity: busy ? 0.6 : 1, transition: "opacity 0.15s" }}>
-        {renderFailed && (
-          <Typography variant="caption" color="error" component="div">
-            The figure could not be rendered, so this text does not describe a drawn figure. Fix the error and re-render before using it.
-          </Typography>
-        )}
-        {(busy || stale) && (
-          <Typography variant="caption" color="text.secondary" component="div">
-            {busy ? "Updating statistics… (copy is available when done)" : "The text reflects the current settings; re-render the graph to match."}
-          </Typography>
-        )}
-        {empty ? (
-          <Typography variant="body2" color="text.secondary">{notes[0] ?? "Enter data to generate the text."}</Typography>
-        ) : (
-          <>
-            <TextBlock heading="Figure legend" text={text.legend} what="the figure legend" disabled={busy} />
-            <TextBlock heading="Statistical methods" text={text.methods} what="the statistical methods" disabled={busy} />
-            {showNormality && (
-              <FormControlLabel sx={{ ml: -0.75, mt: -0.5 }}
-                control={<Checkbox size="small" checked={normality}
-                  onChange={(e) => { setNormality(e.target.checked); writePref(PREF_NORMALITY, e.target.checked ? "1" : "0"); }} />}
-                label={<Typography variant="body2">Mention the normality test (Shapiro–Wilk)</Typography>} />
-            )}
-            {notes.length > 0 && (
-              <>
-                <Divider />
-                <Box>
-                  <Typography variant="overline" color="text.secondary" component="div"
-                    sx={{ lineHeight: 1.6, fontSize: 10.5, letterSpacing: 0.8, mb: 0.25 }}>
-                    Check before use
-                  </Typography>
-                  <Box component="ul" sx={{ m: 0, pl: 2.25, listStyleType: "disc", "& li::marker": { color: "text.secondary" } }}>
-                    {notes.map((n, i) => (
-                      <Typography key={i} component="li" variant="caption" color="text.secondary" sx={{ display: "list-item", mb: 0.5 }}>
-                        {n}
-                      </Typography>
-                    ))}
+      <Stack spacing={1.75} sx={{ p: 1.5 }}>
+        {/* never dimmed or disabled: typing here only changes the text */}
+        {!empty && <LegendFields figLabel={figLabel} unit={unit} onChange={onLegendFields} stacked={side} />}
+        <Stack spacing={1.75} sx={{ opacity: busy ? 0.6 : 1, transition: "opacity 0.15s" }}>
+          {renderFailed && (
+            <Typography variant="caption" color="error" component="div">
+              The figure could not be rendered, so this text does not describe a drawn figure. Fix the error and re-render before using it.
+            </Typography>
+          )}
+          {(busy || stale) && (
+            <Typography variant="caption" color="text.secondary" component="div">
+              {busy ? "Updating statistics… (copy is available when done)" : "The text reflects the current settings; re-render the graph to match."}
+            </Typography>
+          )}
+          {empty ? (
+            <Typography variant="body2" color="text.secondary">{notes[0] ?? "Enter data to generate the text."}</Typography>
+          ) : (
+            <>
+              <TextBlock heading="Figure legend" text={text.legend} what="the figure legend" disabled={busy} warnOver={LEGEND_WORDS_SOFT} />
+              <TextBlock heading="Statistical methods" text={text.methods} what="the statistical methods" disabled={busy} />
+              {showNormality && (
+                <FormControlLabel sx={{ ml: -0.75, mt: -0.5 }}
+                  control={<Checkbox size="small" checked={normality}
+                    onChange={(e) => { setNormality(e.target.checked); writePref(PREF_NORMALITY, e.target.checked ? "1" : "0"); }} />}
+                  label={<Typography variant="body2">Mention the normality test (Shapiro–Wilk)</Typography>} />
+              )}
+              {notes.length > 0 && (
+                <>
+                  <Divider />
+                  <Box>
+                    <Typography variant="overline" color="text.secondary" component="div"
+                      sx={{ lineHeight: 1.6, fontSize: 10.5, letterSpacing: 0.8, mb: 0.25 }}>
+                      Check before use
+                    </Typography>
+                    <Box component="ul" sx={{ m: 0, pl: 2.25, listStyleType: "disc", "& li::marker": { color: "text.secondary" } }}>
+                      {notes.map((n, i) => (
+                        <Typography key={i} component="li" variant="caption" color="text.secondary" sx={{ display: "list-item", mb: 0.5 }}>
+                          {n}
+                        </Typography>
+                      ))}
+                    </Box>
+                    <Typography variant="caption" color="text.disabled" component="div" sx={{ mt: 0.5 }}>
+                      Generated from the data, the analysis and the graph settings; updates as they change. Notes are not copied.
+                    </Typography>
                   </Box>
-                  <Typography variant="caption" color="text.disabled" component="div" sx={{ mt: 0.5 }}>
-                    Generated from the data, the analysis and the graph settings; updates as they change. Notes are not copied.
-                  </Typography>
-                </Box>
-              </>
-            )}
-          </>
-        )}
+                </>
+              )}
+            </>
+          )}
+        </Stack>
       </Stack>
     </Box>
   );

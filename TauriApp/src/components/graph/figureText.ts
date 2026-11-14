@@ -26,7 +26,13 @@ export interface FigureTextInput {
   /** null = not computed yet / stale / request failed. */
   result: AnalyzeResult | null;
   software?: Partial<SoftwareVersions> | null;
-  options?: { normality?: boolean };
+  options?: {
+    normality?: boolean;
+    /** Figure label ("Fig. 1", "Extended Data Fig. 2"); undefined / "" = no label. */
+    figLabel?: string;
+    /** What one plotted value is, singular ("independent cell culture", "mouse"); "" = not stated. */
+    unit?: string;
+  };
 }
 
 export interface FigureText {
@@ -55,6 +61,11 @@ const MAX_BRACKETS = 200;     // graph_plot.MAX_BRACKETS
 const MAX_LISTED = 8;         // names enumerated in a list; more -> "N groups"
 const MAX_NAMED_N = 6;        // unequal n spelled out per group up to this many groups
 const MAX_PAIRS_LISTED = 6;
+const MAX_P_LISTED = 10;      // comparisons whose P values are listed one by one in the legend
+const MAX_MISSING_LISTED = 6; // uncomputed comparisons named one by one
+/** Nature: fewer than 250 words (initial submission), fewer than 300 (formatting guide). */
+export const LEGEND_WORDS_SOFT = 250;
+export const LEGEND_WORDS_HARD = 300;
 const MAX_FIT_STATS = 3;      // XY series whose regression / correlation numbers are written out
 const REL_NOISE = 1e-12;      // graph_stats.REL_NOISE
 const CENTERS: CenterId[] = ["mean_sd", "mean_sem", "mean_ci", "median_iqr"];
@@ -77,21 +88,41 @@ function end(s: string): string {
 
 // ── number formatting (exported, unit-tested) ───────────────────────────────
 
-/** "P = 0.016" | "P = 0.0004" | "P < 0.0001" | "P > 0.999". A value that
- *  would round onto a significance cut-off it isn't equal to gets more
- *  decimals, so the text never contradicts the stars (0.0496 -> 0.0496). */
-export function fmtP(p: number, alpha = 0.05): string {
-  if (!isNum(p)) return "P not available";
-  if (p < 0.0001) return "P < 0.0001";
-  let d = p < 0.001 ? 4 : 3;
+/** A bare P value: "0.023" | "0.42" | "0.0031" | "<0.0001" | ">0.99".
+ *  2 significant figures, at least 2 decimals. A value that would round onto
+ *  a significance cut-off it isn't equal to gets more decimals, so the text
+ *  never contradicts the stars (0.0496 -> "0.0496", not "0.050"). */
+export function fmtPValue(p: number, alpha = 0.05): string {
+  if (!isNum(p)) return "";
+  if (p < 0.0001) return "<0.0001";
+  const e = Math.floor(Math.log10(p));
+  let d = Math.max(2, 1 - e);
   let s = p.toFixed(d);
-  if (d === 3 && Number(s) >= 1) return "P > 0.999";
+  if (Number(s) >= 1) return ">0.99";
+  // rounding up into the next decade: 0.0996 -> "0.10", not "0.100"
+  if (d > 2 && Number(s) >= Math.pow(10, e + 1)) {
+    d--;
+    s = p.toFixed(d);
+  }
   const cuts = [0.05, 0.01, 0.001, 0.0001, alpha];
   while (d < 10 && cuts.some((c) => Number(s) === c && p !== c)) {
     d++;
     s = p.toFixed(d);
   }
-  return `P = ${s}`;
+  return s;
+}
+
+/** "P = 0.016" | "P < 0.0001" | "P > 0.99" | "P not available". */
+export function fmtP(p: number, alpha = 0.05): string {
+  if (!isNum(p)) return "P not available";
+  const s = fmtPValue(p, alpha);
+  return s[0] === "<" || s[0] === ">" ? `P ${s[0]} ${s.slice(1)}` : `P = ${s}`;
+}
+
+/** Words as a journal counts them: whitespace-separated tokens holding a
+ *  letter or a digit (the "|" after the figure label is not a word). */
+export function countWords(s: string): number {
+  return (s ?? "").split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
 }
 
 const SUP: Record<string, string> = {
@@ -142,6 +173,117 @@ function listOrCount(names: string[], noun: string): string {
 }
 
 const fmtThr = (x: number) => String(Number(x.toPrecision(6)));
+
+// ── the unit of n ("Each value is one…") ────────────────────────────────────
+
+const INVARIANT = new Set(["fish", "sheep", "deer", "species", "series", "offspring", "progeny", "cattle"]);
+const IRREGULAR: Record<string, string> = {
+  mouse: "mice", louse: "lice", child: "children", person: "people", man: "men", woman: "women", human: "humans",
+  leaf: "leaves", half: "halves", calf: "calves", wolf: "wolves", life: "lives", knife: "knives", tooth: "teeth",
+  foot: "feet", goose: "geese", ox: "oxen", bacterium: "bacteria", mitochondrion: "mitochondria", nucleus: "nuclei",
+  locus: "loci", focus: "foci", fungus: "fungi", embryo: "embryos", larva: "larvae", pupa: "pupae", alga: "algae",
+  ovum: "ova", medium: "media", analysis: "analyses", biopsy: "biopsies", matrix: "matrices", index: "indices",
+  axis: "axes", hypothesis: "hypotheses", synapse: "synapses", virus: "viruses", lens: "lenses",
+  // Latin / Greek forms used for biological units
+  glomerulus: "glomeruli", stimulus: "stimuli", villus: "villi", bronchus: "bronchi", alveolus: "alveoli",
+  nucleolus: "nucleoli", bacillus: "bacilli", hippocampus: "hippocampi", thalamus: "thalami", radius: "radii",
+  uterus: "uteri", ganglion: "ganglia", criterion: "criteria", phenomenon: "phenomena", spectrum: "spectra",
+  stratum: "strata", datum: "data", vertebra: "vertebrae", fibula: "fibulae", trachea: "tracheae",
+  // singular nouns ending in -s / -is / -o / -z with irregular -es plurals
+  pancreas: "pancreases", gas: "gases", atlas: "atlases", canvas: "canvases", bias: "biases", iris: "irises",
+  potato: "potatoes", tomato: "tomatoes", quiz: "quizzes",
+};
+const IRREGULAR_PLURALS = new Set(Object.values(IRREGULAR).filter((v) => !v.endsWith("s")));
+
+const isAcronym = (w: string) => /^[A-Z0-9]{2,}$/.test(w) && /[A-Z]/.test(w);
+
+/** The plural of one English noun: mouse -> mice, culture -> cultures,
+ *  biopsy -> biopsies, batch -> batches, fish -> fish, PDX -> PDXs,
+ *  co-culture -> co-cultures. The stem's capitalisation is kept. */
+export function pluraliseWord(w: string): string {
+  if (!w) return w;
+  const dash = w.lastIndexOf("-");
+  if (dash > 0 && dash < w.length - 1) return w.slice(0, dash + 1) + pluraliseWord(w.slice(dash + 1));
+  if (isAcronym(w)) return `${w}s`;
+  const l = w.toLowerCase();
+  if (INVARIANT.has(l) || l.endsWith("fish")) return w;
+  const irr = IRREGULAR[l];
+  if (irr) {
+    if (w === w.toUpperCase() && /[A-Z]/.test(w)) return irr.toUpperCase();
+    return w[0] !== l[0] ? irr[0].toUpperCase() + irr.slice(1) : irr;
+  }
+  if (/is$/.test(l)) return `${w.slice(0, -2)}es`;
+  if (/(s|x|z|ch|sh)$/.test(l)) return `${w}es`;
+  if (/[^aeiou]y$/.test(l)) return `${w.slice(0, -1)}ies`;
+  return `${w}s`;
+}
+
+export interface UnitInfo {
+  /** "an independent cell culture" */
+  phrase: string;
+  /** Head noun, singular / plural: "culture" / "cultures". */
+  one: string;
+  many: string;
+  /** The user typed a plural ("mice"): the text is still generated, with a note. */
+  pluralInput: boolean;
+}
+
+// ", " (not a bare comma) so a thousands separator ("1,800-cell cluster") isn't a cut
+const HEAD_CUT = [" of ", " from ", " in ", " per ", " with ", " at ", " on ", " for ", " derived ", " taken ", " isolated ", " obtained ", "(", ", "];
+
+/** "an" (not "a") before this phrase, by its sound: an RNA sample, an X-ray
+ *  image, a UV-treated culture, an 8-week-old mouse, an 18-month-old mouse,
+ *  a unique donor, an uninfected mouse, a urine sample, an hour, a ewe. */
+function needsAn(u: string): boolean {
+  const num = /^(\d[\d,]*)/.exec(u);
+  if (num) {
+    // spoken "eight…", "eleven…", "eighteen…" (8, 80–89, 800…, 11, 18, 11 000, 18 000)
+    const d = num[1].replace(/,/g, "");
+    if (d[0] === "8") return true;
+    const lead = d.slice(0, d.length % 3 || 3);
+    return lead === "11" || lead === "18";
+  }
+  // a letter-by-letter acronym, also before a hyphen ("LC-MS run", "X-ray image")
+  const first = u.split(/[\s\-/]/)[0];
+  if (isAcronym(first) || /^[A-Z]$/.test(first)) return /^[AEFHILMNORSX]/.test(first);
+  if (/^(hour|honest|honou?r|heir)/i.test(u)) return true;
+  // "you"-sounding u / eu / ew and "w"-sounding one: a unit, a ewe, a one-day-old pup;
+  // the negating un- keeps "an" (an uninfected / unimmunised / unirradiated / unidentified mouse)
+  if (/^un(in(?!uc)|im[mp]|irr|iden)/i.test(u)) return true;
+  if (/^(uni|use|usa|usu|ut(?!t)|ur[aeiou]|ubi|eu|ew|one(?![a-z])|once)/i.test(u)) return false;
+  return /^[aeiou]/i.test(u);
+}
+
+/** Parse "Each value is one…" (singular noun phrase) for the legend. */
+export function unitInfo(raw: unknown): UnitInfo | null {
+  // a saved document can hold anything: only text is a unit
+  let u = (typeof raw === "string" ? clean(raw) : "").slice(0, 80);
+  u = u.replace(/^(a|an|one|each|the|per)\s+/i, "").replace(/[.;,:\s]+$/, "").trim();
+  if (!u || !/[\p{L}\p{N}]/u.test(u)) return null;
+  const low = u.toLowerCase();
+  let cut = u.length;
+  for (const c of HEAD_CUT) {
+    const i = low.indexOf(c);
+    if (i > 0 && i < cut) cut = i;
+  }
+  const headPhrase = u.slice(0, cut).trim() || u;
+  const head = (headPhrase.split(" ").pop() ?? headPhrase).replace(/[^\p{L}\p{N}-]+$/u, "") || headPhrase;
+  const hl = head.toLowerCase();
+  const pluralInput = IRREGULAR_PLURALS.has(hl) || (/s$/.test(hl) && !/(ss|us|is)$/.test(hl) && !isAcronym(head)
+    && !INVARIANT.has(hl) && !IRREGULAR[hl]);
+  const an = needsAn(u);
+  return {
+    phrase: `${an ? "an" : "a"} ${u}`,
+    one: head,
+    many: pluralInput ? head : pluraliseWord(head),
+    pluralInput,
+  };
+}
+
+/** The figure label as typed ("Fig. 1"), tidied; "" = none. */
+function figLabel(raw: unknown): string {
+  return (typeof raw === "string" ? clean(raw) : "").replace(/[\s|:]+$/, "").slice(0, 60).trim();
+}
 
 /** A coefficient bounded by ±1 (r, R²) with 3 decimals; never rounds onto ±1. */
 function fmtCoef(name: string, v: number): string {
@@ -436,10 +578,14 @@ function testedPair(input: FigureTextInput, S: Stats): [number, number] | null {
   return p ? [p[0], p[1]] : null;
 }
 
-/** The "n = …" text of the legend, with the range of group sizes. */
-export function describeN(input: FigureTextInput): { text: string; equal: boolean; min: number; max: number } {
+/** The "n = …" text of the legend, with the range of group sizes. With a
+ *  unit (unitInfo) every count carries its noun: "n = 6 cultures per group". */
+export function describeN(input: FigureTextInput, U?: UnitInfo | null): {
+  text: string; equal: boolean; min: number; max: number; paired?: boolean;
+} {
   const t = input.table;
   const N = normalise(input);
+  const noun = (count: number) => (U ? ` ${count === 1 ? U.one : U.many}` : "");
   if (t.template === "xy") {
     const ss = xySeries(t, N);
     if (!ss.length) return { text: "", equal: true, min: 0, max: 0 };
@@ -448,13 +594,15 @@ export function describeN(input: FigureTextInput): { text: string; equal: boolea
       const pts = ss.map((s) => s.px.length);
       const lo = Math.min(...pts), hi = Math.max(...pts);
       const per = ss.length > 1 ? " per data set" : "";
-      return { text: `n = ${rangeText(lo, hi)} ${plural(hi, "point", "points")}${per}`, equal: lo === hi, min: lo, max: hi };
+      const what = U ? noun(hi) : ` ${plural(hi, "point", "points")}`;
+      return { text: `n = ${rangeText(lo, hi)}${what}${per}`, equal: lo === hi, min: lo, max: hi };
     }
     const rLo = Math.min(...ss.map((s) => s.minRep)), rHi = maxRep;
     const xLo = Math.min(...ss.map((s) => s.cells)), xHi = Math.max(...ss.map((s) => s.cells));
+    const reps = U ? noun(rHi) : " replicates";
     return {
-      text: xHi === 1 ? `n = ${rangeText(rLo, rHi)} replicates at a single X value`
-        : `n = ${rangeText(rLo, rHi)} replicates at each of ${rangeText(xLo, xHi)} X values`,
+      text: xHi === 1 ? `n = ${rangeText(rLo, rHi)}${reps} at a single X value`
+        : `n = ${rangeText(rLo, rHi)}${reps} at each of ${rangeText(xLo, xHi)} X values`,
       equal: rLo === rHi, min: rLo, max: rHi,
     };
   }
@@ -467,18 +615,19 @@ export function describeN(input: FigureTextInput): { text: string; equal: boolea
     const pr = testedPair(input, S);
     if (pr) {
       const { pairs, dropped } = pairCounts(t, pr[0], pr[1]);
-      if (!dropped && groups.length === 2) return { text: `n = ${pairs} pairs`, equal: true, min: pairs, max: pairs };
+      // the unit of n is the pair, whatever one value is
+      if (!dropped && groups.length === 2) return { text: `n = ${pairs} pairs`, equal: true, min: pairs, max: pairs, paired: true };
     }
   }
   if (lo === hi) {
-    return { text: groups.length > 1 ? `n = ${lo} per group` : `n = ${lo}`, equal: true, min: lo, max: hi };
+    return { text: groups.length > 1 ? `n = ${lo}${noun(lo)} per group` : `n = ${lo}${noun(lo)}`, equal: true, min: lo, max: hi };
   }
   if (t.template === "column" && groups.length <= MAX_NAMED_N) {
     // "Control, n = 10; Treatment, n = 9": no nested parentheses inside the legend's "(…)"
-    const parts = groups.map((g) => `${N.labels[g.c]}, n = ${g.n}`);
+    const parts = groups.map((g) => `${N.labels[g.c]}, n = ${g.n}${noun(g.n)}`);
     return { text: parts.join("; "), equal: false, min: lo, max: hi };
   }
-  return { text: `n = ${lo}–${hi} per group`, equal: false, min: lo, max: hi };
+  return { text: `n = ${lo}–${hi}${noun(hi)} per group`, equal: false, min: lo, max: hi };
 }
 
 // ── shared phrases ──────────────────────────────────────────────────────────
@@ -501,11 +650,12 @@ function yName(N: Norm, f: GraphFigure, notes: string[]): string {
   return y;
 }
 
+/** Two-group tests, named for the legend (every one is two-sided). */
 const TWO_GROUP_LEGEND: Record<string, string> = {
-  unpaired_t: "an unpaired two-tailed Student's t test",
-  welch_t: "an unpaired two-tailed t test with Welch's correction",
-  paired_t: "a paired two-tailed t test",
-  mann_whitney: "a two-sided Mann–Whitney test",
+  unpaired_t: "a two-sided unpaired Student's t test",
+  welch_t: "a two-sided unpaired Welch's t test",
+  paired_t: "a two-sided paired t test",
+  mann_whitney: "a two-sided Mann–Whitney U test",
   wilcoxon: "a two-sided Wilcoxon matched-pairs signed-rank test",
 };
 
@@ -515,13 +665,26 @@ const ONE_WAY_LEGEND: Record<string, string> = {
   kruskal: "the Kruskal–Wallis test",
 };
 
+/** Post-hoc tests, named for the legend. All are two-sided: Tukey / Games–
+ *  Howell use |difference|, the others 2·sf(|t|) or the two-sided Dunnett distribution. */
 const POSTHOC_LEGEND: Record<string, string> = {
-  tukey: "Tukey's multiple comparisons test",
-  dunnett: "Dunnett's multiple comparisons test",
-  sidak: "Šídák's multiple comparisons test",
-  bonferroni: "Bonferroni's multiple comparisons test",
-  dunn: "Dunn's multiple comparisons test with Bonferroni correction",
-  games_howell: "the Games–Howell multiple comparisons test",
+  tukey: "a two-sided Tukey's multiple-comparisons test",
+  dunnett: "a two-sided Dunnett's multiple-comparisons test",
+  sidak: "a two-sided Šídák's multiple-comparisons test",
+  bonferroni: "a two-sided Bonferroni multiple-comparisons test",
+  dunn: "a two-sided Dunn's multiple-comparisons test with Bonferroni correction",
+  games_howell: "a two-sided Games–Howell multiple-comparisons test",
+};
+
+/** One-way post-hoc with a single, unadjusted comparison: name the test that
+ *  was actually performed (matches the methods text), not a "multiple-comparisons test". */
+const POSTHOC_SINGLE_LEGEND: Record<string, string> = {
+  tukey: "a two-sided Tukey's test",
+  dunnett: "a two-sided Dunnett's test",
+  sidak: "a two-sided t test with the pooled ANOVA variance",
+  bonferroni: "a two-sided t test with the pooled ANOVA variance",
+  dunn: "a two-sided Dunn's test",
+  games_howell: "a two-sided Games–Howell test",
 };
 
 /** "t(18) = −1.19", "F(2, 27) = 4.85", "H(2) = 7.99", "U = 32.5", … */
@@ -545,14 +708,39 @@ function statText(test: NonNullable<AnalyzeResult["test"]>): string {
 const statAndP = (test: NonNullable<AnalyzeResult["test"]>, alpha: number) =>
   [statText(test), isNum(test.p) ? fmtP(test.p, alpha) : ""].filter(Boolean).join(", ");
 
+/** Two-way ANOVA terms: "interaction, F(2, 12) = 47.14, P < 0.0001; row factor, …". */
+function twoWayTerms(S: Stats, alpha: number): string[] {
+  const tab = S.res?.anova_table ?? [];
+  const resid = tab.find((r) => r.source === "Residual");
+  return tab.filter((r) => r.source !== "Residual" && r.source !== "Total" && isNum(r.f) && isNum(r.p))
+    .map((r) => {
+      const df = isNum(r.df) && resid && isNum(resid.df) ? `(${fmtDf(r.df)}, ${fmtDf(resid.df)})` : "";
+      return `${r.source.toLowerCase()}, F${df} = ${fmtStat(r.f as number)}, ${fmtP(r.p as number, alpha)}`;
+    });
+}
+
 /** Names of the two sides of a comparison (labels as the reader sees them). */
 function cmpNames(input: FigureTextInput, N: Norm, c: Comparison): [string, string] {
   const inner = input.table.template === "grouped" && input.analysis.within === "columns" ? N.rowTitles : N.labels;
   return [inner[c.a] ?? `Group ${c.a + 1}`, inner[c.b] ?? `Group ${c.b + 1}`];
 }
 
-/** Distinct compared pairs as "B vs. A" (grouped: across rows / columns). */
-function pairList(input: FigureTextInput, N: Norm, cmps: Comparison[]): string {
+/** "A versus B" (legend): the control / lower index first, as the user's example. */
+function versus(input: FigureTextInput, N: Norm, c: Comparison): string {
+  const [a, b] = cmpNames(input, N, c);
+  return `${a} versus ${b}`;
+}
+
+/** The level of the outer factor a two-way comparison belongs to. */
+function outerName(input: FigureTextInput, N: Norm, c: Comparison): string {
+  const r = c.row ?? -1;
+  if (input.analysis.within === "columns") return N.labels[r] ?? `Column ${r + 1}`;
+  return N.rowTitles[r] ?? `Row ${r + 1}`;
+}
+
+/** Distinct compared pairs: methods "B vs. A; …" (grouped: across rows /
+ *  columns), legend "A versus B, C versus D and …". */
+function pairList(input: FigureTextInput, N: Norm, cmps: Comparison[], style: "methods" | "legend" = "methods"): string {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const c of cmps) {
@@ -560,9 +748,10 @@ function pairList(input: FigureTextInput, N: Norm, cmps: Comparison[]): string {
     if (seen.has(key)) continue;
     seen.add(key);
     const [a, b] = cmpNames(input, N, c);
-    out.push(`${b} vs. ${a}`);
+    out.push(style === "legend" ? `${a} versus ${b}` : `${b} vs. ${a}`);
   }
-  return out.length <= MAX_PAIRS_LISTED ? out.join("; ") : `${out.length} pairs`;
+  if (out.length > MAX_PAIRS_LISTED) return `${out.length} pairs`;
+  return style === "legend" ? joinList(out) : out.join("; ");
 }
 
 function controlName(input: FigureTextInput, N: Norm): string {
@@ -573,30 +762,59 @@ function controlName(input: FigureTextInput, N: Norm): string {
 
 // ── legend ──────────────────────────────────────────────────────────────────
 
-function shownColumn(input: FigureTextInput, N: Norm, nText: string, notes: string[]): string[] {
+/** Plural words for the centre and the error bars ("means", "standard deviations"). */
+const CENTRE_PLURAL: Record<CenterId, [string, string]> = {
+  mean_sd: ["means", "standard deviations"],
+  mean_sem: ["means", "standard errors of the mean"],
+  mean_ci: ["means", "95% confidence intervals"],
+  median_iqr: ["medians", "interquartile ranges"],
+};
+
+const BOX_TEXT = "Boxes span the 25th to 75th percentiles with a line at the median; whiskers extend to the minimum and maximum values";
+const VIOLIN_TEXT = "Violins show the kernel density estimate of each distribution (trimmed to the range of the data, drawn at equal width) with a line at the median";
+
+/** "Each dot represents an independent cell culture" / "… one value". */
+const symbolText = (U: UnitInfo | null) => `Each dot represents ${U ? U.phrase : "one value"}`;
+
+/** A sentence with its n clause: "… (n = 6 per group)." A sentence that
+ *  already ends in a parenthesis (unit "technical replicate (well)") takes it
+ *  after a semicolon instead, never ") (": "…(well); n = 10 replicates per group." */
+function withNClause(s: string, nText: string): string {
+  if (!nText) return `${s}.`;
+  if (!/\)$/.test(s)) return `${s} (${nText}).`;
+  // per-group lists already hold semicolons ("A, n = 8; B, n = 6")
+  return nText.includes(";") ? `${s}. Group sizes: ${nText}.` : `${s}; ${nText}.`;
+}
+
+function shownColumn(input: FigureTextInput, N: Norm, nText: string, U: UnitInfo | null, notes: string[]): string[] {
   const groups = plottedGroups(input.table);
-  const C = CENTER_TEXT[N.center];
-  const pts = N.points ? "; circles show individual values" : "";
-  const withN = (s: string) => `${s}${nText ? ` (${nText})` : ""}.`;
+  const [centres, errors] = CENTRE_PLURAL[N.center];
+  const withN = (s: string) => withNClause(s, nText);
+  const SYM = symbolText(U);
   const out: string[] = [];
+  // the n clause goes with the dots when they are drawn, else with the summary symbols
+  const summary = (s: string) => {
+    if (N.points) out.push(withN(SYM), `${s}.`);
+    else out.push(withN(s));
+  };
   switch (N.type) {
     case "bar":
-      out.push(withN(`Bars show the ${C}${pts}`));
+      summary(`Bar heights indicate ${centres}; error bars indicate ${errors}`);
       break;
     case "dot":
-      out.push(withN(`Each circle is one value; horizontal lines and error bars show the ${C}`));
+      out.push(withN(SYM), `Horizontal lines indicate ${centres}; error bars indicate ${errors}.`);
       break;
     case "box":
-      out.push(withN(`Boxes span the 25th to 75th percentiles with a line at the median; whiskers extend to the minimum and maximum values${pts}`));
+      summary(BOX_TEXT);
       break;
     default: {
       const few = groups.filter((g) => g.n < 3).length;
       if (few === groups.length) {
         // graph_plot draws no violin at all (vok = 0 for every group): only points
-        out.push(withN("Circles show individual values"));
+        out.push(withN(SYM));
         addNote(notes, "Violins need at least 3 values per group, so none is drawn; a dot plot shows the same values with the centre and error bars.");
       } else {
-        out.push(withN(`Violins show the kernel density estimate of each distribution (trimmed to the range of the data, drawn at equal width) with a line at the median${pts}`));
+        summary(VIOLIN_TEXT);
         if (few) out.push("Groups with fewer than 3 values are shown as individual points.");
       }
     }
@@ -609,7 +827,7 @@ function shownColumn(input: FigureTextInput, N: Norm, nText: string, notes: stri
     const colsUsed = [...new Set(groups.map((g) => g.c))].sort((a, b) => a - b);
     const clusters = listOrCount(rowsUsed.map((r) => N.rowTitles[r] ?? `Row ${r + 1}`), "groups");
     const series = listOrCount(colsUsed.map((c) => N.labels[c]), "data sets");
-    const noun = { bar: "bars", dot: "points", box: "boxes", violin: "violins" }[N.type as "bar"] ?? "bars";
+    const noun = { bar: "bars", dot: "dots", box: "boxes", violin: "violins" }[N.type as "bar"] ?? "bars";
     out.push(N.showLegend
       ? `Clusters on the X axis are ${clusters}; colours indicate ${series}.`
       : `Clusters on the X axis are ${clusters}; within each cluster the ${noun} are, from left to right, ${series}.`);
@@ -617,15 +835,17 @@ function shownColumn(input: FigureTextInput, N: Norm, nText: string, notes: stri
   return out;
 }
 
-function shownXY(input: FigureTextInput, N: Norm, ss: Series[], nText: string, notes: string[]): string[] {
-  const C = CENTER_TEXT[N.center];
+function shownXY(input: FigureTextInput, N: Norm, ss: Series[], nText: string, U: UnitInfo | null, notes: string[]): string[] {
+  const [centres, errors] = CENTRE_PLURAL[N.center];
   const reps = ss.some((s) => s.maxRep > 1);
-  let s = N.points || !reps ? "Circles show individual values"
-    : `Circles and error bars show the ${C} of the replicates at each X value`;
+  const first = N.points || !reps ? symbolText(U)
+    : `Dots indicate ${centres} of the replicates at each X value; error bars indicate ${errors}`;
   const lines = ss.length > 1;
+  // what the lines / bands are: one sentence after the symbols
+  let rest = "";
   if (N.type === "xy_line") {
-    s += reps
-      ? `; ${lines ? "lines connect" : "the line connects"} the ${N.center === "median_iqr" ? "medians" : "means"} at each X value`
+    rest += reps
+      ? `; ${lines ? "lines connect" : "the line connects"} the ${centres} at each X value`
       : `; ${lines ? "lines connect" : "the line connects"} the points in order of X`;
   }
   const out: string[] = [];
@@ -637,15 +857,15 @@ function shownXY(input: FigureTextInput, N: Norm, ss: Series[], nText: string, n
       const one = withLine.length === 1;
       // Name the fitted data sets when only some of them have a line.
       const fitFor = withLine.length < ss.length ? ` for ${joinList(withLine.map((f) => f.s.name))}` : "";
-      s += one ? `; the line shows the least-squares linear regression fit${fitFor}` : `; lines show the least-squares linear regression fits${fitFor}`;
+      rest += one ? `; the line shows the least-squares linear regression fit${fitFor}` : `; lines show the least-squares linear regression fits${fitFor}`;
       const banded = withLine.filter((f) => f.band);
       if (N.showBand && banded.length) {
         if (banded.length < withLine.length) {
-          s += banded.length === 1
+          rest += banded.length === 1
             ? `; the shaded band shows the 95% confidence band for ${banded[0].s.name}`
             : `; shaded bands show the 95% confidence bands for ${joinList(banded.map((f) => f.s.name))}`;
         } else {
-          s += one ? " and the shaded band its 95% confidence band" : " and shaded bands their 95% confidence bands";
+          rest += one ? " and the shaded band its 95% confidence band" : " and shaded bands their 95% confidence bands";
         }
         if (banded.length < withLine.length) {
           addNote(notes, `No confidence band could be drawn for ${joinList(withLine.filter((f) => !f.band).map((f) => f.s.name))} (fewer than 3 points or a perfect fit).`);
@@ -653,7 +873,9 @@ function shownXY(input: FigureTextInput, N: Norm, ss: Series[], nText: string, n
       }
     }
   }
-  out.push(`${s}${nText ? ` (${nText})` : ""}.`);
+  out.push(withNClause(first, nText));
+  rest = rest.replace(/^; /, "");
+  if (rest) out.push(`${rest.charAt(0).toUpperCase()}${rest.slice(1)}.`);
   if (!N.points && reps && ss.some((x) => x.minRep === 1)) {
     out.push("No error bar is drawn where there is a single value.");
   }
@@ -670,7 +892,38 @@ function shownXY(input: FigureTextInput, N: Norm, ss: Series[], nText: string, n
   return out;
 }
 
-function legendStatsColumn(input: FigureTextInput, N: Norm, S: Stats): string[] {
+/** A post-hoc test produced at least one P and so replaces the omnibus test in the legend. */
+const posthocRan = (input: FigureTextInput, S: Stats) =>
+  input.analysis.posthoc !== "none" && !!POSTHOC_LEGEND[input.analysis.posthoc] && S.cmpP.length > 0;
+
+/** The post-hoc P values are really adjusted for multiplicity (mirrors
+ *  graph_stats). A family of one comparison leaves P unchanged: Šídák /
+ *  Bonferroni / Dunn / Dunnett with one comparison, Tukey / Games–Howell with
+ *  two groups (the studentized range for k = 2 is the t test), and two-way
+ *  per-row (per-column) families holding one pair. */
+function pAdjusted(input: FigureTextInput, S: Stats): boolean {
+  const a = input.analysis;
+  if (!S.res || TWO_GROUP.includes(a.test) || a.posthoc === "none") return false;
+  const cmps = S.res.comparisons;
+  const groups = plottedGroups(input.table);
+  if (input.table.template === "grouped") {
+    const withinRows = a.within !== "columns";
+    const outer = new Set(groups.map((g) => (withinRows ? g.r : g.c))).size;
+    const inner = new Set(groups.map((g) => (withinRows ? g.c : g.r))).size;
+    const nFam = a.family === "per_row" ? 1 : outer;
+    if (a.posthoc === "tukey") return inner > 2 || nFam > 1;
+    const pairs = new Set(cmps.map((c) => `${c.a},${c.b}`)).size;
+    return pairs * nFam > 1;
+  }
+  if (a.posthoc === "tukey" || a.posthoc === "games_howell") return groups.length > 2;
+  return cmps.length > 1;
+}
+
+/** "multiplicity-adjusted P" or plain "P" (a family of one comparison). */
+const adjP = (adj: boolean) => (adj ? "multiplicity-adjusted P" : "P");
+const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+function legendStatsColumn(input: FigureTextInput, N: Norm, S: Stats, notes: string[]): string[] {
   const out: string[] = [];
   const a = input.analysis;
   const test = S.test;
@@ -678,28 +931,42 @@ function legendStatsColumn(input: FigureTextInput, N: Norm, S: Stats): string[] 
   if (TWO_GROUP.includes(a.test)) {
     if (!S.testP) return out;
     const c0 = S.res!.comparisons[0];
-    const [na, nb] = c0 ? cmpNames(input, N, c0) : ["the first group", "the second group"];
-    out.push(`${nb} was compared with ${na} by ${TWO_GROUP_LEGEND[a.test]} (${statAndP(test, N.alpha)}).`);
+    const who = c0 ? (([x, y]) => `${x} and ${y}`)(cmpNames(input, N, c0)) : "The two groups";
+    let pairsText = "";
+    if (a.test === "paired_t" || a.test === "wilcoxon") {
+      // the legend's n counts plotted values unless every plotted value is in a pair:
+      // say how many pairs the P comes from
+      const pr = testedPair(input, S);
+      const pc = pr ? pairCounts(input.table, pr[0], pr[1]) : null;
+      if (pc && !describeN(input).paired) {
+        pairsText = `; n = ${pc.pairs} ${plural(pc.pairs, "pair", "pairs")}`;
+        if (pc.dropped) pairsText += `, ${pc.dropped} unpaired ${plural(pc.dropped, "value", "values")} not analysed`;
+      }
+    }
+    out.push(`${who} were compared using ${TWO_GROUP_LEGEND[a.test]} (${statAndP(test, N.alpha)}${pairsText}).`);
     return out;
   }
-  if (ONE_WAY.includes(a.test)) {
-    const ph = S.cmpP.length && a.posthoc !== "none" ? posthocLegend(input, N) : "";
-    if (S.testP) out.push(`Groups were compared by ${ONE_WAY_LEGEND[a.test]} (${statAndP(test, N.alpha)})${ph ? ` followed by ${ph}` : ""}.`);
-    else if (ph) out.push(`Groups were compared with ${ph}.`);
+  if (!ONE_WAY.includes(a.test)) return out;
+  if (posthocRan(input, S)) {
+    const PH = POSTHOC_LEGEND[a.posthoc];
+    const cmps = S.res!.comparisons;
+    if (cmps.length === 1) {
+      const [x, y] = cmpNames(input, N, cmps[0]);
+      const P = fmtP(cmps[0].p_adj as number, N.alpha);
+      out.push(pAdjusted(input, S)
+        ? `${x} and ${y} were compared using ${PH} (multiplicity-adjusted ${P}).`
+        : `${x} and ${y} were compared using ${POSTHOC_SINGLE_LEGEND[a.posthoc] ?? PH} (${P}; a single comparison, so not adjusted for multiplicity).`);
+    } else {
+      const scheme = a.compare === "control" || a.posthoc === "dunnett" ? `Comparisons with group ${controlName(input, N)}`
+        : a.compare === "selected" ? "Selected pairwise comparisons" : "All pairwise comparisons";
+      out.push(`${scheme} were performed using ${PH}.`);
+      out.push(...pValueSentences(input, N, S, notes));
+    }
+    if (S.testP) addNote(notes, "The omnibus test result is in the methods text, not the legend; quote it in your Results as your journal requires.");
+    return out;
   }
+  if (S.testP) out.push(`Groups were compared using ${ONE_WAY_LEGEND[a.test]} (${statAndP(test, N.alpha)}).`);
   return out;
-}
-
-function posthocLegend(input: FigureTextInput, N: Norm): string {
-  const a = input.analysis;
-  let s = POSTHOC_LEGEND[a.posthoc] ?? "";
-  if (!s) return "";
-  if (a.posthoc === "dunnett") s += ` against ${controlName(input, N)}`;
-  else if (a.posthoc === "sidak" || a.posthoc === "bonferroni" || a.posthoc === "dunn") {
-    if (a.compare === "control") s += ` (each group vs. ${controlName(input, N)})`;
-    else if (a.compare === "selected") s += " (selected pairs)";
-  }
-  return s;
 }
 
 interface TwoWayInfo {
@@ -730,31 +997,117 @@ function twoWayInfo(input: FigureTextInput, N: Norm, S: Stats): TwoWayInfo {
 }
 
 /** The compared set inside each level of the outer factor (two-way). */
-function twoWayInnerSet(input: FigureTextInput, N: Norm, S: Stats, W: TwoWayInfo): { subject: string; verb: string } {
+function twoWayInnerSet(input: FigureTextInput, N: Norm, S: Stats, W: TwoWayInfo, style: "methods" | "legend" = "methods"): string {
   const a = input.analysis;
-  if (a.compare === "control") return { subject: `each level of the ${W.innerFactor} was compared with ${controlName(input, N)}`, verb: "was" };
-  if (a.compare === "selected") return { subject: `selected pairs (${pairList(input, N, S.cmpP)}) were compared`, verb: "were" };
+  if (a.compare === "control") return `each level of the ${W.innerFactor} was compared with ${controlName(input, N)}`;
+  if (a.compare === "selected") return `selected pairs (${pairList(input, N, S.cmpP, style)}) were compared`;
   const names = W.innerCount <= MAX_LISTED ? joinList(W.innerNames) : `the ${W.innerCount} levels of the ${W.innerFactor}`;
-  return { subject: W.innerCount === 2 ? `${names} were compared` : `all pairs of ${names} were compared`, verb: "were" };
+  return W.innerCount === 2 ? `${names} were compared` : `all pairs of ${names} were compared`;
 }
 
-function legendStatsGrouped(input: FigureTextInput, N: Norm, S: Stats): string[] {
+function legendStatsGrouped(input: FigureTextInput, N: Norm, S: Stats, notes: string[]): string[] {
   const out: string[] = [];
-  if (!S.test || input.analysis.test !== "two_way" || !S.testP) return out;
-  const tab = S.res!.anova_table ?? [];
-  const resid = tab.find((r) => r.source === "Residual");
-  const terms = tab.filter((r) => r.source !== "Residual" && r.source !== "Total" && isNum(r.f) && isNum(r.p))
-    .map((r) => {
-      const df = isNum(r.df) && resid && isNum(resid.df) ? `(${fmtDf(r.df)}, ${fmtDf(resid.df)})` : "";
-      return `${r.source.toLowerCase()}, F${df} = ${fmtStat(r.f as number)}, ${fmtP(r.p as number, N.alpha)}`;
-    });
-  if (!terms.length) return out;
+  const a = input.analysis;
+  if (!S.test || a.test !== "two_way" || !S.testP) return out;
   const W = twoWayInfo(input, N, S);
+  if (posthocRan(input, S)) {
+    let family = "";
+    if (W.outerLevels > 1) {
+      const m = S.res!.comparisons.length;
+      if (a.family === "per_row") family = `, treating each level of the ${W.outerFactor} as a separate family`;
+      else if (a.posthoc === "tukey") family = `, with Šídák correction across the ${W.outerLevels} levels of the ${W.outerFactor}`;
+      else if (a.posthoc === "sidak" || a.posthoc === "bonferroni") family = m === 2 ? ", with both comparisons as one family" : `, with all ${m} comparisons as one family`;
+    }
+    if (!pAdjusted(input, S)) {
+      // e.g. two columns, each row its own family: the P values are those of single t tests
+      family += family ? "; with one comparison per family, P values are not adjusted for multiplicity"
+        : "; with a single comparison per level, P values are not adjusted for multiplicity";
+      const lvl = a.within === "columns" ? "column" : "row";
+      addNote(notes, `Each ${lvl} is its own family with a single comparison, so its P value is not corrected for multiplicity. To correct across ${lvl}s, set “Correct for multiple comparisons across” to “All comparisons (one family)”.`);
+    }
+    // unadjusted (one comparison per family): these are t tests on the pooled residual variance, as the methods say
+    const how = pAdjusted(input, S) ? POSTHOC_LEGEND[a.posthoc] : "two-sided t tests with the pooled residual variance of the ANOVA";
+    out.push(`Within each level of the ${W.outerFactor}, ${twoWayInnerSet(input, N, S, W, "legend")} using ${how}${family}.`);
+    out.push(...pValueSentences(input, N, S, notes));
+    addNote(notes, "Replace 'row factor' / 'column factor' with the names of your factors.");
+    if (twoWayTerms(S, N.alpha).length) {
+      addNote(notes, "The omnibus test result is in the methods text, not the legend; quote it in your Results as your journal requires.");
+    }
+    return out;
+  }
+  const terms = twoWayTerms(S, N.alpha);
+  if (!terms.length) return out;
   out.push(`Two-way ANOVA${W.interaction ? "" : " without interaction (one value per group)"}: ${terms.join("; ")}.`);
-  if (S.cmpP.length && input.analysis.posthoc !== "none") {
-    const ph = POSTHOC_LEGEND[input.analysis.posthoc];
-    const set = twoWayInnerSet(input, N, S, W).subject;
-    out.push(end(`Within each level of the ${W.outerFactor}, ${set} by ${ph}`));
+  return out;
+}
+
+/** The P value of every computed comparison (multi-comparison post-hoc
+ *  tests), in result order; above MAX_P_LISTED a truthful, numerically
+ *  checked summary instead. Comparisons without a P are named. */
+function pValueSentences(input: FigureTextInput, N: Norm, S: Stats, notes: string[]): string[] {
+  const out: string[] = [];
+  const cmps = S.res!.comparisons;
+  const grouped = input.table.template === "grouped";
+  if (!grouped && cmps.length <= 1) return out;   // a single comparison carries its P in the test sentence
+  const thr = N.thr;
+  const cmpP = S.cmpP;
+  const M = cmpP.length;
+  const AP = adjP(pAdjusted(input, S));
+  const pv = (c: Comparison) => fmtPValue(c.p_adj as number, N.alpha);
+  const item = (c: Comparison) => `${pv(c)} for ${versus(input, N, c)}`;
+  const listSentence = (L: Comparison[]): string => {
+    const one = L.length === 1;
+    if (!grouped) {
+      return one ? `The ${AP} value is ${item(L[0])}.` : `${cap(AP)} values are ${joinList(L.map(item))}.`;
+    }
+    const pairs = [...new Set(L.map((c) => versus(input, N, c)))];
+    if (pairs.length === 1) {
+      const vals = joinList(L.map((c) => `${pv(c)} (${outerName(input, N, c)})`));
+      return one ? `The ${AP} value for ${pairs[0]} is ${vals}.` : `${cap(AP)} values for ${pairs[0]} are ${vals}.`;
+    }
+    const levels: (number | null)[] = [];
+    for (const c of L) if (!levels.includes(c.row)) levels.push(c.row);
+    const parts = levels.map((r) => {
+      const inLevel = L.filter((c) => c.row === r);
+      return `within ${outerName(input, N, inLevel[0])}, ${joinList(inLevel.map(item))}`;
+    });
+    return `${cap(AP)} values are as follows: ${parts.join("; ")}.`;
+  };
+  if (M > 0 && M <= MAX_P_LISTED) {
+    out.push(listSentence(cmpP));
+  } else if (M > MAX_P_LISTED) {
+    const B = bracketInfo(input);
+    const key = (c: { a: number; b: number; row: number | null }) => `${c.a},${c.b},${c.row ?? -1}`;
+    const drawnKeys = new Set(B.drawn.map(key));
+    const drawnC = cmpP.filter((c) => drawnKeys.has(key(c)));
+    const sig = cmpP.filter((c) => (c.p_adj as number) <= thr);
+    const L = drawnC.length >= 1 && drawnC.length <= MAX_P_LISTED ? drawnC
+      : sig.length >= 1 && sig.length <= MAX_P_LISTED ? sig : null;
+    const rest = L ? cmpP.filter((c) => !L.includes(c)) : [];
+    const T = fmtThr(thr);
+    if (L && rest.length && rest.every((c) => (c.p_adj as number) > thr)) {
+      out.push(listSentence(L));
+      out.push(rest.length === 1
+        ? `The other comparison had a ${AP} > ${T}.`
+        : `The other ${rest.length} comparisons had ${AP} > ${T}.`);
+    } else if (cmpP.every((c) => (c.p_adj as number) < 0.0001)) {
+      out.push(`${cap(AP)} values were <0.0001 for all ${M} comparisons.`);
+    } else if (sig.length === M) {
+      out.push(`${cap(AP)} values were ≤ ${T} for all ${M} comparisons.`);
+    } else if (!sig.length) {
+      out.push(`${cap(AP)} values were > ${T} for all ${M} comparisons.`);
+    } else {
+      const sigBound = sig.every((c) => (c.p_adj as number) < 0.0001) ? "<0.0001" : `≤ ${T}`;
+      out.push(`${cap(AP)} values were ${sigBound} for ${sig.length} of the ${M} comparisons and > ${T} for the other ${M - sig.length === 1 ? "one" : M - sig.length}.`);
+    }
+    addNote(notes, `${M} comparisons: the legend lists at most ${MAX_P_LISTED}. Every ${AP === "P" ? "" : "adjusted "}P value is in the Results tab (export it as a supplementary table).`);
+  }
+  const missing = cmps.filter((c) => !isNum(c?.p_adj));
+  if (missing.length) {
+    const name = (c: Comparison) => (grouped ? `${versus(input, N, c)} within ${outerName(input, N, c)}` : versus(input, N, c));
+    if (missing.length > MAX_MISSING_LISTED) out.push(`P values could not be computed for ${missing.length} comparisons.`);
+    else if (missing.length === 1) out.push(`A P value could not be computed for ${name(missing[0])}.`);
+    else out.push(`P values could not be computed for ${joinList(missing.map(name))}.`);
   }
   return out;
 }
@@ -771,7 +1124,7 @@ function legendStatsXY(input: FigureTextInput, N: Norm, S: Stats, ss: Series[], 
       const parts = rows.map((r) => {
         const bits = [fmtEquation(r.slope as number, r.intercept as number)];
         if (isNum(r.r2)) bits.push(fmtCoef("R²", r.r2));
-        if (isNum(r.p)) bits.push(`${fmtP(r.p, N.alpha)} (slope vs. zero)`);
+        if (isNum(r.p)) bits.push(`${fmtP(r.p, N.alpha)} (slope versus zero)`);
         return `${single && rows.length === 1 ? "" : `${N.labels[r.col] ?? clean(r.label)}: `}${bits.join(", ")}`;
       });
       out.push(`Linear regression: ${parts.join("; ")}.`);
@@ -801,43 +1154,41 @@ function legendStatsXY(input: FigureTextInput, N: Norm, S: Stats, ss: Series[], 
   return out;
 }
 
+/** What the brackets on the figure are and what their labels mean; nothing
+ *  when no bracket is drawn. Mirrors graph_plot via bracketInfo. */
 function bracketSentences(input: FigureTextInput, N: Norm, S: Stats, notes: string[]): string[] {
   const out: string[] = [];
   if (input.table.template === "xy" || N.sigShow === "none" || !S.ok || !S.cmpP.length) return out;
   const twoGroup = TWO_GROUP.includes(input.analysis.test);
-  const P = twoGroup ? "P" : "adjusted P";
   const B = bracketInfo(input);
   if (B.tooMany) {
     addNote(notes, `More than ${MAX_BRACKETS} brackets (${B.tooMany}): none are drawn on the figure, so the legend gives no bracket key.`);
     return out;
   }
-  // comparisons without a P are never drawn: don't let "all" / "no comparison" cover them
-  const missing = twoGroup ? [] : S.res!.comparisons.filter((c) => !isNum(c?.p_adj));
-  const missingText = !missing.length ? ""
-    : input.table.template === "column"
-      ? `Comparisons that could not be computed (${pairList(input, N, missing)}) are not shown.`
-      : `${missing.length} ${plural(missing.length, "comparison", "comparisons")} could not be computed and ${plural(missing.length, "is", "are")} not shown.`;
-  if (!B.drawn.length) {
-    if (N.sigShow === "significant" && !twoGroup && B.droppedNs) {
-      out.push(`No comparison${missing.length ? " that could be computed" : ""} was significant (${P} > ${fmtThr(N.thr)}).`);
-      if (missingText) out.push(missingText);
-    }
-    return out;
+  if (!B.drawn.length) return out;
+  const adj = !twoGroup && pAdjusted(input, S);
+  const P = adjP(adj);
+  const one = B.drawn.length === 1;
+  const T = fmtThr(N.thr);
+  if (B.drawn.length === S.cmpP.length) {
+    out.push(one ? "The bracket indicates the groups compared." : "Brackets indicate the groups compared.");
+  } else if (N.sigShow === "significant" && B.droppedNs > 0) {
+    out.push(one ? `The bracket marks the comparison with ${P} ≤ ${T}.` : `Brackets mark comparisons with ${P} ≤ ${T}.`);
+  } else {
+    out.push("Brackets indicate comparisons between the groups they span.");
   }
-  if (N.sigShow === "significant" && B.droppedNs) out.push("Only significant comparisons are shown.");
-  if (N.sigShow === "all" && !twoGroup) out.push(missing.length ? "All comparisons that could be computed are shown." : "All comparisons are shown.");
-  if (missingText) out.push(missingText);
   if (N.sigLabel === "p") {
-    out.push(twoGroup ? "The bracket shows the P value." : "Brackets show multiplicity-adjusted P values.");
+    out.push(one ? `The bracket label gives the ${P} value.` : `Bracket labels give the ${P} values.`);
     return out;
   }
+  const PS = adj ? "adjusted P" : "P";
   const present = new Set(B.drawn.map((b) => b.label));
   const key: string[] = [];
   // _star: "*" needs P ≤ min(α, 0.05); with an α below a star's own cut-off
   // (e.g. α = 0.005) that star only appears for P ≤ α.
   const cut: [string, number][] = [["*", 0.05], ["**", 0.01], ["***", 0.001], ["****", 0.0001]];
-  for (const [sym, v] of cut) if (present.has(sym)) key.push(`${sym}${P} ≤ ${fmtThr(Math.min(v, N.thr))}`);
-  if (present.has("ns")) key.push(`ns, not significant (${P} > ${fmtThr(N.thr)})`);
+  for (const [sym, v] of cut) if (present.has(sym)) key.push(`${sym}${PS} ≤ ${fmtThr(Math.min(v, N.thr))}`);
+  if (present.has("ns")) key.push(`ns, not significant (${PS} > ${T})`);
   if (key.length) out.push(`${key.join("; ")}.`);
   return out;
 }
@@ -900,13 +1251,13 @@ function methodsTestColumn(input: FigureTextInput, N: Norm, S: Stats): string[] 
     const method = test.method ?? "";
     switch (a.test) {
       case "unpaired_t":
-        out.push("The two groups were compared with an unpaired, two-tailed Student's t test (pooled variance).");
+        out.push("The two groups were compared with an unpaired, two-sided Student's t test (pooled variance).");
         break;
       case "welch_t":
-        out.push("The two groups were compared with an unpaired, two-tailed t test with Welch's correction for unequal variances (Welch–Satterthwaite degrees of freedom).");
+        out.push("The two groups were compared with an unpaired, two-sided t test with Welch's correction for unequal variances (Welch–Satterthwaite degrees of freedom).");
         break;
       case "paired_t":
-        out.push(`The two groups were compared with a paired, two-tailed t test on the within-pair differences (n = ${pc.pairs} pairs).${droppedRows}`);
+        out.push(`The two groups were compared with a paired, two-sided t test on the within-pair differences (n = ${pc.pairs} pairs).${droppedRows}`);
         break;
       case "mann_whitney": {
         const clause = EXACT_CLAUSE[method]
@@ -935,10 +1286,12 @@ function methodsTestColumn(input: FigureTextInput, N: Norm, S: Stats): string[] 
   }
   if (!ONE_WAY.includes(a.test)) return out;
   if (S.testP) {
+    // the omnibus result always lives here (the legend drops it when post-hoc P values are listed)
+    const st = statAndP(test, N.alpha);
     out.push({
-      anova: "Groups were compared by ordinary one-way ANOVA.",
-      welch_anova: "Groups were compared by Welch's one-way ANOVA, which does not assume equal variances.",
-      kruskal: "Groups were compared with the Kruskal–Wallis test (tie-corrected H, χ² approximation).",
+      anova: `Groups were compared by ordinary one-way ANOVA (${st}).`,
+      welch_anova: `Groups were compared by Welch's one-way ANOVA, which does not assume equal variances (${st}).`,
+      kruskal: `Groups were compared with the Kruskal–Wallis test (tie-corrected H, χ² approximation; ${st}).`,
     }[a.test as "anova"]);
   }
   const ph = methodsPosthocOneWay(input, N, S);
@@ -978,7 +1331,9 @@ function methodsPosthocOneWay(input: FigureTextInput, N: Norm, S: Stats): string
       s = `${subject} using t tests with the pooled ANOVA variance and Bonferroni correction for ${mText}`;
       break;
     case "games_howell":
-      s = `${allPw} used the Games–Howell test (no assumption of equal variances)`;
+      // Games–Howell runs on any comparison set (all / control / selected pairs)
+      s = a.compare === "all" ? `${allPw} used the Games–Howell test (no assumption of equal variances)`
+        : `${subject} using the Games–Howell test (no assumption of equal variances)`;
       break;
     case "dunn":
       s = `${subject} using Dunn's test on the mean ranks of the joint ranking (tie-corrected), with Bonferroni correction for ${mText}`;
@@ -986,8 +1341,17 @@ function methodsPosthocOneWay(input: FigureTextInput, N: Norm, S: Stats): string
     default:
       return null;
   }
-  const out = [`${s}; multiplicity-adjusted P values are reported.`];
-  if (["dunnett", "sidak", "bonferroni", "dunn"].includes(a.posthoc)) out.push("Pairwise comparisons were two-sided.");
+  if (!pAdjusted(input, S)) {
+    // one comparison (or two groups): every correction leaves P unchanged
+    const ph = a.posthoc === "dunn" ? `${subject} using Dunn's test on the mean ranks of the joint ranking (tie-corrected)`
+      : a.posthoc === "sidak" || a.posthoc === "bonferroni" ? `${subject} using a t test with the pooled ANOVA variance`
+        : s;
+    s = `${ph}; with a single comparison, the P value is not adjusted for multiplicity`;
+  } else {
+    s += "; multiplicity-adjusted P values are reported";
+  }
+  const out = [`${s}.`];
+  out.push(cmps.length > 1 ? "Pairwise comparisons were two-sided." : "The comparison was two-sided.");
   if (missing.length) {
     const why = clean(missing[0].note).replace(/[.]$/, "");
     out.push(`${missing.length} of ${m} comparisons (${pairList(input, N, missing)}) could not be computed${why ? ` (${why.charAt(0).toLowerCase()}${why.slice(1)})` : ""}.`);
@@ -1007,29 +1371,38 @@ function methodsTwoWay(input: FigureTextInput, N: Norm, S: Stats, notes: string[
   out.push(W.interaction
     ? `Data were analysed by two-way ANOVA with Type III sums of squares, with the row factor (${rowNames}), the column factor (${colNames}) and their interaction.`
     : `Data were analysed by two-way ANOVA with Type III sums of squares, with the row factor (${rowNames}) and the column factor (${colNames}), fitted without an interaction term because there is one value per group.`);
+  const terms = twoWayTerms(S, N.alpha);
+  if (terms.length) out.push(`ANOVA results: ${terms.join("; ")}.`);
   addNote(notes, "Replace 'row factor' / 'column factor' with the names of your factors.");
   if (unequal(groups.map((g) => g.n))) addNote(notes, "Unequal group sizes: Type III sums of squares were used.");
   const a = input.analysis;
   if (a.posthoc === "none" || !S.cmpP.length) return out;
   const cmps = S.res!.comparisons;
-  const set = twoWayInnerSet(input, N, S, W).subject;
+  const set = twoWayInnerSet(input, N, S, W);
   const lead = `Within each level of the ${W.outerFactor}, ${set}`;
+  const adj = pAdjusted(input, S);
+  const unadj = W.outerLevels > 1 ? `each level of the ${W.outerFactor} was treated as a separate family of one comparison, so P values are not adjusted for multiplicity`
+    : "with a single comparison per level, P values are not adjusted for multiplicity";
   if (a.posthoc === "tukey") {
     const kramer = unequal(groups.map((g) => g.n)) ? " (Tukey–Kramer for unequal group sizes)" : "";
     let s = `${lead} using Tukey's test with the pooled residual variance of the ANOVA${kramer}`;
-    if (a.family === "all" && W.outerLevels > 1) {
+    if (!adj) {
+      s = `${lead} using t tests with the pooled residual variance of the ANOVA (Tukey's test for two groups); ${unadj}`;
+    } else if (a.family === "all" && W.outerLevels > 1) {
       s += `; P values were additionally Šídák-corrected across the ${W.outerLevels} levels of the ${W.outerFactor} (one family)`;
     } else if (W.outerLevels > 1) {
       s += `; each level of the ${W.outerFactor} was treated as a separate family`;
     }
-    out.push(`${s}; multiplicity-adjusted P values are reported.`);
+    out.push(adj ? `${s}; multiplicity-adjusted P values are reported.` : `${s}.`);
   } else if (a.posthoc === "sidak" || a.posthoc === "bonferroni") {
     const m = a.family === "all" ? cmps.length : Math.round(cmps.length / Math.max(1, W.outerLevels));
     const how = a.posthoc === "sidak" ? "Šídák's" : "Bonferroni";
     const fam = a.family === "all" ? " (all comparisons as one family)" : ` (each level of the ${W.outerFactor} as a separate family)`;
-    out.push(`${lead} using t tests with the pooled residual variance and ${how} correction for ${m} ${plural(m, "comparison", "comparisons")}${fam}; multiplicity-adjusted P values are reported.`);
-    out.push("Pairwise comparisons were two-sided.");
+    out.push(adj
+      ? `${lead} using t tests with the pooled residual variance and ${how} correction for ${m} ${plural(m, "comparison", "comparisons")}${fam}; multiplicity-adjusted P values are reported.`
+      : `${lead} using t tests with the pooled residual variance of the ANOVA; ${unadj}.`);
   }
+  out.push("Pairwise comparisons were two-sided.");
   return out;
 }
 
@@ -1168,32 +1541,40 @@ function build(input: FigureTextInput): FigureText {
     }
   }
 
-  // ── legend
+  // ── legend: [label | ] title. symbols (n). error bars. layout. test. P values. brackets. key.
   const legend: string[] = [];
   const Y = yName(N, f, notes);
-  // A graph title leads the legend; the descriptive sentence still follows so
-  // the legend always names the measured variable and the groups.
-  const title = clean(f?.title);
-  if (title) legend.push(end(title));
+  const label = figLabel(input.options?.figLabel);
+  const prefix = label ? `${label} | ` : "";
+  let built: string;
   if (t.template === "xy") {
     const X = clean(f?.xlabel) || clean(t.x_title) || "X";
-    legend.push(end(`${Y} as a function of ${X}${ss.length > 1 ? ` for ${listOrCount(ss.map((s) => s.name), "data sets")}` : ""}`));
+    built = `${Y} as a function of ${X}${ss.length > 1 ? ` for ${listOrCount(ss.map((s) => s.name), "data sets")}` : ""}`;
   } else {
     const groups = plottedGroups(t);
     if (t.template === "column") {
-      legend.push(end(`${Y} for ${listOrCount(groups.map((g) => N.labels[g.c]), "groups")}`));
+      const names = groups.map((g) => N.labels[g.c]);
+      const G = names.length === 1 ? names[0] : names.length <= MAX_LISTED ? `groups ${joinList(names)}` : `${names.length} groups`;
+      built = `${Y} in ${G}`;
     } else {
       const cols = [...new Set(groups.map((g) => g.c))].sort((x, y) => x - y);
       const rows = [...new Set(groups.map((g) => g.r as number))].sort((x, y) => x - y);
-      legend.push(end(`${Y} for ${listOrCount(cols.map((c) => N.labels[c]), "data sets")} across ${listOrCount(rows.map((r) => N.rowTitles[r] ?? `Row ${r + 1}`), "groups")}`));
+      built = `${Y} for ${listOrCount(cols.map((c) => N.labels[c]), "data sets")} across ${listOrCount(rows.map((r) => N.rowTitles[r] ?? `Row ${r + 1}`), "groups")}`;
     }
   }
-  const nText = describeN(input).text;
-  if (t.template === "xy") legend.push(...shownXY(input, N, ss, nText, notes));
-  else legend.push(...shownColumn(input, N, nText, notes));
+  // A graph title leads the legend; the descriptive sentence still follows so
+  // the legend always names the measured variable and the groups.
+  const title = clean(f?.title);
+  if (title) legend.push(prefix + end(title), end(built));
+  else legend.push(prefix + end(built));
+  const U = unitInfo(input.options?.unit);
+  const nInfo = describeN(input, U);
+  const nText = nInfo.text;
+  if (t.template === "xy") legend.push(...shownXY(input, N, ss, nText, U, notes));
+  else legend.push(...shownColumn(input, N, nText, U, notes));
   if (S.ok) {
-    if (t.template === "column") legend.push(...legendStatsColumn(input, N, S));
-    else if (t.template === "grouped") legend.push(...legendStatsGrouped(input, N, S));
+    if (t.template === "column") legend.push(...legendStatsColumn(input, N, S, notes));
+    else if (t.template === "grouped") legend.push(...legendStatsGrouped(input, N, S, notes));
     else legend.push(...legendStatsXY(input, N, S, ss, notes));
     legend.push(...bracketSentences(input, N, S, notes));
   }
@@ -1215,7 +1596,7 @@ function build(input: FigureTextInput): FigureText {
     } else if (t.template === "column") {
       methods.push(...methodsTestColumn(input, N, S));
       tested = S.testP || S.cmpP.length > 0;
-      adjusted = !TWO_GROUP.includes(a.test) && a.posthoc !== "none" && S.cmpP.length > 0;
+      adjusted = !TWO_GROUP.includes(a.test) && a.posthoc !== "none" && S.cmpP.length > 0 && pAdjusted(input, S);
       // the normality sentence accompanies a computed test only
       const norm = tested ? normalitySentence(input, N, S) : "";
       if (norm) methods.push(norm);
@@ -1225,7 +1606,7 @@ function build(input: FigureTextInput): FigureText {
     } else {
       methods.push(...methodsTwoWay(input, N, S, notes));
       tested = S.testP;
-      adjusted = a.posthoc !== "none" && S.cmpP.length > 0;
+      adjusted = a.posthoc !== "none" && S.cmpP.length > 0 && pAdjusted(input, S);
     }
   }
   if (tested) methods.push(`${adjusted ? "Adjusted P" : "P"} ≤ ${fmtThr(N.thr)} was considered statistically significant.`);
@@ -1234,7 +1615,12 @@ function build(input: FigureTextInput): FigureText {
 
   // ── notes (the engine's warnings explain e.g. why a post-hoc test has no rows)
   for (const w of arr(input.result?.warnings)) addNote(notes, clean(w));
-  addNote(notes, "State what n represents (e.g. animals, independent experiments, technical replicates).");
+  if (!U) {
+    addNote(notes, "State what n represents: fill in “Each value is one…” above (e.g. mouse, independent experiment, technical replicate).");
+  } else {
+    if (U.pluralInput) addNote(notes, "“Each value is one…” should be singular (e.g. “mouse”, not “mice”).");
+    if (nInfo.paired) addNote(notes, "Paired test: n counts pairs (rows). If both values of a pair come from the same subject, say so in the legend.");
+  }
   if (!input.software) addNote(notes, "Software versions are not available yet.");
   addNote(notes, "Cite R and ggplot2 as your journal requires.");
 

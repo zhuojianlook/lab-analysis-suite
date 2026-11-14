@@ -491,7 +491,9 @@ export function GraphView() {
       <FigureTextPanel table={table} analysis={effAnalysis} figure={effFigure}
         result={resultFresh ? result : null} busy={analyzing || !resultFresh} stale={plotStale && !liveUpdate}
         error={resultFresh ? anError : null} renderFailed={!plot.success} side={side} panelWidth={panelWidth} open={textOpen}
-        onToggle={(o) => { setTextOpen(o); writeTextPanelOpen(o); }} />
+        onToggle={(o) => { setTextOpen(o); writeTextPanelOpen(o); }}
+        figLabel={typeof figure.fig_label === "string" ? figure.fig_label : "Fig. 1"}
+        unit={typeof figure.n_unit === "string" ? figure.n_unit : ""} onLegendFields={(patch) => setFigure(patch)} />
     );
     return (
       <Box ref={canvasRef} sx={{ display: "flex", flexDirection: side ? "row" : "column", gap: 2, alignItems: side ? "flex-start" : "stretch", minHeight: 0 }}>

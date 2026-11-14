@@ -78,6 +78,11 @@ export interface GraphFigure {
   dpi: number;
   export_format: "png" | "tiff";
   transparent: boolean;
+  /** Legend text only, never sent to the plot: "Fig. 1", "Extended Data Fig. 2"; "" = no label. */
+  fig_label?: string;
+  /** Legend text only, never sent to the plot: what one plotted value is, singular
+   *  ("independent cell culture", "mouse"); "" = not stated. */
+  n_unit?: string;
 }
 
 export interface GraphSummary {
