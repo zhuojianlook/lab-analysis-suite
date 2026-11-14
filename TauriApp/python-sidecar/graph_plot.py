@@ -459,6 +459,8 @@ def _xy_code(tb, fig, result, warnings):
                 continue
             d = gs.describe(vals[r][c])
             ctr, lo, hi = _center(d, fig["center"])
+            if len(vals[r][c]) < 2:
+                lo = hi = None  # one value: no spread to draw (median/IQR would give a zero-height bar)
             summ.append({"ci": c + 1, "x": x, "center": ctr, "lo": lo, "hi": hi})
             for y in vals[r][c]:
                 rows.append({"kind": 0, "ci": c + 1, "x": x, "y": y})

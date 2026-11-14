@@ -95,7 +95,7 @@ export function TitleFields({
 }
 
 export function GraphFigureControls({
-  template, figure, setFigure, seriesTitles, hasComparisons,
+  template, figure, setFigure, seriesTitles, hasComparisons, nRep = 1,
 }: {
   template: Template;
   figure: GraphFigure;
@@ -104,11 +104,19 @@ export function GraphFigureControls({
   seriesTitles: string[];
   /** The analysis produces pairwise comparisons that can be drawn as brackets. */
   hasComparisons: boolean;
+  /** Replicate sub-columns per X (XY tables). */
+  nRep?: number;
 }) {
   const f = figure;
   const g = f.graph_type;
   const graphs = templateInfo(template).graphs;
-  const pointsInherent = g === "dot" || g === "gdot" || g === "xy_points" || g === "xy_line" || g === "xy_fit";
+  const pointsInherent = g === "dot" || g === "gdot";
+  const xy = template === "xy";
+  // XY: with one Y per X there is nothing to summarise, so every value is drawn.
+  const xyNoReps = xy && nRep <= 1;
+  // XY: while every replicate is drawn, "Replicates as" has nothing to summarise,
+  // except on the line graph, whose line joins the means or medians.
+  const xyCenterUnused = xy && (xyNoReps || (f.show_points && g !== "xy_line"));
   const centerInherent = g === "box" || g === "violin";
   const hasBars = g === "bar" || g === "gbar" || g === "box" || g === "violin";
 
@@ -134,7 +142,7 @@ export function GraphFigureControls({
       <Box>
         <Grid2>
           <TextField select size="small" label={template === "xy" ? "Replicates as" : "Centre & error"} value={f.center}
-            disabled={centerInherent} onChange={(e) => setFigure({ center: e.target.value as GraphFigure["center"] })}>
+            disabled={centerInherent || xyCenterUnused} onChange={(e) => setFigure({ center: e.target.value as GraphFigure["center"] })}>
             {CENTERS.map((c) => <MenuItem key={c.id} value={c.id}>{c.label}</MenuItem>)}
           </TextField>
           <TextField select size="small" label="Theme" value={f.theme} onChange={(e) => setFigure({ theme: e.target.value as GraphFigure["theme"] })}>
@@ -143,6 +151,18 @@ export function GraphFigureControls({
             <MenuItem value="minimal">Minimal</MenuItem>
           </TextField>
         </Grid2>
+        {xyCenterUnused && (
+          <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }}>
+            {xyNoReps
+              ? "Used when each X has replicate Y values (add sub-columns in step 1)."
+              : "Used when “Show each replicate” is off."}
+          </Typography>
+        )}
+        {xy && !xyNoReps && f.show_points && g === "xy_line" && (
+          <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }}>
+            Sets whether the line joins the means or the medians.
+          </Typography>
+        )}
         {centerInherent && (
           <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }}>
             {g === "box"
@@ -165,10 +185,19 @@ export function GraphFigureControls({
 
       <RailHeading>Data points</RailHeading>
       <FormControlLabel sx={{ ml: -0.5 }}
-        control={<Switch size="small" checked={f.show_points || pointsInherent} disabled={pointsInherent}
+        control={<Switch size="small" checked={f.show_points || pointsInherent || xyNoReps} disabled={pointsInherent || xyNoReps}
           onChange={(e) => setFigure({ show_points: e.target.checked })} />}
-        label={<Typography variant="body2">Show individual values</Typography>} />
-      {(f.show_points || pointsInherent) && (
+        label={<Typography variant="body2">{xy ? "Show each replicate" : "Show individual values"}</Typography>} />
+      {xy && (
+        <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 0.5 }}>
+          {xyNoReps
+            ? "Each X has one Y value, so every value is plotted. Add replicate sub-columns in step 1 to plot a mean with error bars."
+            : f.show_points
+              ? "Every replicate is plotted. Turn off to plot one point per X with error bars (set by “Replicates as”)."
+              : `Each X shows the summary chosen in “Replicates as”.${g === "xy_fit" ? " Fitted lines still use every replicate." : ""}`}
+        </Typography>
+      )}
+      {(f.show_points || pointsInherent || xy) && (
         <LabeledSlider label="Point size" value={f.point_size} onChange={(v) => setFigure({ point_size: v })} min={0.5} max={6} step={0.1} />
       )}
       {hasBars && (

@@ -398,7 +398,7 @@ export function GraphView() {
     <RailSection step={3} title="Graph" done={!!plot?.success}
       summary={`${info.graphs.find((g) => g.id === figure.graph_type)?.label ?? figure.graph_type} · ${figure.theme}${ylabelText ? ` · Y: “${ylabelText}”` : ""}`}
       expanded={open.graph} onToggle={toggle("graph")}>
-      <GraphFigureControls template={template} figure={figure} setFigure={setFigure} seriesTitles={colNames}
+      <GraphFigureControls template={template} figure={figure} setFigure={setFigure} seriesTitles={colNames} nRep={doc.n_rep}
         hasComparisons={result ? (result.comparisons?.length ?? 0) > 0
           : effAnalysis.test !== "none" && (hasPosthoc(effAnalysis.test) ? effAnalysis.posthoc !== "none" : template === "column")} />
     </RailSection>

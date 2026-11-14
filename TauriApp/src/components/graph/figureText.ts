@@ -654,7 +654,7 @@ function shownXY(input: FigureTextInput, N: Norm, ss: Series[], nText: string, n
     }
   }
   out.push(`${s}${nText ? ` (${nText})` : ""}.`);
-  if (!N.points && reps && isMeanCentre(N.center) && ss.some((x) => x.minRep === 1)) {
+  if (!N.points && reps && ss.some((x) => x.minRep === 1)) {
     out.push("No error bar is drawn where there is a single value.");
   }
   if (N.type === "xy_fit" && N.showEquation) {
