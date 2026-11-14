@@ -48,6 +48,52 @@ function OptionalNumberField({ label, value, onCommit }: { label: string; value:
   );
 }
 
+/** Axis and graph titles. Used at the top of rail step 3 and, `dense`, as a
+ *  one-line row above the figure on the Graph canvas (same store fields, so the
+ *  two stay in sync). */
+export function TitleFields({
+  figure, setFigure, template, dense,
+}: {
+  figure: GraphFigure;
+  setFigure: (patch: Partial<GraphFigure>) => void;
+  template: Template;
+  dense?: boolean;
+}) {
+  const xPlaceholder = template === "xy" ? "X column title" : "Optional";
+  // Explicit accessible names: the rail and the canvas row show the same three
+  // fields at once, so the canvas copies say where they are.
+  const where = dense ? " (above the figure)" : "";
+  const input = (name: string) => ({ "aria-label": `${name}${where}` });
+  const y = (
+    <TextField size="small" label="Y axis title" value={figure.ylabel ?? ""} placeholder="e.g. Weight (g)"
+      onChange={(e) => setFigure({ ylabel: e.target.value })} fullWidth
+      slotProps={{ inputLabel: { shrink: true }, htmlInput: input("Y axis title") }} />
+  );
+  const x = (
+    <TextField size="small" label="X axis title" value={figure.xlabel ?? ""} placeholder={xPlaceholder}
+      onChange={(e) => setFigure({ xlabel: e.target.value })} fullWidth
+      slotProps={{ inputLabel: { shrink: true }, htmlInput: input("X axis title") }} />
+  );
+  const title = (
+    <TextField size="small" label="Graph title" value={figure.title ?? ""} placeholder="Optional"
+      onChange={(e) => setFigure({ title: e.target.value })} fullWidth
+      slotProps={{ inputLabel: { shrink: true }, htmlInput: input("Graph title") }} />
+  );
+  if (dense) {
+    return (
+      <Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 1 }}>
+        {y}{x}{title}
+      </Box>
+    );
+  }
+  return (
+    <Stack spacing={1}>
+      {y}
+      <Grid2>{x}{title}</Grid2>
+    </Stack>
+  );
+}
+
 export function GraphFigureControls({
   template, figure, setFigure, seriesTitles, hasComparisons,
 }: {
@@ -79,7 +125,13 @@ export function GraphFigureControls({
         {graphs.map((x) => <ToggleButton key={x.id} value={x.id} sx={{ px: 0.5 }}>{x.label}</ToggleButton>)}
       </ToggleButtonGroup>
 
-      <Box sx={{ mt: 1 }}>
+      <RailHeading>Titles</RailHeading>
+      <TitleFields figure={f} setFigure={setFigure} template={template} />
+      <LabeledSlider label="Font size" value={f.font_size} onChange={(v) => setFigure({ font_size: v })} min={8} max={28} step={1} format={(v) => `${v} pt`} />
+
+      <RailHeading>Style</RailHeading>
+
+      <Box>
         <Grid2>
           <TextField select size="small" label={template === "xy" ? "Replicates as" : "Centre & error"} value={f.center}
             disabled={centerInherent} onChange={(e) => setFigure({ center: e.target.value as GraphFigure["center"] })}>
@@ -93,7 +145,9 @@ export function GraphFigureControls({
         </Grid2>
         {centerInherent && (
           <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }}>
-            {g === "box" ? "Boxes show the median and quartiles; whiskers reach 1.5 × IQR." : "Violins show the distribution with the median and quartiles."}
+            {g === "box"
+              ? "Boxes span the 25th–75th percentiles with a line at the median; whiskers reach the minimum and maximum."
+              : "Violins show the distribution (kernel density) with a line at the median; groups with fewer than 3 values are drawn as points."}
           </Typography>
         )}
       </Box>
@@ -145,16 +199,6 @@ export function GraphFigureControls({
           )}
         </>
       )}
-
-      <RailHeading>Text</RailHeading>
-      <Stack spacing={1}>
-        <TextField size="small" label="Title" value={f.title} onChange={(e) => setFigure({ title: e.target.value })} fullWidth />
-        <Grid2>
-          <TextField size="small" label="X axis" value={f.xlabel} onChange={(e) => setFigure({ xlabel: e.target.value })} />
-          <TextField size="small" label="Y axis" value={f.ylabel} onChange={(e) => setFigure({ ylabel: e.target.value })} />
-        </Grid2>
-      </Stack>
-      <LabeledSlider label="Font size" value={f.font_size} onChange={(v) => setFigure({ font_size: v })} min={8} max={28} step={1} format={(v) => `${v} pt`} />
 
       <RailHeading>Y axis range</RailHeading>
       <Grid2>

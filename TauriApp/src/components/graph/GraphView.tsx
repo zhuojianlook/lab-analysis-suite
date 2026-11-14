@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Alert, Box, Button, Chip, CircularProgress, FormControlLabel, Stack, Switch, Tab, Tabs, Tooltip, Typography,
 } from "@mui/material";
@@ -17,7 +17,8 @@ import { NumberField } from "../shared/NumberField";
 import { DataGrid } from "./DataGrid";
 import { FileBar, MOD_KEY, StartScreen, useGraphLibrary } from "./GraphLibrary";
 import { GraphAnalysisControls } from "./GraphAnalysisControls";
-import { GraphFigureControls } from "./GraphFigureControls";
+import { GraphFigureControls, TitleFields } from "./GraphFigureControls";
+import { FigureTextPanel, readTextPanelOpen, writeTextPanelOpen } from "./FigureTextPanel";
 import { GraphResults } from "./GraphResults";
 import {
   GRAPH_DEFAULT, MAX_COLS, MAX_REP, MAX_ROWS, POSTHOC_LABELS, TEST_LABELS, colHasData, countInvalid, defaultColTitle,
@@ -65,6 +66,33 @@ const CanvasNote = ({ children, action }: { children: ReactNode; action?: ReactN
   </Box>
 );
 
+/** Width of an element, tracked with a ResizeObserver (callback ref, so it
+ *  follows an element that mounts / unmounts conditionally). */
+function useElementWidth(): [(el: HTMLElement | null) => void, number] {
+  const [width, setWidth] = useState(0);
+  const ro = useRef<ResizeObserver | null>(null);
+  const ref = useCallback((el: HTMLElement | null) => {
+    ro.current?.disconnect();
+    ro.current = null;
+    if (!el) return;
+    setWidth(el.getBoundingClientRect().width);
+    if (typeof ResizeObserver === "undefined") return;
+    const obs = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      if (w !== undefined) setWidth(w);
+    });
+    obs.observe(el);
+    ro.current = obs;
+  }, []);
+  return [ref, width];
+}
+
+/** Canvas width from which the legend & methods panel sits beside the figure
+ *  (a 1280 px window with the app sidebar and rail open leaves about 670 px). */
+const SIDE_PANEL_MIN_WIDTH = 640;
+/** Below this canvas width the side panel is narrower, to leave the figure room. */
+const SIDE_PANEL_WIDE_FROM = 900;
+
 // Restore an unsaved document left over from the last session (once per app run).
 let draftChecked = false;
 
@@ -91,6 +119,10 @@ export function GraphView() {
   const [colConfirm, setColConfirm] = useState(false);
 
   const [result, setResult] = useState<AnalyzeResult | null>(null);
+  /** The analysis key (table + settings) that `result` / `anError` belong to. */
+  const [resultKey, setResultKey] = useState<string | null>(null);
+  const [textOpen, setTextOpen] = useState(readTextPanelOpen);
+  const [canvasRef, canvasWidth] = useElementWidth();
   const [anError, setAnError] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [plot, setPlot] = useState<GraphPlotResult | null>(null);
@@ -139,6 +171,7 @@ export function GraphView() {
     plotSeq.current++;
     plotKeyRendered.current = null;
     setResult(null);
+    setResultKey(null);
     setAnError(null);
     setPlot(null);
     setPlotError(null);
@@ -187,8 +220,8 @@ export function GraphView() {
   // ── live analysis ─────────────────────────────────────────────────────────
   useEffect(() => {
     const seq = ++anSeq.current;
-    if (!table || !hasData) { setResult(null); setAnError(null); setAnalyzing(false); return; }
-    const t0 = table, a0 = effAnalysis;
+    if (!table || !hasData) { setResult(null); setResultKey(null); setAnError(null); setAnalyzing(false); return; }
+    const t0 = table, a0 = effAnalysis, k0 = anKey;
     setAnalyzing(true);
     const t = setTimeout(async () => {
       try {
@@ -196,9 +229,10 @@ export function GraphView() {
         if (seq !== anSeq.current) return;
         if (res.error && !res.descriptives) { setAnError(res.error); setResult(null); }
         else { setResult(res); setAnError(res.error ?? null); }
+        setResultKey(k0);
       } catch (e) {
         // Drop the previous data's statistics so they aren't shown as current.
-        if (seq === anSeq.current) { setAnError(errMsg(e)); setResult(null); }
+        if (seq === anSeq.current) { setAnError(errMsg(e)); setResult(null); setResultKey(k0); }
       } finally {
         if (seq === anSeq.current) setAnalyzing(false);
       }
@@ -232,7 +266,15 @@ export function GraphView() {
     }
   };
 
-  useEffect(() => { if (canvasTab === "graph") setGraphSeen(true); }, [canvasTab]);
+  // The first time the Graph tab is shown for a document, open rail step 3 so
+  // the axis titles and graph settings are in view (only on that transition,
+  // so a user who collapses it again isn't fought).
+  useEffect(() => {
+    if (canvasTab === "graph" && !graphSeen) {
+      setGraphSeen(true);
+      setOpen((p) => ({ ...p, graph: true }));
+    }
+  }, [canvasTab, graphSeen]);
 
   // Once the graph has been looked at, re-render (debounced) on any change to
   // the data, the analysis or the figure settings. Stale responses are dropped.
@@ -350,9 +392,11 @@ export function GraphView() {
     </RailSection>
   );
 
+  // A saved record / draft may carry a non-string title (hand-edited, older build).
+  const ylabelText = typeof figure.ylabel === "string" ? figure.ylabel.trim() : "";
   const graphSection = (
     <RailSection step={3} title="Graph" done={!!plot?.success}
-      summary={`${info.graphs.find((g) => g.id === figure.graph_type)?.label ?? figure.graph_type} · ${figure.theme}`}
+      summary={`${info.graphs.find((g) => g.id === figure.graph_type)?.label ?? figure.graph_type} · ${figure.theme}${ylabelText ? ` · Y: “${ylabelText}”` : ""}`}
       expanded={open.graph} onToggle={toggle("graph")}>
       <GraphFigureControls template={template} figure={figure} setFigure={setFigure} seriesTitles={colNames}
         hasComparisons={result ? (result.comparisons?.length ?? 0) > 0
@@ -438,18 +482,38 @@ export function GraphView() {
         {plotError ?? "The graph hasn't been rendered yet."}
       </CanvasNote>
     )
-  ) : (
-    <Stack spacing={1.5} sx={{ minHeight: 0 }}>
-      {plotWarnings.length > 0 && <Alert severity="warning">{plotWarnings.map((w) => <div key={w}>{w}</div>)}</Alert>}
-      {plotStale && !liveUpdate && (
-        <Alert severity="info" action={<Button color="inherit" size="small" onClick={() => void renderPlot()}>Re-render</Button>}>
-          The data or settings changed since this graph was rendered.
-        </Alert>
-      )}
-      <FigureView result={plot} busy={plotting} baseName={baseName}
-        fitHeight={plotWarnings.length || (plotStale && !liveUpdate) ? "calc(100vh - 250px)" : "calc(100vh - 190px)"} />
-    </Stack>
-  );
+  ) : (() => {
+    const side = canvasWidth >= SIDE_PANEL_MIN_WIDTH;
+    const panelWidth = canvasWidth >= SIDE_PANEL_WIDE_FROM ? 340 : 300;
+    const alerts = plotWarnings.length > 0 || (plotStale && !liveUpdate);
+    const resultFresh = resultKey === anKey;
+    const panel = (
+      <FigureTextPanel table={table} analysis={effAnalysis} figure={effFigure}
+        result={resultFresh ? result : null} busy={analyzing || !resultFresh} stale={plotStale && !liveUpdate}
+        error={resultFresh ? anError : null} renderFailed={!plot.success} side={side} panelWidth={panelWidth} open={textOpen}
+        onToggle={(o) => { setTextOpen(o); writeTextPanelOpen(o); }} />
+    );
+    return (
+      <Box ref={canvasRef} sx={{ display: "flex", flexDirection: side ? "row" : "column", gap: 2, alignItems: side ? "flex-start" : "stretch", minHeight: 0 }}>
+        <Stack spacing={1.5} sx={{ minHeight: 0, minWidth: 0, flex: side ? "1 1 0" : "0 0 auto" }}>
+          <TitleFields dense figure={figure} setFigure={setFigure} template={template} />
+          {plotWarnings.length > 0 && <Alert severity="warning">{plotWarnings.map((w) => <div key={w}>{w}</div>)}</Alert>}
+          {plotStale && !liveUpdate && (
+            <Alert severity="info" action={<Button color="inherit" size="small" onClick={() => void renderPlot()}>Re-render</Button>}>
+              The data or settings changed since this graph was rendered.
+            </Alert>
+          )}
+          {/* stacked: cap the figure so the open legend panel starts above the fold */}
+          <FigureView result={plot} busy={plotting} baseName={baseName}
+            fitHeight={(() => {
+              const full = alerts ? "calc(100vh - 306px)" : "calc(100vh - 246px)";
+              return side || !textOpen ? full : `min(${full}, 42vh)`;
+            })()} />
+        </Stack>
+        {panel}
+      </Box>
+    );
+  })();
 
   const resultsBody = (
     <GraphResults result={result} error={anError} busy={analyzing} template={template}

@@ -111,6 +111,8 @@ export interface GraphError {
 
 export interface AnalyzeResult {
   error?: string;
+  /** "invalid" = malformed request / unsupported combination; "data" = the data can't support the test. */
+  code?: "invalid" | "data";
   warnings: string[];
   descriptives: {
     row: number | null; col: number; label: string; n: number;
@@ -121,6 +123,12 @@ export interface AnalyzeResult {
   test: null | {
     id: string; label: string; method: string | null; statistic_name: string | null;
     statistic: Num; df: Num; df2: Num; p: Num; star: string; note: string | null;
+    /** One-way ANOVA: SS(between) / SS(total). */
+    r2?: Num;
+    /** Wilcoxon: pairs used (non-zero differences) and the rank sums. */
+    n?: number; sum_pos_ranks?: Num; sum_neg_ranks?: Num;
+    /** Two-way ANOVA: the anova_table term the headline F / P belong to. */
+    term?: string;
   };
   anova_table: { source: string; ss: Num; df: Num; ms: Num; f: Num; p: Num }[];
   comparisons: {
@@ -137,6 +145,20 @@ export interface AnalyzeResult {
     col: number; label: string; method: string | null; n: number; r: Num; p: Num;
     ci_lo: Num; ci_hi: Num; star: string; note: string | null;
   }[];
+}
+
+/** Versions of the software that computed / drew a graph, read from the
+ *  running engine (GET /api/graph/software). null = unknown: leave it out of
+ *  any citation rather than guessing. */
+export interface SoftwareVersions {
+  /** Lab Analysis Suite (the engine's config.APP_VERSION). */
+  app: string | null;
+  python: string | null;
+  numpy: string | null;
+  scipy: string | null;
+  r: string | null;
+  ggplot2: string | null;
+  ggprism: string | null;
 }
 
 export type GraphPlotResult = RunRResponse & { warnings?: string[]; error?: string };
@@ -181,6 +203,8 @@ export const analyzeGraph = (table: GraphTable, analysis: GraphAnalysis) =>
 
 export const plotGraph = (table: GraphTable, analysis: GraphAnalysis, figure: GraphFigure) =>
   post<GraphPlotResult>("/api/graph/plot", { table, analysis, figure });
+
+export const getGraphSoftware = () => apiJson<SoftwareVersions>("/api/graph/software");
 
 /** True when a route answered with an error envelope. */
 export const isGraphError = (r: unknown): r is GraphError =>

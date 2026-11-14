@@ -12,6 +12,8 @@ deletes are POST):
   POST /api/graph/library/delete         -> {analyses, path}
   POST /api/graph/analyze                -> AnalyzeResult
   POST /api/graph/plot                   -> run-r response + {warnings}
+  GET  /api/graph/software               -> {app, python, numpy, scipy, r, ggplot2, ggprism}
+                                            (versions for the methods text; each a string or null)
 
 Statistics live in graph_stats, R code generation in graph_plot and the
 SQLite store in graph_library. Keep every @router decorator directly above
@@ -24,16 +26,24 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import platform
 import re
+import subprocess
+import tempfile
 import threading
 from collections import OrderedDict
 from typing import Any, Dict, Optional
 
+import numpy as np
+import scipy
 from fastapi import APIRouter, Body
 
+import config
 import graph_library as lib
 import graph_plot
 import graph_stats
+import r_bridge
 
 router = APIRouter()
 
@@ -196,3 +206,82 @@ def plot(body: Any = Body(None)):
         return graph_plot.render(table, analysis, body.get("figure"), result=_compute(table, analysis))
     except Exception as e:  # noqa: BLE001
         return graph_plot._fail(_unexpected(e))
+
+
+# ── software versions (cited in the generated statistical methods) ─────────
+#
+# Only versions read from the running engine are reported; anything unknown is
+# None (the client then leaves it out rather than guessing). The R probe is
+# cached per Rscript path once R, ggplot2 and ggprism all answered; a failure
+# or a missing package is not cached, so installing R / a package while the
+# app is open shows up on the next request.
+
+_R_PROBE = (
+    'cat("R\\t", as.character(getRversion()), "\\n", sep="")\n'
+    'for (p in c("ggplot2", "ggprism")) {\n'
+    '  v <- tryCatch(as.character(utils::packageVersion(p)), error=function(e) "MISSING")\n'
+    '  cat(p, "\\t", v, "\\n", sep="")\n'
+    '}\n'
+)
+_R_KEYS = {"R": "r", "ggplot2": "ggplot2", "ggprism": "ggprism"}
+_VERSION_RE = re.compile(r"^[0-9]+(?:[.-][0-9]+){0,4}$")
+_R_CACHE: Dict[str, dict] = {}
+_R_CACHE_LOCK = threading.Lock()
+
+
+def _version(v: Any) -> Optional[str]:
+    s = str(v).strip() if v is not None else ""
+    return s if _VERSION_RE.match(s) else None
+
+
+def _r_versions() -> dict:
+    out: Dict[str, Optional[str]] = {"r": None, "ggplot2": None, "ggprism": None}
+    try:
+        rscript, is_bundled = r_bridge._resolve_rscript()
+    except Exception:  # noqa: BLE001
+        return out
+    if not rscript:
+        return out
+    with _R_CACHE_LOCK:
+        hit = _R_CACHE.get(rscript)
+    if hit is not None:
+        return dict(hit)
+    try:
+        env = r_bridge._r_env(rscript, is_bundled) or os.environ.copy()
+        with tempfile.TemporaryDirectory(prefix="las_versions_") as tmp:
+            sp = os.path.join(tmp, "versions.R")
+            with open(sp, "w", encoding="utf-8") as f:
+                f.write(_R_PROBE)
+            res = subprocess.run([rscript, sp], capture_output=True, text=True, timeout=20, env=env)
+    except Exception:  # noqa: BLE001 - no R, timeout, unreadable output: versions stay unknown
+        return out
+    for line in (res.stdout or "").splitlines():
+        if "\t" not in line:
+            continue
+        name, ver = line.split("\t", 1)
+        key = _R_KEYS.get(name.strip())
+        if key:
+            out[key] = _version(ver)
+    if all(out.values()):
+        with _R_CACHE_LOCK:
+            _R_CACHE[rscript] = dict(out)
+    return out
+
+
+def _safe(fn) -> Optional[str]:
+    try:
+        return _version(fn())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@router.get("/api/graph/software")
+def software():
+    out = {"app": _safe(lambda: config.APP_VERSION), "python": _safe(platform.python_version),
+           "numpy": _safe(lambda: np.__version__), "scipy": _safe(lambda: scipy.__version__),
+           "r": None, "ggplot2": None, "ggprism": None}
+    try:
+        out.update(_r_versions())
+    except Exception:  # noqa: BLE001 - never an HTTP 500: unknown versions are simply omitted
+        pass
+    return out
