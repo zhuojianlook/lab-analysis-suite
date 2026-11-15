@@ -12,6 +12,10 @@ interface Snapshot {
   structural: boolean;
   colors: string[];
   labels: string[];
+  /** The palette bookkeeping that goes with `colors` (name, captured colours,
+   *  reverse, edited flag, axis scheme), so undo never leaves the picker naming
+   *  a palette the restored colours don't come from. */
+  palette: Pick<GraphFigure, (typeof M.PALETTE_KEYS)[number]>;
   control: number | null;
   pairs: [number, number][];
 }
@@ -71,11 +75,18 @@ export const snapshotKey = (s: Pick<GraphState, "name" | "doc" | "analysis" | "f
 
 export const isDirty = (s: GraphState) => !!s.doc && (s.savedSnapshot === null || s.savedSnapshot !== snapshotKey(s));
 
+const paletteFields = (f: GraphFigure): Snapshot["palette"] => {
+  const out: Record<string, unknown> = {};
+  for (const k of M.PALETTE_KEYS) out[k] = f[k];
+  return out as Snapshot["palette"];
+};
+
 const snap = (s: GraphState, structural: boolean): Snapshot => ({
   doc: s.doc!,
   structural,
   colors: s.figure.colors,
   labels: s.figure.labels,
+  palette: paletteFields(s.figure),
   control: s.analysis.control,
   pairs: s.analysis.pairs,
 });
@@ -97,9 +108,19 @@ function defaultsFor(doc: GraphDoc) {
  *  that lack a newer field still open with every field set. */
 function mergeSettings(doc: GraphDoc, analysis?: Partial<GraphAnalysis>, figure?: Partial<GraphFigure>) {
   const d = defaultsFor(doc);
+  const saved = (figure && typeof figure === "object" ? figure : {}) as Record<string, unknown>;
+  const { prism_palette: _pp, ...rest } = saved;   // derived for the plot request only; never stored
+  const merged = { ...d.figure, ...rest } as GraphFigure;
+  // Documents from before palettes were named: show which built-in palette
+  // their colours are ("" = custom colours); the figure itself is unchanged.
+  const pal = Object.prototype.hasOwnProperty.call(saved, "palette")
+    ? M.sanitizePaletteFields(saved)
+    : { palette: M.inferAppPalette(Array.isArray(merged.colors) ? merged.colors : []),
+      palette_reverse: false, palette_edited: false, axis_scheme: false };
+  const { palette_colors: _pc, ...noPc } = merged;
   return {
     analysis: { ...d.analysis, ...(analysis ?? {}) } as GraphAnalysis,
-    figure: M.resizeSeries({ ...d.figure, ...(figure ?? {}) } as GraphFigure, doc.col_titles.length),
+    figure: M.resizeSeries({ ...noPc, ...pal } as GraphFigure, doc.col_titles.length),
   };
 }
 
@@ -278,7 +299,7 @@ export const useGraphStore = create<GraphState>((set, get) => {
       set({
         doc: prev.doc,
         ...(prev.structural ? {
-          figure: { ...following, colors: prev.colors, labels: prev.labels },
+          figure: { ...following, colors: prev.colors, labels: prev.labels, ...prev.palette },
           analysis: { ...s.analysis, control: prev.control, pairs: prev.pairs },
         } : following === s.figure ? {} : { figure: following }),
         undoStack: s.undoStack.slice(0, -1),

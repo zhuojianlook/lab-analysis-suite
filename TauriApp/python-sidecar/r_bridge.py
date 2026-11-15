@@ -172,9 +172,11 @@ mpfig_plot <- function(filename = NULL, width = 1200, height = 900, res = 150, b
 # Render a ggplot object to (a) a PNG preview the WebView can display, and
 # (b) an optional publication export in the requested format / background.
 # format: "png" | "tiff" ; bg: "white" | "transparent".
-mpfig_render <- function(p, width = 1200, height = 900, res = 150, format = "png", bg = "white") {{
+# preview: optional plot drawn for the on-screen preview instead of p (e.g. p
+# with its coloured page kept while the export is transparent).
+mpfig_render <- function(p, width = 1200, height = 900, res = 150, format = "png", bg = "white", preview = NULL) {{
   mpfig_plot(width = width, height = height, res = res, bg = "white")
-  print(p)
+  print(if (is.null(preview)) p else preview)
   while (dev.cur() > 1) try(dev.off(), silent = TRUE)
   fmt <- tolower(as.character(format))
   if (fmt %in% c("tiff", "tif") || !identical(bg, "white")) {{

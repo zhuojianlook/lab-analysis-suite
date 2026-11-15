@@ -14,6 +14,9 @@ deletes are POST):
   POST /api/graph/plot                   -> run-r response + {warnings}
   GET  /api/graph/software               -> {app, python, numpy, scipy, r, ggplot2, ggprism}
                                             (versions for the methods text; each a string or null)
+  GET  /api/graph/palettes               -> {available, source, version, r, reason, message,
+                                             colour, fill, themes} (ggprism palettes and colour
+                                             schemes read from the user's R; built-ins when not)
 
 Statistics live in graph_stats, R code generation in graph_plot and the
 SQLite store in graph_library. Keep every @router decorator directly above
@@ -203,9 +206,37 @@ def plot(body: Any = Body(None)):
         return graph_plot._fail("The request body must be a JSON object.")
     try:
         table, analysis = body.get("table"), body.get("analysis")
-        return graph_plot.render(table, analysis, body.get("figure"), result=_compute(table, analysis))
+        res = graph_plot.render(table, analysis, body.get("figure"), result=_compute(table, analysis))
+        _warn_unknown_scheme(body.get("figure"), res)
+        return res
     except Exception as e:  # noqa: BLE001
         return graph_plot._fail(_unexpected(e))
+
+
+def _warn_unknown_scheme(figure: Any, res: Any) -> None:
+    """A well-formed scheme name the installed ggprism doesn't have (e.g. a
+    document saved with another ggprism version) is drawn with the standard
+    Prism theme by the R-side check; say so. Uses only an already cached
+    palette probe, never starts one, so plotting is not slowed down."""
+    try:
+        if not isinstance(figure, dict) or not isinstance(res, dict):
+            return
+        pp = figure.get("prism_palette")
+        theme = figure.get("theme") if figure.get("theme") in ("prism", "classic", "minimal") else "prism"
+        if not isinstance(pp, str) or not pp or theme != "prism" or not graph_plot._PRISM_NAME.fullmatch(pp) or pp == "all_null":
+            return
+        rscript, _ = r_bridge._resolve_rscript()
+        with _PAL_CACHE_LOCK:
+            hit = _PAL_CACHE.get(rscript) if rscript else None
+        if not hit or pp in (hit.get("themes") or {}):
+            return
+        msg = "Unknown Prism colour scheme; drew the standard Prism theme."
+        warnings = res.get("warnings") if isinstance(res.get("warnings"), list) else []
+        if msg not in warnings:
+            warnings.append(msg)
+        res["warnings"] = warnings
+    except Exception:  # noqa: BLE001 - a warning must never break plotting
+        return
 
 
 # ── software versions (cited in the generated statistical methods) ─────────
@@ -285,3 +316,169 @@ def software():
     except Exception:  # noqa: BLE001 - never an HTTP 500: unknown versions are simply omitted
         pass
     return out
+
+
+# ── ggprism palettes (read from the user's installed ggprism) ──────────────
+#
+# Prism-style colour palettes and colour schemes come from ggprism's own
+# `ggprism_data` at runtime: none of that (GPL) data is copied into the app or
+# written to disk. Every name and colour read back is treated as untrusted and
+# validated; the result is cached per Rscript path only when the probe
+# succeeded, so installing R / ggprism while the app is open shows up on the
+# next request (same policy as the software versions above).
+
+_PAL_PROBE = (
+    'cat("R\\t", as.character(getRversion()), "\\n", sep="")\n'
+    'v <- tryCatch(as.character(utils::packageVersion("ggprism")), error=function(e) "MISSING")\n'
+    'cat("ggprism\\t", v, "\\n", sep="")\n'
+    'if (!identical(v, "MISSING")) {\n'
+    '  d <- tryCatch(ggprism::ggprism_data, error=function(e) NULL)\n'
+    '  emit <- function(kind, lst) for (n in names(lst)) {\n'
+    '    x <- lst[[n]]\n'
+    '    if (is.character(x) && length(x) > 0) cat(kind, "\\t", n, "\\t", paste(x, collapse=","), "\\n", sep="")\n'
+    '  }\n'
+    '  if (is.list(d)) {\n'
+    '    emit("colour", d$colour_palettes)\n'
+    '    emit("fill", d$fill_palettes)\n'
+    '    for (n in names(d$themes)) {\n'
+    '      t <- d$themes[[n]]\n'
+    '      if (is.data.frame(t) && all(c("name", "value") %in% names(t)))\n'
+    '        cat("theme\\t", n, "\\t", paste(paste0(t$name, "=", t$value), collapse=","), "\\n", sep="")\n'
+    '    }\n'
+    '    cat("END\\n")\n'
+    '  }\n'
+    '}\n'
+)
+_PAL_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")      # used with fullmatch
+_PAL_HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}")             # used with fullmatch
+_PAL_MAX_COLOURS = 64
+_PAL_MAX_PALETTES = 200
+# The theme entries ggprism::theme_prism(palette=) draws with. plottingAreaColor
+# is deliberately left out: theme_prism paints the panel with it only for the
+# "office" scheme (every other scheme's panel shows the page colour), so passing
+# it on would mislead a UI preview into drawing a panel R never draws.
+_THEME_KEYS = ("pageBackgroundColor", "axisColor", "axisLabelColor", "axisTitleColor", "graphTitleColor")
+_THEME_REQUIRED = _THEME_KEYS
+_PAL_MESSAGES = {
+    "no_r": "R wasn't found, so only the built-in palettes are available. Set up R in Setup.",
+    "no_ggprism": "The R package ggprism isn't installed, so only the built-in palettes are available. "
+                  "Install it in Setup.",
+    "probe_failed": "R didn't return the ggprism palettes, so only the built-in palettes are available.",
+}
+_PAL_CACHE: Dict[str, dict] = {}
+_PAL_CACHE_LOCK = threading.Lock()
+
+
+def _pal_envelope(reason: Optional[str], r_ver: Optional[str] = None, version: Optional[str] = None) -> dict:
+    return {"available": reason is None, "source": "ggprism", "version": version, "r": r_ver,
+            "reason": reason, "message": _PAL_MESSAGES.get(reason, "") if reason else "",
+            "colour": {}, "fill": {}, "themes": {}}
+
+
+def _pal_name(s: str) -> Optional[str]:
+    n = s.strip()
+    return n if _PAL_NAME_RE.fullmatch(n) and n != "all_null" else None
+
+
+def _pal_colours(s: str) -> Optional[list]:
+    items = [x.strip() for x in s.split(",")]
+    if not items or len(items) > _PAL_MAX_COLOURS:
+        return None
+    if not all(_PAL_HEX_RE.fullmatch(x) for x in items):
+        return None                       # never a partial palette
+    return [x.upper() for x in items]
+
+
+def _pal_theme(s: str) -> Optional[dict]:
+    out: Dict[str, str] = {}
+    for part in s.split(","):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k in _THEME_KEYS and k not in out:
+            if not _PAL_HEX_RE.fullmatch(v):
+                if k in _THEME_REQUIRED:
+                    return None
+                continue
+            out[k] = v.upper()
+    return out if all(k in out for k in _THEME_REQUIRED) else None
+
+
+def _parse_palettes(stdout: str) -> dict:
+    r_ver = gg_ver = None
+    missing = saw_end = False
+    colour: Dict[str, list] = {}
+    fill: Dict[str, list] = {}
+    themes_raw: Dict[str, dict] = {}
+    for line in (stdout or "").splitlines():
+        if line.strip() == "END":
+            saw_end = True
+            continue
+        parts = line.split("\t")
+        tag = parts[0].strip()
+        if tag == "R" and len(parts) == 2:
+            r_ver = _version(parts[1])
+        elif tag == "ggprism" and len(parts) == 2:
+            if parts[1].strip() == "MISSING":
+                missing = True
+            else:
+                gg_ver = _version(parts[1])
+        elif tag in ("colour", "fill", "theme") and len(parts) == 3:
+            name = _pal_name(parts[1])
+            if name is None:
+                continue
+            if tag == "theme":
+                th = _pal_theme(parts[2])
+                if th is not None and name not in themes_raw:
+                    themes_raw[name] = th
+                continue
+            dest = colour if tag == "colour" else fill
+            cols = _pal_colours(parts[2])
+            if cols is not None and name not in dest and len(dest) < _PAL_MAX_PALETTES:
+                dest[name] = cols
+    if missing:
+        return _pal_envelope("no_ggprism", r_ver)
+    if not saw_end or not (colour or fill):
+        return _pal_envelope("probe_failed", r_ver, gg_ver)
+    themes = {n: t for n, t in themes_raw.items() if n in colour or n in fill}
+    return {**_pal_envelope(None, r_ver, gg_ver), "colour": colour, "fill": fill, "themes": themes}
+
+
+def _pal_copy(d: dict) -> dict:
+    return json.loads(json.dumps(d))
+
+
+def _probe_palettes() -> dict:
+    try:
+        rscript, is_bundled = r_bridge._resolve_rscript()
+    except Exception:  # noqa: BLE001
+        return _pal_envelope("no_r")
+    if not rscript:
+        return _pal_envelope("no_r")
+    with _PAL_CACHE_LOCK:
+        hit = _PAL_CACHE.get(rscript)
+    if hit is not None:
+        return _pal_copy(hit)
+    try:
+        env = r_bridge._r_env(rscript, is_bundled) or os.environ.copy()
+        with tempfile.TemporaryDirectory(prefix="las_palettes_") as tmp:
+            sp = os.path.join(tmp, "palettes.R")
+            with open(sp, "w", encoding="utf-8") as f:
+                f.write(_PAL_PROBE)
+            res = subprocess.run([rscript, sp], capture_output=True, text=True, timeout=20, env=env)
+    except Exception:  # noqa: BLE001 - no R, timeout, unreadable output
+        return _pal_envelope("probe_failed")
+    out = _parse_palettes(res.stdout or "")
+    if out["available"]:
+        with _PAL_CACHE_LOCK:
+            _PAL_CACHE[rscript] = _pal_copy(out)
+    return out
+
+
+@router.get("/api/graph/palettes")
+def palettes():
+    try:
+        return _probe_palettes()
+    except Exception:  # noqa: BLE001 - never an HTTP 500: the app falls back to its built-in palettes
+        return _pal_envelope("probe_failed")

@@ -4,7 +4,8 @@
    everything here is unit-testable in node. */
 
 import type {
-  CenterId, CompareId, GraphAnalysis, GraphDoc, GraphFigure, GraphTable, GraphType, Num, PosthocId, Template, TestId,
+  CenterId, CompareId, GraphAnalysis, GraphDoc, GraphFigure, GraphPalettes, GraphTable, GraphType, Num, PosthocId, Template,
+  TestId,
 } from "../../api/graph";
 
 // ── limits ──────────────────────────────────────────────────────────────────
@@ -18,6 +19,15 @@ export const PALETTES: Record<string, string[]> = {
   Default: ["#5a7fa8", "#63a66a", "#c1666b", "#d4a05a", "#8a6fae", "#4aa3a3", "#b07aa1", "#9c9c4a"],
   "Colour-blind": ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442", "#000000"],
   Greyscale: ["#1f1f1f", "#5c5c5c", "#8f8f8f", "#c2c2c2", "#3d3d3d", "#737373", "#a8a8a8", "#e0e0e0"],
+  // Freely licensed qualitative schemes, so there is a choice even without R:
+  // Paul Tol's "bright" and "muted" (personal.sron.nl/~pault, free to use);
+  // ColorBrewer Set2 / Dark2 / Paired (© Cynthia Brewer, Apache-2.0).
+  "Tol bright": ["#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB"],
+  "Tol muted": ["#CC6677", "#332288", "#DDCC77", "#117733", "#88CCEE", "#882255", "#44AA99", "#999933", "#AA4499"],
+  Set2: ["#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3", "#A6D854", "#FFD92F", "#E5C494", "#B3B3B3"],
+  Dark2: ["#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#66A61E", "#E6AB02", "#A6761D", "#666666"],
+  Paired: ["#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6", "#6A3D9A",
+    "#FFFF99", "#B15928"],
 };
 
 // ── templates ───────────────────────────────────────────────────────────────
@@ -633,11 +643,13 @@ export function nextColor(used: string[], palette = PALETTES.Default): string {
   return palette.find((c) => !taken.has(c.toLowerCase())) ?? palette[used.length % palette.length];
 }
 
-/** Grow/shrink the per-data-set colours and legend labels to `n`. */
+/** Grow/shrink the per-data-set colours and legend labels to `n`. New data
+ *  sets take the next unused colour of the active palette. */
 export function resizeSeries(f: GraphFigure, n: number): GraphFigure {
   if (f.colors.length === n && f.labels.length === n) return f;
   const colors = f.colors.slice(0, n);
-  while (colors.length < n) colors.push(nextColor(colors));
+  const pal = activePaletteColors(f);
+  while (colors.length < n) colors.push(nextColor(colors, pal));
   const labels = f.labels.slice(0, n);
   while (labels.length < n) labels.push("");
   return { ...f, colors, labels };
@@ -671,6 +683,10 @@ export function defaultFigure(t: Template, nSeries: number, xTitle = "X"): Graph
     transparent: false,
     fig_label: "Fig. 1",
     n_unit: "",
+    palette: "app:Default",
+    palette_reverse: false,
+    palette_edited: false,
+    axis_scheme: false,
   }, nSeries);
 }
 
@@ -685,13 +701,176 @@ const HEX = /^#[0-9a-fA-F]{6}$/;
 export function effectiveFigure(f: GraphFigure, table: GraphTable): GraphFigure {
   const n = table.col_titles.length;
   const sized = resizeSeries(f, Math.max(n, f.colors.length));
-  // legend-only fields: never part of the plot request / plotKey (typing them must not re-render)
-  const { fig_label: _fl, n_unit: _nu, ...plot } = f;
+  // legend-only fields: never part of the plot request / plotKey (typing them must not re-render);
+  // palette bookkeeping neither (the colours themselves are what is drawn)
+  const {
+    fig_label: _fl, n_unit: _nu,
+    palette: _p, palette_colors: _pc, palette_reverse: _pr, palette_edited: _pe, axis_scheme: _as, prism_palette: _pp,
+    ...plot
+  } = f;
+  const scheme = prismScheme(f);
   return {
     ...plot,
     colors: sized.colors.slice(0, n).map((c, i) => (HEX.test(c) ? c : PALETTES.Default[i % PALETTES.Default.length])),
     labels: sized.labels.slice(0, n).map((l, i) => l.trim() || table.col_titles[i]),
+    // Only when the colour scheme is on: otherwise the key is absent, so the
+    // request (and plot key) of every existing figure is unchanged.
+    ...(scheme ? { prism_palette: scheme } : {}),
   };
+}
+
+// ── palettes ────────────────────────────────────────────────────────────────
+
+/** Figure fields that only record which palette is active: saved with the
+ *  document, never part of the plot request (or the plot key). */
+export const PALETTE_KEYS = ["palette", "palette_colors", "palette_reverse", "palette_edited", "axis_scheme"] as const;
+
+/** A ggprism palette / colour-scheme name (the engine validates it the same way). */
+export const PRISM_NAME = /^[a-z][a-z0-9_]{0,39}$/;
+
+/** The ggprism colour scheme a figure asks for: only with the scheme switch on,
+ *  the Prism theme and a ggprism palette; "" otherwise. */
+export function prismScheme(f: Partial<GraphFigure>): string {
+  const pal = typeof f.palette === "string" ? f.palette : "";
+  if (f.axis_scheme !== true || f.theme !== "prism" || !pal.startsWith("prism:")) return "";
+  const name = pal.slice(6);
+  return PRISM_NAME.test(name) ? name : "";
+}
+
+/** True for a light colour (#RRGGBB, relative luminance above 0.5), e.g. the
+ *  white axes of a Prism scheme drawn for a dark page. */
+export function isLightHex(hex: string): boolean {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+  if (!m) return false;
+  const lin = (h: string) => { const c = parseInt(h, 16) / 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  return 0.2126 * lin(m[1]) + 0.7152 * lin(m[2]) + 0.0722 * lin(m[3]) > 0.5;
+}
+
+/** "candy_bright" → "Candy bright", "prism_dark2" → "Prism dark 2". */
+export function humanizePalette(name: string): string {
+  const s = name.replace(/_+/g, " ").replace(/([a-z])(\d+)$/i, "$1 $2").trim();
+  return s ? s[0].toUpperCase() + s.slice(1) : name;
+}
+
+export interface PaletteOption {
+  /** "app:<key>" | "prism:<name>" — stored in figure.palette. */
+  id: string;
+  /** Group header in the picker. */
+  group: string;
+  /** Key / ggprism name. */
+  name: string;
+  /** Shown to people ("Candy bright"). */
+  label: string;
+  /** Colours in the palette's own order. */
+  colors: string[];
+  /** ggprism has a colour scheme (axes / text) of the same name. */
+  hasScheme: boolean;
+  /** Prism palette whose fill and colour (line / symbol) vectors differ. */
+  kindDiffers?: boolean;
+}
+
+export const APP_GROUP = "App";
+export const prismGroup = (version: string | null | undefined) => (version ? `Prism (ggprism ${version})` : "Prism (ggprism)");
+
+const isHexList = (v: unknown): v is string[] =>
+  Array.isArray(v) && v.length > 0 && v.length <= 64 && v.every((c) => typeof c === "string" && HEX.test(c));
+
+/** Every palette the picker offers: the built-ins, then ggprism's (when R
+ *  answered), sorted by name. Column / Grouped graphs use ggprism's FILL
+ *  palettes (area colours inside a dark outline: bars, boxes, violins, filled
+ *  points); XY graphs its COLOUR palettes (the darker line / symbol partners).
+ *  Names that exist in only one kind fall back to the other. */
+export function paletteOptions(template: Template, prism: GraphPalettes | null | undefined): PaletteOption[] {
+  const out: PaletteOption[] = Object.entries(PALETTES).map(([key, colors]) => ({
+    id: `app:${key}`, group: APP_GROUP, name: key, label: key, colors, hasScheme: false,
+  }));
+  if (!prism || !prism.available) return out;
+  const colour = prism.colour && typeof prism.colour === "object" ? prism.colour : {};
+  const fill = prism.fill && typeof prism.fill === "object" ? prism.fill : {};
+  const themes = prism.themes && typeof prism.themes === "object" ? prism.themes : {};
+  const own = (o: Record<string, unknown>, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+  const names = [...new Set([...Object.keys(colour), ...Object.keys(fill)])].sort();
+  const group = prismGroup(prism.version);
+  for (const name of names) {
+    if (!PRISM_NAME.test(name) || name === "all_null") continue;
+    const c = own(colour, name) && isHexList(colour[name]) ? colour[name] : null;
+    const fl = own(fill, name) && isHexList(fill[name]) ? fill[name] : null;
+    const colors = template === "xy" ? (c ?? fl) : (fl ?? c);
+    if (!colors) continue;
+    out.push({
+      id: `prism:${name}`, group, name, label: humanizePalette(name), colors: [...colors],
+      hasScheme: own(themes, name), kindDiffers: !!c && !!fl && c.join() !== fl.join(),
+    });
+  }
+  return out;
+}
+
+/** n colours from a palette, cycling when it is shorter; `reverse` assigns the
+ *  same colours in the opposite order. */
+export function paletteAssign(pal: string[], n: number, reverse: boolean): string[] {
+  if (!pal.length) return [];
+  return Array.from({ length: Math.max(0, n) }, (_, i) => pal[(reverse ? n - 1 - i : i) % pal.length].toLowerCase());
+}
+
+/** Apply a palette to n data sets (the only place a palette changes colours). */
+export function applyPalette(f: GraphFigure, opt: PaletteOption, n: number): Partial<GraphFigure> {
+  return {
+    colors: paletteAssign(opt.colors, n, !!f.palette_reverse),
+    palette: opt.id,
+    palette_colors: opt.colors.map((c) => c.toLowerCase()),
+    palette_edited: false,
+    axis_scheme: opt.hasScheme ? !!f.axis_scheme : false,
+  };
+}
+
+/** Flip the order of the current colours (palette or hand-picked). */
+export function reversePalette(f: GraphFigure): Partial<GraphFigure> {
+  return { colors: [...f.colors].reverse(), palette_reverse: !f.palette_reverse };
+}
+
+/** One colour changed by hand: the palette stays named (and its colour scheme
+ *  stays on) but is marked as edited. */
+export function editColor(f: GraphFigure, i: number, hex: string): Partial<GraphFigure> {
+  const colors = [...f.colors];
+  colors[i] = hex;
+  return { colors, palette_edited: true };
+}
+
+/** The colours new data sets draw from: the applied palette, else Default. */
+export function activePaletteColors(f: Partial<GraphFigure>): string[] {
+  if (isHexList(f.palette_colors)) return f.palette_colors;
+  const key = typeof f.palette === "string" && f.palette.startsWith("app:") ? f.palette.slice(4) : "";
+  return key && Object.prototype.hasOwnProperty.call(PALETTES, key) ? PALETTES[key] : PALETTES.Default;
+}
+
+/** Documents saved before palettes were named: which built-in palette (if
+ *  any) their colours are, so the picker can show it. "" = custom colours. */
+export function inferAppPalette(colors: string[]): string {
+  if (!colors.length) return "app:Default";
+  const lc = colors.map((c) => (typeof c === "string" ? c.toLowerCase() : ""));
+  for (const [key, pal] of Object.entries(PALETTES)) {
+    const want = paletteAssign(pal, lc.length, false);
+    if (want.every((c, i) => c === lc[i])) return `app:${key}`;
+  }
+  return "";
+}
+
+/** Saved palette fields made safe to use (anything odd → custom colours). */
+export function sanitizePaletteFields(f: Record<string, unknown>): Partial<GraphFigure> {
+  const p = f.palette;
+  let palette = "";
+  if (typeof p === "string") {
+    if (p.startsWith("app:") && Object.prototype.hasOwnProperty.call(PALETTES, p.slice(4))) palette = p;
+    else if (p.startsWith("prism:") && PRISM_NAME.test(p.slice(6)) && p !== "prism:all_null") palette = p;
+  }
+  const out: Partial<GraphFigure> = {
+    palette,
+    palette_reverse: f.palette_reverse === true,
+    palette_edited: f.palette_edited === true,
+    axis_scheme: f.axis_scheme === true,
+  };
+  if (isHexList(f.palette_colors)) out.palette_colors = (f.palette_colors as string[]).map((c) => c.toLowerCase());
+  return out;
 }
 
 // ── index remapping after structural edits ──────────────────────────────────
@@ -720,7 +899,7 @@ export function remapAnalysis(a: GraphAnalysis, t: Template, axis: "col" | "row"
 export function remapFigure(f: GraphFigure, op: IndexOp): GraphFigure {
   const colors = [...f.colors], labels = [...f.labels];
   if (op.type === "insert") {
-    colors.splice(op.at, 0, nextColor(colors));
+    colors.splice(op.at, 0, nextColor(colors, activePaletteColors(f)));
     labels.splice(op.at, 0, "");
   } else {
     colors.splice(op.at, 1);

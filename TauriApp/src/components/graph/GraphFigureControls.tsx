@@ -1,11 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
-  Box, Chip, FormControlLabel, MenuItem, Slider, Stack, Switch, TextField, ToggleButton, ToggleButtonGroup, Typography,
+  Box, FormControlLabel, MenuItem, Slider, Stack, Switch, TextField, ToggleButton, ToggleButtonGroup, Typography,
 } from "@mui/material";
 import type { GraphFigure, Template } from "../../api/graph";
 import { RailHeading } from "../shared/RailSection";
 import { NumberField } from "../shared/NumberField";
-import { CENTERS, PALETTES, templateInfo } from "./graphModel";
+import { CENTERS, editColor, templateInfo } from "./graphModel";
+import { PalettePicker } from "./PalettePicker";
 
 /** Caption + slider with the current value shown on the right. */
 export function LabeledSlider({
@@ -119,11 +120,6 @@ export function GraphFigureControls({
   const xyCenterUnused = xy && (xyNoReps || (f.show_points && g !== "xy_line"));
   const centerInherent = g === "box" || g === "violin";
   const hasBars = g === "bar" || g === "gbar" || g === "box" || g === "violin";
-
-  const applyPalette = (name: string) => {
-    const pal = PALETTES[name];
-    setFigure({ colors: seriesTitles.map((_, i) => pal[i % pal.length]) });
-  };
 
   return (
     <Box>
@@ -239,20 +235,12 @@ export function GraphFigureControls({
       )}
 
       <RailHeading>Colours &amp; legend</RailHeading>
-      <Stack direction="row" spacing={0.75} sx={{ mb: 1 }}>
-        {Object.keys(PALETTES).map((name) => (
-          <Chip key={name} size="small" variant="outlined" label={name} onClick={() => applyPalette(name)} />
-        ))}
-      </Stack>
+      <PalettePicker template={template} figure={f} setFigure={setFigure} n={seriesTitles.length} />
       <Stack spacing={0.75}>
         {seriesTitles.map((title, i) => (
           <Stack key={i} direction="row" spacing={1} alignItems="center">
             <input type="color" value={f.colors[i] ?? "#888888"} aria-label={`Colour for ${title}`}
-              onChange={(e) => {
-                const colors = [...f.colors];
-                colors[i] = e.target.value;
-                setFigure({ colors });
-              }}
+              onChange={(e) => setFigure(editColor(f, i, e.target.value))}
               style={{ width: 30, height: 30, padding: 0, border: "1px solid #48484a", borderRadius: 4, background: "none", cursor: "pointer", flexShrink: 0 }} />
             <TextField size="small" fullWidth value={f.labels[i] ?? ""} placeholder={title}
               onChange={(e) => {

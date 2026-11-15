@@ -36,6 +36,9 @@ _HEX = re.compile(r"^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$")
 _R2 = "\x00R2\x00"   # placeholder for "R²" in equation labels (split out before escaping)
 MAX_BRACKETS = 200    # more significance brackets than this are not drawn (unreadable)
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
+# A ggprism colour-scheme name (ggprism::theme_prism(palette=)). Used with
+# fullmatch only; R re-checks that the name exists in the installed ggprism.
+_PRISM_NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
 
 
 # ── R literal helpers (local copies; graph modules don't import qpcr) ───────
@@ -63,13 +66,47 @@ def _r_nums(xs: List[Any]) -> str:
     return "c(" + ", ".join(_r_num(x) for x in xs) + ")"
 
 
-def _theme_layer(theme: str, font_size: int) -> str:
+def _theme_layer(theme: str, font_size: int, scheme: str = "") -> str:
+    if theme == "prism" and scheme:
+        fs = int(font_size)
+        return (f'if (requireNamespace("ggprism", quietly=TRUE)) {{ p <- p + (if (!is.null(.th)) '
+                f'tryCatch(ggprism::theme_prism(palette="{_resc(scheme)}", base_size={fs}), '
+                f'error=function(e) ggprism::theme_prism(base_size={fs})) else ggprism::theme_prism(base_size={fs})); '
+                f'if (!is.null(.th)) p <- p + ggplot2::theme(axis.ticks=ggplot2::element_line(colour=.ink)) }} '
+                f'else p <- p + ggplot2::theme_classic(base_size={fs})\n')
     if theme == "classic":
         return f'p <- p + ggplot2::theme_classic(base_size={int(font_size)})\n'
     if theme == "minimal":
         return f'p <- p + ggplot2::theme_minimal(base_size={int(font_size)})\n'
     return (f'if (requireNamespace("ggprism", quietly=TRUE)) p <- p + ggprism::theme_prism(base_size={int(font_size)}) '
             f'else p <- p + ggplot2::theme_classic(base_size={int(font_size)})\n')
+
+
+def _scheme_prelude(scheme: str) -> str:
+    """R lines (after library(ggplot2)) that look the Prism colour scheme up in
+    the installed ggprism. An unknown name leaves .th NULL: the standard Prism
+    theme with black ink, never an R error."""
+    if not scheme:
+        return ""
+    return (f'.scheme <- "{_resc(scheme)}"\n'
+            '.th <- NULL\n'
+            'if (requireNamespace("ggprism", quietly=TRUE)) {\n'
+            '  .t <- tryCatch(ggprism::ggprism_data$themes[[.scheme]], error=function(e) NULL)\n'
+            '  if (is.data.frame(.t) && all(c("name", "value") %in% names(.t))) '
+            '.th <- stats::setNames(as.character(.t$value), as.character(.t$name))\n'
+            '}\n'
+            '.hex <- function(k) { v <- if (is.null(.th)) NA_character_ else unname(.th[k]); '
+            'if (length(v) == 1 && !is.na(v) && grepl("^#[0-9A-Fa-f]{6}$", v)) v else "black" }\n'
+            '.ink <- .hex("axisColor"); .inkText <- .hex("axisLabelColor")\n')
+
+
+def _ink(fig) -> tuple:
+    """(outline colour expression, extra colour arg, extra text colour arg) for
+    borders, error bars, brackets and labels: black unless a Prism colour
+    scheme is on, then the scheme's axis colours (legible on dark pages)."""
+    if fig.get("prism_palette"):
+        return ".ink", ", colour=.ink", ", colour=.inkText"
+    return '"black"', "", ""
 
 
 def _transparent_layer(transparent: bool) -> str:
@@ -79,6 +116,23 @@ def _transparent_layer(transparent: bool) -> str:
             "panel.background=ggplot2::element_rect(fill='transparent', colour=NA), "
             "legend.background=ggplot2::element_rect(fill='transparent', colour=NA), "
             "legend.key=ggplot2::element_rect(fill='transparent', colour=NA))\n")
+
+
+def _render_tail(fig) -> str:
+    """The transparent-background layer plus the mpfig_render call.
+
+    A Prism colour scheme can have light ink (diazo, blueprint, … draw white
+    axes on a coloured page). The on-screen preview is always drawn on white,
+    so with "Transparent background" on it keeps the scheme's page colour
+    (the plot before the transparent layer) and only the exported file is
+    transparent. Without a scheme the output is unchanged."""
+    size = f"width={fig['width']}, height={fig['height']}, res={fig['dpi']}, format=\"{fig['export_format']}\""
+    if not fig["transparent"]:
+        return f'mpfig_render(p, {size}, bg="white")'
+    if fig.get("prism_palette"):
+        return (".pv <- p\n" + _transparent_layer(True)
+                + f'mpfig_render(p, {size}, bg="transparent", preview=.pv)')
+    return _transparent_layer(True) + f'mpfig_render(p, {size}, bg="transparent")'
 
 
 # ── figure settings ─────────────────────────────────────────────────────────
@@ -113,6 +167,16 @@ def normalize_figure(figure: Optional[dict], template: str, warnings: List[str])
                 warnings.append(f"'{gt}' isn't available for this table; drew bars instead.")
             gt = "bar"
     center = f.get("center") if f.get("center") in CENTERS else "mean_sd"
+    theme = f.get("theme") if f.get("theme") in ("prism", "classic", "minimal") else "prism"
+    # Prism colour scheme (axes / text coloured like a Prism scheme): a strictly
+    # validated name, only with the Prism theme. Anything else draws as before.
+    pp = f.get("prism_palette")
+    scheme = ""
+    if isinstance(pp, str) and pp and theme == "prism":
+        if _PRISM_NAME.fullmatch(pp) and pp != "all_null":
+            scheme = pp
+        else:
+            warnings.append("Unknown Prism colour scheme; drew the standard Prism theme.")
     return {
         "graph_type": gt, "center": center,
         "show_points": _bool(f.get("show_points"), False),
@@ -128,7 +192,8 @@ def normalize_figure(figure: Optional[dict], template: str, warnings: List[str])
         "colors": f.get("colors") if isinstance(f.get("colors"), list) else [],
         "labels": f.get("labels") if isinstance(f.get("labels"), list) else [],
         "show_legend": _bool(f.get("show_legend"), template != "column"),
-        "theme": f.get("theme") if f.get("theme") in ("prism", "classic", "minimal") else "prism",
+        "theme": theme,
+        "prism_palette": scheme,
         "width": int(_clamp(f.get("width"), 200, 8000, 1200)),
         "height": int(_clamp(f.get("height"), 200, 8000, 900)),
         "dpi": int(_clamp(f.get("dpi"), 50, 1200, 150)),
@@ -241,6 +306,7 @@ def _column_code(tb, an, fig, result, warnings):
     show_pts = fig["show_points"] or gt == "dot"
     S = n_cols
     w = bw / S if grouped else bw
+    ink, ink_arg, text_arg = _ink(fig)
 
     elems, pts = [], []
     gid = 0
@@ -353,35 +419,35 @@ def _column_code(tb, an, fig, result, warnings):
     geom = ""
     if gt == "bar":
         geom = ('p <- p + ggplot2::geom_col(data=summ[!is.na(summ$center), , drop=FALSE], ggplot2::aes(x=xp, y=center, fill=f), '
-                'position="identity", width=.w, colour="black", linewidth=0.3)\n'
+                f'position="identity", width=.w, colour={ink}, linewidth=0.3)\n'
                 'if (nrow(summE) > 0) p <- p + ggplot2::geom_errorbar(data=summE, ggplot2::aes(x=xp, ymin=lo, ymax=hi), '
-                'position="identity", width=.w * 0.35, linewidth=0.4)\n')
+                f'position="identity", width=.w * 0.35, linewidth=0.4{ink_arg})\n')
     elif gt == "dot":
         geom = ('if (nrow(summE) > 0) p <- p + ggplot2::geom_errorbar(data=summE, ggplot2::aes(x=xp, ymin=lo, ymax=hi), '
-                'position="identity", width=.w * 0.35, linewidth=0.4)\n'
+                f'position="identity", width=.w * 0.35, linewidth=0.4{ink_arg})\n'
                 'p <- p + ggplot2::geom_crossbar(data=summ[!is.na(summ$center), , drop=FALSE], ggplot2::aes(x=xp, y=center, ymin=center, ymax=center), '
-                'position="identity", width=.w * 0.6, linewidth=0.4, colour="black")\n')
+                f'position="identity", width=.w * 0.6, linewidth=0.4, colour={ink})\n')
     elif gt == "box":
         geom = ('p <- p + ggplot2::geom_boxplot(data=summ, ggplot2::aes(x=xp, ymin=mn, lower=q1, middle=med, upper=q3, ymax=mx, group=gid, fill=f), '
-                'stat="identity", position="identity", width=.w, colour="black", linewidth=0.3)\n')
+                f'stat="identity", position="identity", width=.w, colour={ink}, linewidth=0.3)\n')
     else:  # violin
         geom = ('datV <- dat[dat$vok == 1, , drop=FALSE]\n'
                 'if (nrow(datV) > 0) p <- p + ggplot2::geom_violin(data=datV, ggplot2::aes(x=xp, y=y, group=gid, fill=f), '
-                'position="identity", width=.w, trim=TRUE, scale="width", colour="black", linewidth=0.3)\n'
+                f'position="identity", width=.w, trim=TRUE, scale="width", colour={ink}, linewidth=0.3)\n'
                 'sV <- summ[summ$gid %in% datV$gid, , drop=FALSE]\n'
                 'if (nrow(sV) > 0) p <- p + ggplot2::geom_crossbar(data=sV, ggplot2::aes(x=xp, y=med, ymin=med, ymax=med), '
-                'position="identity", width=.w * 0.5, linewidth=0.4, colour="black")\n')
+                f'position="identity", width=.w * 0.5, linewidth=0.4, colour={ink})\n')
     pts_layer = ""
     if gt == "dot":
         pts_layer = (f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(x=xp, y=y, fill=f), position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=1), '
-                     f'shape=21, colour="black", stroke=0.4, size={ps})\n')
+                     f'shape=21, colour={ink}, stroke=0.4, size={ps})\n')
     elif show_pts:
         pts_layer = (f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(x=xp, y=y), position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=1), '
-                     f'shape=21, fill="white", colour="black", stroke=0.4, size={ps})\n')
+                     f'shape=21, fill="white", colour={ink}, stroke=0.4, size={ps})\n')
     if gt == "violin" and not show_pts:
         pts_layer += (f'datP <- dat[dat$vok == 0, , drop=FALSE]\n'
                       f'if (nrow(datP) > 0) p <- p + ggplot2::geom_point(data=datP, ggplot2::aes(x=xp, y=y, fill=f), position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=1), '
-                      f'shape=21, colour="black", stroke=0.4, size={ps})\n')
+                      f'shape=21, colour={ink}, stroke=0.4, size={ps})\n')
 
     coord = f"xlim=c(0.5, {K} + 0.5)"
     if ylim:
@@ -396,10 +462,10 @@ def _column_code(tb, an, fig, result, warnings):
             f'bdf <- data.frame(x1={_r_nums([b["x1"] for b in brackets])}, x2={_r_nums([b["x2"] for b in brackets])}, '
             f'y={_r_nums([b["y"] for b in brackets])}, tick={_r_nums([b["tick"] for b in brackets])}, '
             f'label={_r_vec([b["label"] for b in brackets])}, stringsAsFactors=FALSE)\n'
-            'p <- p + ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x2, y=y, yend=y), inherit.aes=FALSE, linewidth=0.4) + '
-            'ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x1, y=y, yend=y - tick), inherit.aes=FALSE, linewidth=0.4) + '
-            'ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x2, xend=x2, y=y, yend=y - tick), inherit.aes=FALSE, linewidth=0.4) + '
-            f'ggplot2::geom_text(data=bdf, ggplot2::aes(x=(x1 + x2) / 2, y=y, label=label), inherit.aes=FALSE, vjust=-0.25, size={star_size})\n'
+            f'p <- p + ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x2, y=y, yend=y), inherit.aes=FALSE, linewidth=0.4{ink_arg}) + '
+            f'ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x1, y=y, yend=y - tick), inherit.aes=FALSE, linewidth=0.4{ink_arg}) + '
+            f'ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x2, xend=x2, y=y, yend=y - tick), inherit.aes=FALSE, linewidth=0.4{ink_arg}) + '
+            f'ggplot2::geom_text(data=bdf, ggplot2::aes(x=(x1 + x2) / 2, y=y, label=label), inherit.aes=FALSE, vjust=-0.25, size={star_size}{text_arg})\n'
             f'p <- p + ggplot2::expand_limits(y={_r_num(top_all + 0.06 * y_range)})\n'
         )
     angle = ('p <- p + ggplot2::theme(axis.text.x=ggplot2::element_text(angle=45, hjust=1, vjust=1))\n'
@@ -418,7 +484,7 @@ def _column_code(tb, an, fig, result, warnings):
 
     code = f"""
 suppressMessages({{ library(ggplot2) }})
-.cols <- {_r_vec(cols)}; names(.cols) <- as.character(seq_along(.cols))
+{_scheme_prelude(fig['prism_palette'])}.cols <- {_r_vec(cols)}; names(.cols) <- as.character(seq_along(.cols))
 .labs <- {_r_vec(labs)}
 .w <- {_r_num(w)}
 dat <- data[data$kind == 0, , drop=FALSE]
@@ -430,7 +496,7 @@ p <- ggplot2::ggplot()
 {geom}{pts_layer}p <- p + ggplot2::scale_fill_manual(values=.cols, labels=.labs, breaks=names(.cols), drop=FALSE, name=NULL)
 p <- p + ggplot2::scale_x_continuous(breaks=seq_len({K}), labels={_r_vec(xlabs)}, expand=c(0, 0)) + ggplot2::coord_cartesian({coord})
 {yscale}p <- p + ggplot2::labs(title="{_resc(fig['title'])}", x="{_resc(xlabel)}", y="{_resc(fig['ylabel'])}")
-{_theme_layer(fig['theme'], fig['font_size'])}{angle}{legend}{bracket_block}{_transparent_layer(fig['transparent'])}mpfig_render(p, width={fig['width']}, height={fig['height']}, res={fig['dpi']}, format="{fig['export_format']}", bg="{'transparent' if fig['transparent'] else 'white'}")
+{_theme_layer(fig['theme'], fig['font_size'], fig['prism_palette'])}{angle}{legend}{bracket_block}{_render_tail(fig)}
 mpfig_data({table_df}, "graph_summary")
 """
     csv = _csv(pts, ["kind", "gid", "ci", "ri", "xp", "x", "y", "lo", "hi", "vok"])
@@ -446,6 +512,7 @@ def _xy_code(tb, fig, result, warnings):
     labs = _labels(fig, titles)
     cols = _colors(fig, n_cols)
     gt = fig["graph_type"]
+    ink, ink_arg, text_arg = _ink(fig)
     rows, summ, eqs = [], [], []
     xs_used = [x for r, x in enumerate(xs) if x is not None and any(vals[r])]
     if not xs_used:
@@ -497,15 +564,15 @@ def _xy_code(tb, fig, result, warnings):
     if gt == "xy_line":
         layers += 'p <- p + ggplot2::geom_line(data=summ[!is.na(summ$center), , drop=FALSE], ggplot2::aes(x=x, y=center, colour=f, group=f), linewidth=0.7)\n'
     if fig["show_points"]:
-        layers += (f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(x=x, y=y, fill=f), shape=21, colour="black", stroke=0.4, size={ps})\n')
+        layers += (f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(x=x, y=y, fill=f), shape=21, colour={ink}, stroke=0.4, size={ps})\n')
     else:
         layers += (f'if (nrow(summE) > 0) p <- p + ggplot2::geom_errorbar(data=summE, ggplot2::aes(x=x, ymin=lo, ymax=hi, colour=f), width={_r_num(xspan * 0.02)}, linewidth=0.4)\n'
-                   f'p <- p + ggplot2::geom_point(data=summ[!is.na(summ$center), , drop=FALSE], ggplot2::aes(x=x, y=center, fill=f), shape=21, colour="black", stroke=0.4, size={ps})\n')
+                   f'p <- p + ggplot2::geom_point(data=summ[!is.na(summ$center), , drop=FALSE], ggplot2::aes(x=x, y=center, fill=f), shape=21, colour={ink}, stroke=0.4, size={ps})\n')
     if eqs:
         # R² via an R "²" escape so the script stays ASCII whatever R's locale.
         label = "R\\u00b2".join(_resc(part) for part in "\n".join(eqs).split(_R2))
         layers += (f'p <- p + ggplot2::annotate("text", x=-Inf, y=Inf, hjust=-0.05, vjust=1.3, '
-                   f'label="{label}", size={max(2, fig["font_size"] // 4)})\n')
+                   f'label="{label}", size={max(2, fig["font_size"] // 4)}{text_arg})\n')
     coord = ""
     if fig["y_min"] is not None or fig["y_max"] is not None:
         ys = [r["y"] for r in rows if r.get("y") is not None] + [s["hi"] for s in summ if s["hi"] is not None] + \
@@ -526,7 +593,7 @@ def _xy_code(tb, fig, result, warnings):
                 ", stringsAsFactors=FALSE)")
     code = f"""
 suppressMessages({{ library(ggplot2) }})
-.cols <- {_r_vec(cols)}; names(.cols) <- as.character(seq_along(.cols))
+{_scheme_prelude(fig['prism_palette'])}.cols <- {_r_vec(cols)}; names(.cols) <- as.character(seq_along(.cols))
 .labs <- {_r_vec(labs)}
 dat <- data[data$kind == 0, , drop=FALSE]
 dat$f <- factor(dat$ci, levels=seq_along(.cols))
@@ -538,7 +605,7 @@ summE <- summ[!is.na(summ$lo) & !is.na(summ$hi), , drop=FALSE]
 p <- ggplot2::ggplot()
 {layers}p <- p + ggplot2::scale_fill_manual(values=.cols, labels=.labs, breaks=names(.cols), drop=FALSE, name=NULL, aesthetics=c("colour", "fill"))
 {coord}p <- p + ggplot2::labs(title="{_resc(fig['title'])}", x="{_resc(xlabel)}", y="{_resc(fig['ylabel'])}")
-{_theme_layer(fig['theme'], fig['font_size'])}{legend}{_transparent_layer(fig['transparent'])}mpfig_render(p, width={fig['width']}, height={fig['height']}, res={fig['dpi']}, format="{fig['export_format']}", bg="{'transparent' if fig['transparent'] else 'white'}")
+{_theme_layer(fig['theme'], fig['font_size'], fig['prism_palette'])}{legend}{_render_tail(fig)}
 mpfig_data({table_df}, "graph_summary")
 """
     csv = _csv(rows, ["kind", "ci", "x", "y", "lo", "hi"])

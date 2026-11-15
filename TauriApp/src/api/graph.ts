@@ -83,6 +83,23 @@ export interface GraphFigure {
   /** Legend text only, never sent to the plot: what one plotted value is, singular
    *  ("independent cell culture", "mouse"); "" = not stated. */
   n_unit?: string;
+  /** Active palette: "app:<PALETTES key>" | "prism:<ggprism name>" | "" (custom colours).
+   *  Saved with the document; never part of the plot request. */
+  palette?: string;
+  /** The palette's colours in its own order, captured when it was applied (new
+   *  data sets take the next colour from it; works without R). Saved only. */
+  palette_colors?: string[];
+  /** Colours were assigned in reverse order. Saved only. */
+  palette_reverse?: boolean;
+  /** A colour was changed by hand since the palette was applied. Saved only. */
+  palette_edited?: boolean;
+  /** Colour the axes and text with the palette's ggprism colour scheme (needs
+   *  the Prism theme and a "prism:" palette). Saved; reaches the plot only as
+   *  prism_palette. */
+  axis_scheme?: boolean;
+  /** PLOT REQUEST ONLY (derived by effectiveFigure, never stored): the ggprism
+   *  colour-scheme name passed to theme_prism(palette=). */
+  prism_palette?: string;
 }
 
 export interface GraphSummary {
@@ -166,6 +183,34 @@ export interface SoftwareVersions {
   ggprism: string | null;
 }
 
+/** A ggprism colour scheme (the subset theme_prism(palette=) uses). The page
+ *  colour also fills the plotting area (ggprism only paints a separate panel
+ *  colour for "office", so the backend leaves plottingAreaColor out). */
+export interface PrismTheme {
+  pageBackgroundColor: string;
+  axisColor: string;
+  axisLabelColor: string;
+  axisTitleColor: string;
+  graphTitleColor: string;
+}
+
+/** GET /api/graph/palettes: ggprism's palettes and colour schemes, read from
+ *  the user's installed R package at runtime. available=false → use the
+ *  built-in palettes; `message` says why. */
+export interface GraphPalettes {
+  available: boolean;
+  source: string;
+  version: string | null;
+  r: string | null;
+  reason: null | "no_r" | "no_ggprism" | "probe_failed";
+  message: string;
+  /** Line / symbol colours, by palette name. */
+  colour: Record<string, string[]>;
+  /** Area fill colours, by palette name. */
+  fill: Record<string, string[]>;
+  themes: Record<string, PrismTheme>;
+}
+
 export type GraphPlotResult = RunRResponse & { warnings?: string[]; error?: string };
 
 export interface SaveRequest {
@@ -210,6 +255,8 @@ export const plotGraph = (table: GraphTable, analysis: GraphAnalysis, figure: Gr
   post<GraphPlotResult>("/api/graph/plot", { table, analysis, figure });
 
 export const getGraphSoftware = () => apiJson<SoftwareVersions>("/api/graph/software");
+
+export const getGraphPalettes = () => apiJson<GraphPalettes>("/api/graph/palettes");
 
 /** True when a route answered with an error envelope. */
 export const isGraphError = (r: unknown): r is GraphError =>
