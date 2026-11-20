@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { GraphAnalysis, GraphDoc, GraphFigure, Template } from "../api/graph";
 import * as M from "../components/graph/graphModel";
+import { sanitizeScratch, type ScratchDoc } from "../components/graph/scratchpad/scratchModel";
 
 /** What one undo step restores: the table, plus — for structural steps that
  *  move columns/rows around — everything indexed by column/row. */
@@ -40,13 +41,22 @@ export interface GraphState {
   docSerial: number;
   /** How the current document was opened. */
   openedAs: "new" | "sample" | "saved" | "draft";
+  /** The Scratchpad sheet as canonical JSON text ("" = empty). Saved with the
+   *  analysis, but never part of the statistics or the figure. */
+  scratch: string;
+  /** `scratch` at the last save/open (null when savedSnapshot is null). */
+  savedScratch: string | null;
 
   newDoc: (t: Template, sample: boolean) => void;
-  load: (p: { doc: GraphDoc; analysis?: Partial<GraphAnalysis>; figure?: Partial<GraphFigure>; name: string; id: number | null; saved: boolean }) => void;
+  load: (p: {
+    doc: GraphDoc; analysis?: Partial<GraphAnalysis>; figure?: Partial<GraphFigure>; name: string; id: number | null; saved: boolean;
+    /** Saved scratchpad (object, JSON text or null); sanitized. */
+    scratch?: unknown;
+  }) => void;
   close: () => void;
   setName: (name: string) => void;
   /** Saved as `id`; `sent` is exactly what was sent (later edits stay unsaved). */
-  markSaved: (id: number, name: string, sent: Pick<GraphState, "doc" | "analysis" | "figure">) => void;
+  markSaved: (id: number, name: string, sent: Pick<GraphState, "doc" | "analysis" | "figure" | "scratch">) => void;
   markRenamed: (name: string) => void;
   detach: () => void;
 
@@ -63,6 +73,10 @@ export interface GraphState {
   deleteRow: (r: number) => void;
   clearRow: (r: number) => void;
   paste: (anchor: M.PasteAnchor, text: string) => M.PasteResult | null;
+  /** Scratchpad → Data: optionally blank every value first, then paste — one undo step. */
+  sendBlock: (anchor: M.PasteAnchor, text: string, clearFirst: boolean) => M.PasteResult | null;
+  /** Replace the scratchpad text (touches nothing else: no undo step, no analysis/figure change). */
+  setScratch: (text: string) => void;
   undo: () => boolean;
 
   setAnalysis: (patch: Partial<GraphAnalysis> | ((a: GraphAnalysis) => GraphAnalysis)) => void;
@@ -73,7 +87,8 @@ export interface GraphState {
 export const snapshotKey = (s: Pick<GraphState, "name" | "doc" | "analysis" | "figure">) =>
   JSON.stringify({ name: s.name, doc: s.doc, analysis: s.analysis, figure: s.figure });
 
-export const isDirty = (s: GraphState) => !!s.doc && (s.savedSnapshot === null || s.savedSnapshot !== snapshotKey(s));
+export const isDirty = (s: GraphState) =>
+  !!s.doc && (s.savedSnapshot === null || s.scratch !== s.savedScratch || s.savedSnapshot !== snapshotKey(s));
 
 const paletteFields = (f: GraphFigure): Snapshot["palette"] => {
   const out: Record<string, unknown> = {};
@@ -159,6 +174,8 @@ export const useGraphStore = create<GraphState>((set, get) => {
     lastEditKey: null,
     docSerial: 0,
     openedAs: "new",
+    scratch: "",
+    savedScratch: null,
 
     newDoc: (t, sample) => {
       const doc = sample ? M.sampleDoc(t) : M.emptyDoc(t);
@@ -167,26 +184,31 @@ export const useGraphStore = create<GraphState>((set, get) => {
       // A fresh document only counts as changed once it is edited.
       set((s) => ({
         ...next, currentId: null, savedSnapshot: snapshotKey(next), undoStack: [], lastEditKey: null,
-        docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new",
+        docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new", scratch: "", savedScratch: "",
       }));
     },
 
-    load: ({ doc, analysis, figure, name, id, saved }) => {
+    load: ({ doc, analysis, figure, name, id, saved, scratch }) => {
       const merged = mergeSettings(doc, analysis, figure);
       const next = { doc, ...merged, name };
+      const sc = sanitizeScratch(scratch);
       set((s) => ({
         ...next, currentId: id, savedSnapshot: saved ? snapshotKey(next) : null, undoStack: [], lastEditKey: null,
-        docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft",
+        docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft", scratch: sc, savedScratch: saved ? sc : null,
       }));
     },
 
     close: () => set((s) => ({
       doc: null, name: "", currentId: null, savedSnapshot: null, undoStack: [], lastEditKey: null, docSerial: s.docSerial + 1,
+      scratch: "", savedScratch: null,
     })),
 
     setName: (name) => set({ name }),
 
-    markSaved: (id, name, sent) => set({ name, currentId: id, savedSnapshot: snapshotKey({ name, ...sent }) }),
+    markSaved: (id, name, sent) => set({
+      name, currentId: id, savedSnapshot: snapshotKey({ name, doc: sent.doc, analysis: sent.analysis, figure: sent.figure }),
+      savedScratch: sent.scratch,
+    }),
 
     // Renamed in the library: the saved version now carries the new name.
     markRenamed: (name) => set((s) => {
@@ -201,7 +223,9 @@ export const useGraphStore = create<GraphState>((set, get) => {
     }),
 
     // The open document's library record was deleted: keep it on screen, unsaved.
-    detach: () => set({ currentId: null, savedSnapshot: null }),
+    detach: () => set({ currentId: null, savedSnapshot: null, savedScratch: null }),
+
+    setScratch: (text) => set((s) => (s.scratch === text ? {} : { scratch: text })),
 
     setCell: (r, c, k, v) =>
       type(`c:${r}:${c}:${k}`, (doc) => {
@@ -290,6 +314,16 @@ export const useGraphStore = create<GraphState>((set, get) => {
       return res;
     },
 
+    sendBlock: (anchor, text, clearFirst) => {
+      const s = get();
+      if (!s.doc) return null;
+      const res = M.applyPaste(clearFirst ? M.clearValues(s.doc) : s.doc, anchor, text);
+      if (!res) return null;
+      const figure = M.followXLabel(M.resizeSeries(s.figure, res.doc.col_titles.length), s.doc.x_title, res.doc.x_title);
+      set({ doc: res.doc, figure, undoStack: pushUndo(s, true), lastEditKey: null });
+      return res;
+    },
+
     undo: () => {
       const s = get();
       const prev = s.undoStack[s.undoStack.length - 1];
@@ -334,12 +368,18 @@ export interface GraphDraft {
   analysis: GraphAnalysis;
   figure: GraphFigure;
   at: number;
+  /** Absent in drafts from older versions, and when it didn't fit (status "no_scratch"). */
+  scratchpad?: ScratchDoc | null;
+  /** The scratchpad had unsaved content but was left out to fit DRAFT_LIMIT: restoring
+   *  must not treat it as empty (saving that over the analysis would erase its scratchpad). */
+  scratchOmitted?: boolean;
 }
 
 /** "saved", or why the draft wasn't kept: "too_large" (over DRAFT_LIMIT) or
  *  "failed" (storage unavailable / quota). An older draft is removed either
- *  way, so a stale one can never be restored. */
-export type DraftStatus = "saved" | "too_large" | "failed";
+ *  way, so a stale one can never be restored. "no_scratch": the draft was kept
+ *  without the scratchpad, which alone would have taken it over the limit. */
+export type DraftStatus = "saved" | "too_large" | "failed" | "no_scratch";
 
 /** Save the open document's unsaved state as a local draft (best-effort). */
 export function writeDraft(s: GraphState): DraftStatus {
@@ -347,10 +387,20 @@ export function writeDraft(s: GraphState): DraftStatus {
   const drop = () => { try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ } };
   try {
     const draft: GraphDraft = { v: 1, name: s.name, currentId: s.currentId, doc: s.doc, analysis: s.analysis, figure: s.figure, at: Date.now() };
-    const text = JSON.stringify(draft);
-    if (text.length > DRAFT_LIMIT) { drop(); return "too_large"; }
-    localStorage.setItem(DRAFT_KEY, text);
-    return "saved";
+    const base = JSON.stringify(draft);
+    // The scratchpad is already canonical JSON text: splice it in, no double encoding.
+    const full = s.scratch ? `${base.slice(0, -1)},"scratchpad":${s.scratch}}` : base;
+    if (full.length <= DRAFT_LIMIT) {
+      localStorage.setItem(DRAFT_KEY, full);
+      return "saved";
+    }
+    const lean = s.scratch ? `${base.slice(0, -1)},"scratch_omitted":true}` : base;
+    if (s.scratch && lean.length <= DRAFT_LIMIT) {
+      localStorage.setItem(DRAFT_KEY, lean);
+      return "no_scratch";
+    }
+    drop();
+    return "too_large";
   } catch {
     drop();
     return "failed";
@@ -361,7 +411,7 @@ export function readDraft(): GraphDraft | null {
   try {
     const text = localStorage.getItem(DRAFT_KEY);
     if (!text) return null;
-    const d = JSON.parse(text) as Partial<GraphDraft>;
+    const d = JSON.parse(text) as Partial<GraphDraft> & { scratch_omitted?: unknown };
     const doc = M.migrateDoc(d.doc);
     if (!doc) return null;
     return {
@@ -372,6 +422,8 @@ export function readDraft(): GraphDraft | null {
       analysis: (d.analysis ?? {}) as GraphAnalysis,
       figure: (d.figure ?? {}) as GraphFigure,
       at: typeof d.at === "number" ? d.at : 0,
+      scratchpad: (d.scratchpad ?? null) as ScratchDoc | null,
+      scratchOmitted: d.scratch_omitted === true,
     };
   } catch {
     return null;

@@ -21,6 +21,17 @@ import {
 } from "../../api/graph";
 import { clearDraft, isDirty, readLastId, useGraphStore, writeLastId } from "../../store/graphStore";
 import { TEMPLATES, migrateDoc } from "./graphModel";
+import { flushScratch, scratchController, useScratchUi } from "./scratchpad/scratchBridge";
+
+/** After the inline name field closes, give the keyboard back to the Scratchpad grid
+ *  when it is on screen and nothing else took focus. */
+function refocusSheet(): void {
+  setTimeout(() => {
+    const a = document.activeElement;
+    if (!a || a === document.body) scratchController()?.focus();
+  }, 0);
+}
+import { SCRATCH_LIMIT, type ScratchDoc } from "./scratchpad/scratchModel";
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 export const MOD_KEY = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform) ? "⌘" : "Ctrl";
@@ -88,7 +99,9 @@ export function useGraphLibrary(): GraphLib {
       const saved = res.analysis;
       const doc = migrateDoc(saved.table);
       if (!doc) return "This analysis was saved by a newer version of the app and can't be opened here.";
-      useGraphStore.getState().load({ doc, analysis: saved.analysis, figure: saved.figure, name: saved.name, id: saved.id, saved: true });
+      useGraphStore.getState().load({
+        doc, analysis: saved.analysis, figure: saved.figure, name: saved.name, id: saved.id, saved: true, scratch: saved.scratchpad,
+      });
       writeLastId(saved.id);
       clearDraft();
       return null;
@@ -363,12 +376,19 @@ export function FileBar({ lib }: { lib: GraphLib }) {
   pendingRef.current = pending;
 
   const doSave = async (mode: "save" | "saveas", saveName: string, overwrite = false): Promise<boolean> => {
+    flushScratch({ commitEdit: true });   // commit an open scratchpad cell edit and serialise pending changes
     const s = useGraphStore.getState();
     if (!s.doc) return false;
-    const sent = { doc: s.doc, analysis: s.analysis, figure: s.figure };
+    if (s.scratch.length > SCRATCH_LIMIT) {
+      useScratchUi.setState({ over: true });
+      setErr("The scratchpad is too large to save. Delete some cells and try again.");
+      return false;
+    }
+    const sent = { doc: s.doc, analysis: s.analysis, figure: s.figure, scratch: s.scratch };
     const body = {
       id: mode === "save" ? s.currentId : null, name: saveName, template: s.doc.template,
       table: sent.doc, analysis: sent.analysis, figure: sent.figure, doc_version: 1 as const, overwrite,
+      scratchpad: sent.scratch ? (JSON.parse(sent.scratch) as ScratchDoc) : null,
     };
     setSaving(true);
     setErr(null);
@@ -387,6 +407,7 @@ export function FileBar({ lib }: { lib: GraphLib }) {
       clearDraft();
       setPrompt(null);
       setConflict(null);
+      refocusSheet();
       setSavedNote(res.replaced ? `Saved — replaced the earlier “${res.analysis.name}”.` : null);
       const p = pendingRef.current;
       if (p) { setPending(null); await p.run(); }
@@ -422,6 +443,7 @@ export function FileBar({ lib }: { lib: GraphLib }) {
 
   /** Run `action` now, or after the user deals with unsaved changes. */
   const guard = (label: string, run: () => void | Promise<void>) => {
+    flushScratch({ commitEdit: true });
     if (isDirty(useGraphStore.getState())) setPending({ label, run });
     else void run();
   };
@@ -439,6 +461,7 @@ export function FileBar({ lib }: { lib: GraphLib }) {
 
   const openFromDialog = (id: number) => {
     setOpenDialog(false);
+    flushScratch({ commitEdit: true });
     const before = useGraphStore.getState();
     const isCurrent = id === before.currentId;
     if (isCurrent && !isDirty(before)) return;
@@ -509,10 +532,10 @@ export function FileBar({ lib }: { lib: GraphLib }) {
           <Typography variant="body2" color="text.secondary" noWrap>{prompt.mode === "saveas" ? "Save a copy as" : "Save as"}</Typography>
           <TextField size="small" autoFocus value={prompt.value} placeholder="Analysis name" sx={{ width: 280 }}
             onChange={(e) => setPrompt({ ...prompt, value: e.target.value })}
-            onKeyDown={(e) => { if (e.key === "Enter") submitPrompt(); if (e.key === "Escape") setPrompt(null); }}
+            onKeyDown={(e) => { if (e.key === "Enter") submitPrompt(); if (e.key === "Escape") { setPrompt(null); refocusSheet(); } }}
             slotProps={{ htmlInput: { "aria-label": "Analysis name" } }} />
           <Button size="small" variant="contained" onClick={submitPrompt} disabled={saving}>Save</Button>
-          <Button size="small" color="inherit" onClick={() => setPrompt(null)}>Cancel</Button>
+          <Button size="small" color="inherit" onClick={() => { setPrompt(null); refocusSheet(); }}>Cancel</Button>
         </Stack>
       )}
 

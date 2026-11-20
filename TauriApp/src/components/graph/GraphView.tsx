@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
 import {
   Alert, Box, Button, Chip, CircularProgress, FormControlLabel, Stack, Switch, Tab, Tabs, Tooltip, Typography,
 } from "@mui/material";
@@ -8,7 +8,8 @@ import InsertChartOutlinedIcon from "@mui/icons-material/InsertChartOutlined";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import TableChartIcon from "@mui/icons-material/TableChart";
 import GridOnIcon from "@mui/icons-material/GridOn";
-import { analyzeGraph, plotGraph, type AnalyzeResult, type GraphPlotResult } from "../../api/graph";
+import CalculateOutlinedIcon from "@mui/icons-material/CalculateOutlined";
+import { analyzeGraph, getGraphAnalysis, isGraphError, plotGraph, type AnalyzeResult, type GraphPlotResult } from "../../api/graph";
 import { clearDraft, isDirty, readDraft, useGraphStore, writeDraft, type DraftStatus } from "../../store/graphStore";
 import { PlotResult } from "../shared/PlotResult";
 import { Workspace } from "../shared/Workspace";
@@ -20,6 +21,7 @@ import { GraphAnalysisControls } from "./GraphAnalysisControls";
 import { GraphFigureControls, TitleFields } from "./GraphFigureControls";
 import { FigureTextPanel, readTextPanelOpen, writeTextPanelOpen } from "./FigureTextPanel";
 import { GraphResults } from "./GraphResults";
+import { flushScratch, scratchController, useScratchUi } from "./scratchpad/scratchBridge";
 import {
   GRAPH_DEFAULT, MAX_COLS, MAX_REP, MAX_ROWS, POSTHOC_LABELS, TEST_LABELS, colHasData, countInvalid, defaultColTitle,
   effectiveAnalysis, effectiveFigure, formatP, hasNumbers, hasPosthoc, normalizeAnalysis, templateInfo, toNumericTable, usedCols,
@@ -27,7 +29,31 @@ import {
 } from "./graphModel";
 
 type Step = "table" | "analysis" | "graph";
-type CanvasTab = "data" | "graph" | "results";
+type CanvasTab = "scratch" | "data" | "graph" | "results";
+
+/** The Scratchpad (spreadsheet + formula engine) is its own chunk, loaded the first time the tab opens. */
+const ScratchpadTab = lazy(() => import("./scratchpad/ScratchpadTab"));
+
+/** Keeps a failed Scratchpad load from taking the Graphs tool down; its saved text stays in the store. */
+class ScratchBoundary extends Component<{ children: ReactNode }, { error: string | null; attempt: number }> {
+  state = { error: null as string | null, attempt: 0 };
+  static getDerivedStateFromError(e: unknown) { return { error: e instanceof Error ? e.message : String(e) }; }
+  componentDidCatch(_e: unknown, _info: ErrorInfo) { /* shown in the fallback */ }
+  render() {
+    if (this.state.error !== null) {
+      return (
+        <Box sx={{ flexGrow: 1, display: "grid", placeItems: "center" }}>
+          <Alert severity="error" action={
+            <Button color="inherit" size="small" onClick={() => this.setState((s) => ({ error: null, attempt: s.attempt + 1 }))}>Retry</Button>
+          }>
+            The scratchpad couldn't be loaded ({this.state.error}). Its saved contents are kept.
+          </Alert>
+        </Box>
+      );
+    }
+    return <Box key={this.state.attempt} sx={{ display: "flex", flexDirection: "column", flexGrow: 1, minHeight: 0 }}>{this.props.children}</Box>;
+  }
+}
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -93,6 +119,68 @@ const SIDE_PANEL_MIN_WIDTH = 640;
 /** Below this canvas width the side panel is narrower, to leave the figure room. */
 const SIDE_PANEL_WIDE_FROM = 900;
 
+/** Selection / size caption on the tab strip while the Scratchpad is shown. */
+function ScratchCaption() {
+  const ui = useScratchUi();
+  if (!ui.ready) return null;
+  const sel = ui.selRows * ui.selCols > 1 ? `${ui.sel} · ${ui.selRows} × ${ui.selCols}` : ui.sel;
+  return (
+    <Typography variant="caption" color="text.secondary" noWrap>
+      {sel} · {ui.cells} cell{ui.cells === 1 ? "" : "s"} filled
+    </Typography>
+  );
+}
+
+/** Rail section shown above the steps while the Scratchpad tab is open. */
+function ScratchRail() {
+  const ready = useScratchUi((s) => s.ready);
+  const cells = useScratchUi((s) => s.cells);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const run = (fn: (c: NonNullable<ReturnType<typeof scratchController>>) => void) => { const c = scratchController(); if (c) fn(c); };
+  return (
+    <RailSection step={0} icon={<CalculateOutlinedIcon sx={{ fontSize: 20 }} />} title="Scratchpad"
+      summary={ready ? `${cells} cell${cells === 1 ? "" : "s"} filled · saved with this analysis` : "Loading…"}
+      expanded onToggle={() => undefined}>
+      <Typography variant="body2" color="text.secondary">
+        A spreadsheet for working out values before they go into the Data table. Formulas work as in Excel
+        (=SUM(A1:A5), $A$1, IF, VLOOKUP, T.TEST …). It is saved with this analysis and never affects the statistics or the graph.
+      </Typography>
+      <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mt: 1.5 }}>
+        <Button size="small" variant="contained" disabled={!ready} onClick={() => run((c) => c.openSend())}>Send selection to Data…</Button>
+        <Button size="small" variant="outlined" disabled={!ready} onClick={() => run((c) => c.copy())}>Copy values</Button>
+        <Button size="small" color="error" disabled={!ready || cells === 0} onClick={() => setConfirmClear(true)}>Clear scratchpad…</Button>
+      </Stack>
+      {confirmClear && (
+        <Alert severity="warning" sx={{ mt: 1 }}
+          action={
+            <Stack direction="row" spacing={0.5}>
+              <Button color="inherit" size="small" onClick={() => { run((c) => c.clearAll()); setConfirmClear(false); }}>Clear</Button>
+              <Button color="inherit" size="small" onClick={() => setConfirmClear(false)}>Cancel</Button>
+            </Stack>
+          }>
+          Clear every cell of the scratchpad? ({MOD_KEY} + Z in the sheet undoes it.)
+        </Alert>
+      )}
+      <RailHeading>Keys</RailHeading>
+      <Typography variant="caption" color="text.secondary" component="div">
+        Enter / Tab move · F2 edit · F4 cycles $ · {MOD_KEY} + C / X / V · {MOD_KEY} + D / R fill down / right ·
+        {" "}{MOD_KEY} + Z / Shift + {MOD_KEY} + Z undo / redo · {MOD_KEY} + Enter fills the selection · drag the corner square to fill ·
+        right-click for insert / delete. Copied cells paste as their displayed values.
+      </Typography>
+      <RailHeading>Differences from Excel</RailHeading>
+      <Typography variant="caption" color="text.secondary" component="div">
+        One sheet; US number and date formats (1,234.5 and m/d/yyyy). Fractions typed as 1 1/2 are shown as 1.5, and =TIME()
+        results as a decimal unless a time format is chosen. The intersection ( ) and union ((A1:A2,B1:B2)) operators, @,
+        AGGREGATE and GROWTH aren't available; a formula Excel would refuse (or shows as #ERROR!) is refused. COUNT and
+        ISNUMBER don't look inside array expressions, so COUNT over one is refused. Circular references show #CIRC!.
+        Formulas over 500 operators or 64 levels deep are refused. Cutting a cell onto one that a formula refers to keeps
+        that formula (Excel turns it into #REF!). Formula results that change by themselves (TODAY, RAND) are recalculated
+        when the analysis is opened. Copied numbers are written plainly (12,500 → 12500, 50% → 0.5) so they paste as numbers.
+      </Typography>
+    </RailSection>
+  );
+}
+
 // Restore an unsaved document left over from the last session (once per app run).
 let draftChecked = false;
 
@@ -109,6 +197,8 @@ export function GraphView() {
 
   const name = useGraphStore((s) => s.name);
   const [restored, setRestored] = useState(false);
+  /** How the scratchpad was restored when the draft backup had to leave it out. */
+  const [scratchRestoreNote, setScratchRestoreNote] = useState<string | null>(null);
   /** Why unsaved changes aren't being kept as a local draft (null = they are, or nothing to keep). */
   const [draftProblem, setDraftProblem] = useState<Exclude<DraftStatus, "saved"> | null>(null);
   const [open, setOpen] = useState<Record<Step, boolean>>({ table: true, analysis: true, graph: false });
@@ -141,7 +231,34 @@ export function GraphView() {
     const d = readDraft();
     if (!d) return;
     // openedAs "draft" makes the per-document effect show the "restored" notice.
-    store.getState().load({ doc: d.doc, analysis: d.analysis, figure: d.figure, name: d.name, id: d.currentId, saved: false });
+    const restore = (scratch: unknown, id: number | null, name: string, note: string | null) => {
+      store.getState().load({ doc: d.doc, analysis: d.analysis, figure: d.figure, name, id, saved: false, scratch });
+      setScratchRestoreNote(note);
+    };
+    if (!d.scratchOmitted) { restore(d.scratchpad, d.currentId, d.name, null); return; }
+    // The scratchpad was too large for the backup. Never restore it as empty under the
+    // saved analysis's id (saving would erase the saved scratchpad): use the saved one.
+    if (d.currentId === null) {
+      restore(null, null, d.name, "The scratchpad was too large for the automatic backup, so it couldn't be restored.");
+      return;
+    }
+    const id = d.currentId;
+    let tries = 0;
+    const attempt = () => {
+      getGraphAnalysis(id).then((res) => {
+        if (store.getState().doc) return;
+        if (isGraphError(res) || !res.analysis) throw new Error("not available");
+        restore(res.analysis.scratchpad ?? null, id, d.name,
+          "The scratchpad was too large for the automatic backup: its last saved version was restored.");
+      }).catch(() => {
+        if (store.getState().doc) return;
+        if (++tries < 5) { setTimeout(attempt, 1500); return; }
+        restore(null, null, d.name ? `${d.name} (recovered)` : "",
+          "The scratchpad was too large for the automatic backup and its saved version couldn't be read, so these changes were restored "
+          + "as a new, unsaved analysis (saving it won't overwrite the saved one).");
+      });
+    };
+    attempt();
   }, [store]);
 
   // ── autosave unsaved changes as a local draft (debounced) ─────────────────
@@ -149,9 +266,10 @@ export function GraphView() {
     let t: ReturnType<typeof setTimeout> | null = null;
     const unsub = store.subscribe((s, prev) => {
       if (s.doc === prev.doc && s.analysis === prev.analysis && s.figure === prev.figure && s.name === prev.name
-        && s.savedSnapshot === prev.savedSnapshot) return;
+        && s.savedSnapshot === prev.savedSnapshot && s.scratch === prev.scratch && s.savedScratch === prev.savedScratch) return;
       if (t) clearTimeout(t);
       t = setTimeout(() => {
+        flushScratch();
         const cur = store.getState();
         if (isDirty(cur)) {
           const st = writeDraft(cur);
@@ -185,6 +303,7 @@ export function GraphView() {
     setGraphSeen(showGraph);
     setOpen({ table: !showGraph, analysis: true, graph: showGraph });
     setRestored(openedAs === "draft");
+    if (openedAs !== "draft") setScratchRestoreNote(null);
   }, [docSerial, openedAs]);
 
   // ── derived data ──────────────────────────────────────────────────────────
@@ -429,6 +548,8 @@ export function GraphView() {
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey) || !hasData) return;
+    // ⌘/Ctrl+Enter inside the Scratchpad commits a cell (Excel), it doesn't render the graph.
+    if ((e.target as HTMLElement | null)?.closest?.("[data-scratchpad]")) return;
     e.preventDefault();
     setCanvasTab("graph");
     void renderPlot();
@@ -442,21 +563,32 @@ export function GraphView() {
     setPasteNote({ tone: r.truncated ? "warning" : "success", text: `${parts.join("; ")}. ${MOD_KEY} + Z undoes it.` });
   };
 
-  const dataBody = (
-    <Stack spacing={1.25} sx={{ minHeight: 0, flexGrow: 1 }}>
+  const sharedAlerts = (
+    <>
       {restored && (
         <Alert severity="info" onClose={() => setRestored(false)}>
           Unsaved changes restored from your last session.
         </Alert>
       )}
-      {pasteNote && <Alert severity={pasteNote.tone} onClose={() => setPasteNote(null)}>{pasteNote.text}</Alert>}
+      {scratchRestoreNote && (
+        <Alert severity="warning" onClose={() => setScratchRestoreNote(null)}>{scratchRestoreNote}</Alert>
+      )}
       {draftProblem && (
         <Alert severity="warning">
           {draftProblem === "too_large"
             ? "This table is too large to keep unsaved changes automatically. Save it to keep your changes."
-            : "Unsaved changes couldn't be kept as a local backup. Save to keep your changes."}
+            : draftProblem === "no_scratch"
+              ? "The scratchpad is too large to be included in the automatic backup of unsaved changes. Save to keep it."
+              : "Unsaved changes couldn't be kept as a local backup. Save to keep your changes."}
         </Alert>
       )}
+    </>
+  );
+
+  const dataBody = (
+    <Stack spacing={1.25} sx={{ minHeight: 0, flexGrow: 1 }}>
+      {sharedAlerts}
+      {pasteNote && <Alert severity={pasteNote.tone} onClose={() => setPasteNote(null)}>{pasteNote.text}</Alert>}
       {invalid > 0 && (
         <Alert severity="warning">
           {invalid} cell{invalid === 1 ? " is" : "s are"} not {invalid === 1 ? "a number" : "numbers"} and {invalid === 1 ? "was" : "were"} ignored (outlined in red).
@@ -522,14 +654,33 @@ export function GraphView() {
       rowTitles={table.row_titles} withinTitles={withinCols ? colNames : table.row_titles} baseName={baseName} />
   );
 
-  const body = canvasTab === "data" ? dataBody : canvasTab === "graph" ? graphBody : resultsBody;
+  const scratchBody = (
+    <Stack spacing={1.25} sx={{ minHeight: 0, flexGrow: 1 }}>
+      {sharedAlerts}
+      <ScratchBoundary>
+        <Suspense fallback={
+          <Box sx={{ flexGrow: 1, display: "grid", placeItems: "center" }}>
+            <Stack alignItems="center" spacing={1.5}>
+              <CircularProgress size={28} />
+              <Typography variant="body2" color="text.secondary">Loading the scratchpad…</Typography>
+            </Stack>
+          </Box>
+        }>
+          <ScratchpadTab onSent={(r) => { onPasted(r); setCanvasTab("data"); }} />
+        </Suspense>
+      </ScratchBoundary>
+    </Stack>
+  );
+
+  const body = canvasTab === "scratch" ? scratchBody : canvasTab === "data" ? dataBody : canvasTab === "graph" ? graphBody : resultsBody;
   const tabSx = { minHeight: 44 };
 
   return (
-    <Workspace rail={<>{tableSection}{analysisSection}{graphSection}</>} railFooter={railFooter} onKeyDown={onKeyDown}>
+    <Workspace rail={<>{canvasTab === "scratch" && <ScratchRail />}{tableSection}{analysisSection}{graphSection}</>} railFooter={railFooter} onKeyDown={onKeyDown}>
       <FileBar lib={lib} />
       <Box sx={{ display: "flex", alignItems: "center", px: 2, borderBottom: 1, borderColor: "divider", flexShrink: 0, minHeight: 44 }}>
         <Tabs value={canvasTab} onChange={(_, v) => setCanvasTab(v)} variant="scrollable" scrollButtons={false} sx={tabSx}>
+          <Tab value="scratch" label="Scratchpad" icon={<CalculateOutlinedIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
           <Tab value="data" label="Data" icon={<GridOnIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
           <Tab value="graph" label="Graph" icon={<InsertChartOutlinedIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
           <Tab value="results" label="Results" icon={<TableChartIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
@@ -544,6 +695,8 @@ export function GraphView() {
           <Typography variant="caption" color="text.secondary" noWrap>
             {figure.width} × {figure.height} px · {figure.dpi} dpi · {figure.export_format.toUpperCase()}
           </Typography>
+        ) : canvasTab === "scratch" ? (
+          <ScratchCaption />
         ) : canvasTab === "results" && result?.test ? (
           <Chip size="small" variant="outlined" label={`${result.test.label}: P ${formatP(result.test.p)} ${result.test.star || "ns"}`} />
         ) : null}

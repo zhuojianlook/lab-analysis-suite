@@ -5,6 +5,7 @@
 
 import { apiJson } from "./client";
 import type { RunRResponse } from "./types";
+import type { ScratchDoc } from "../components/graph/scratchpad/scratchModel";
 
 export type Template = "column" | "grouped" | "xy";
 export type Num = number | null;
@@ -117,6 +118,8 @@ export interface GraphSaved extends GraphSummary {
   analysis: GraphAnalysis;
   figure: GraphFigure;
   doc_version: number;
+  /** The Scratchpad sheet; null when empty, absent from older sidecars. */
+  scratchpad?: unknown | null;
 }
 
 export interface GraphLibraryList {
@@ -222,6 +225,8 @@ export interface SaveRequest {
   figure: GraphFigure;
   doc_version: 1;
   overwrite: boolean;
+  /** Saved with the analysis; never sent to /analyze or /plot. */
+  scratchpad: ScratchDoc | null;
 }
 
 export type SaveResponse =

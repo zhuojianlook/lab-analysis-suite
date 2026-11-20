@@ -5,8 +5,10 @@ parseApi shows them instead of throwing; the Rust proxy has no DELETE, so
 deletes are POST):
 
   GET  /api/graph/library                -> {analyses, path}
-  GET  /api/graph/library/get?id=        -> {analysis}
+  GET  /api/graph/library/get?id=        -> {analysis}   (analysis.scratchpad: object or null)
   POST /api/graph/library/save           -> {analysis, replaced, analyses, path}
+                                            (body may carry "scratchpad": {v, cells, cols?} or null;
+                                             never sent to /analyze or /plot)
   POST /api/graph/library/rename         -> {analysis, analyses, path}
   POST /api/graph/library/duplicate      -> {analysis, analyses, path}
   POST /api/graph/library/delete         -> {analyses, path}
@@ -116,7 +118,7 @@ def library_save(body: Any = Body(None)):
         b = _body(body)
         summary, replaced = lib.save_analysis(
             _id(b.get("id")), b.get("name"), b.get("template"), b.get("table"), b.get("analysis"),
-            b.get("figure"), b.get("doc_version", 1), bool(b.get("overwrite", False)))
+            b.get("figure"), b.get("doc_version", 1), bool(b.get("overwrite", False)), scratchpad=b.get("scratchpad"))
         return {"analysis": summary, "replaced": replaced, **_listing()}
     except lib.LibraryError as e:
         return _err(e)

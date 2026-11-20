@@ -93,6 +93,10 @@ export function defaultColTitle(t: Template, i: number): string {
 // ── cell parsing ────────────────────────────────────────────────────────────
 
 const NUMERIC = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+/** The system locale writes 1.5 as "1,5". */
+const DECIMAL_COMMA = (() => {
+  try { return new Intl.NumberFormat().formatToParts(1.5).find((p) => p.type === "decimal")?.value === ","; } catch { return false; }
+})();
 
 /** Parse one cell's raw text. Empty → missing (not invalid). A single decimal
  *  comma ("1,5") is read as a decimal point. Anything else that isn't a plain
@@ -100,7 +104,10 @@ const NUMERIC = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
 export function parseCell(raw: string | null | undefined): { value: number | null; invalid: boolean } {
   let s = (raw ?? "").trim();
   if (s === "") return { value: null, invalid: false };
-  if (/^-?\d+,\d+$/.test(s)) s = s.replace(",", ".");
+  // "12,500" / "1,234,567.5": thousands separators (how Excel copies formatted numbers);
+  // a lone "d,ddd" is only read as a decimal comma when the system locale writes decimals that way.
+  if (/^[+-]?[1-9]\d{0,2}(,\d{3})+(\.\d+)?$/.test(s) && (!DECIMAL_COMMA || /,\d{3},|\./.test(s))) s = s.replace(/,/g, "");
+  else if (/^-?\d+,\d+$/.test(s)) s = s.replace(",", ".");
   if (!NUMERIC.test(s)) return { value: null, invalid: true };
   const n = Number(s);
   return Number.isFinite(n) ? { value: n, invalid: false } : { value: null, invalid: true };
@@ -399,7 +406,19 @@ export function flatColAt(doc: GraphDoc, fc: number): FlatCol {
 export function parsePaste(text: string): string[][] {
   const lines = text.split(/\r?\n/);
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  return lines.map((l) => l.split("\t"));
+  return decimalCommaBlock(lines.map((l) => l.split("\t")));
+}
+
+/** One pasted block uses one decimal convention. "1,500" alone is ambiguous
+ *  (parseCell reads it as 1500 on a decimal-point system), but if the same block
+ *  also holds an unmistakable decimal comma ("0,500", "12,34", "1,5"), every
+ *  single-comma number in it is a decimal comma: "1,500" → "1.500". */
+function decimalCommaBlock(lines: string[][]): string[][] {
+  const single = /^\s*[+-]?\d+,\d+\s*$/;
+  const ambiguous = /^\s*[+-]?[1-9]\d{0,2},\d{3}\s*$/;
+  const clear = lines.some((l) => l.some((v) => single.test(v) && !ambiguous.test(v)));
+  if (!clear) return lines;
+  return lines.map((l) => l.map((v) => (single.test(v) ? v.replace(",", ".") : v)));
 }
 
 /** Multi-cell paste? (single values are left to the input's own paste). */
@@ -486,6 +505,44 @@ export function applyPaste(doc: GraphDoc, anchor: PasteAnchor, text: string): Pa
   next = ensureRows(next);
   if (!truncated && groupsNeeded > next.col_titles.length) truncated = true;
   return { doc: next, truncated, titles: !!titleLine, rows: lines.length, cols: width };
+}
+
+/** Blank every value, X value and row title, keeping titles and the table's shape. */
+export function clearValues(doc: GraphDoc): GraphDoc {
+  return ensureRows({
+    ...doc,
+    x: doc.x.map(() => ""),
+    row_titles: doc.row_titles.map(() => ""),
+    cells: doc.cells.map((row) => row.map((reps) => reps.map(() => ""))),
+  });
+}
+
+export interface PastePreview {
+  /** Non-blank values (cells, X values, row titles) the paste would change. */
+  overwritten: number;
+  truncated: boolean;
+  titles: boolean;
+  rows: number;
+  cols: number;
+}
+
+/** What pasting `text` at `anchor` would do (nothing is changed). With
+ *  `clearFirst`, every existing value that ends up different counts as replaced. */
+export function previewPaste(doc: GraphDoc, anchor: PasteAnchor, text: string, clearFirst = false): PastePreview | null {
+  const res = applyPaste(clearFirst ? clearValues(doc) : doc, anchor, text);
+  if (!res) return null;
+  const nd = res.doc;
+  let overwritten = 0;
+  const differs = (a: string | undefined, b: string | undefined) => !isBlank(a) && (a ?? "").trim() !== (b ?? "").trim();
+  for (let r = 0; r < doc.cells.length; r++) {
+    if (differs(doc.x[r], nd.x[r])) overwritten++;
+    if (differs(doc.row_titles[r], nd.row_titles[r])) overwritten++;
+    const row = doc.cells[r];
+    for (let c = 0; c < row.length; c++) {
+      for (let k = 0; k < row[c].length; k++) if (differs(row[c][k], nd.cells[r]?.[c]?.[k])) overwritten++;
+    }
+  }
+  return { overwritten, truncated: res.truncated, titles: res.titles, rows: res.rows, cols: res.cols };
 }
 
 // ── statistics options ──────────────────────────────────────────────────────

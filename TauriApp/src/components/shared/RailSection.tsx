@@ -28,9 +28,11 @@ function StepBadge({ step, done }: { step: number; done?: boolean }) {
 }
 
 /** One collapsible step of a control rail: badge + title + one-line status
- *  summary in the header. Disabled steps are shown dimmed and can't open. */
+ *  summary in the header. Disabled steps are shown dimmed and can't open.
+ *  `icon` replaces the numbered badge (a section that isn't a step). */
 export function RailSection({
   step,
+  icon,
   title,
   summary,
   done,
@@ -40,6 +42,7 @@ export function RailSection({
   children,
 }: {
   step: number;
+  icon?: ReactNode;
   title: string;
   summary?: ReactNode;
   done?: boolean;
@@ -73,7 +76,9 @@ export function RailSection({
           "& .MuiAccordionSummary-content": { my: 1, alignItems: "center", gap: 1.25, minWidth: 0 },
         }}
       >
-        <StepBadge step={step} done={done} />
+        {icon ? (
+          <Box sx={{ width: 22, height: 22, flexShrink: 0, display: "grid", placeItems: "center", color: "primary.main" }}>{icon}</Box>
+        ) : <StepBadge step={step} done={done} />}
         <Box sx={{ minWidth: 0 }}>
           <Typography variant="subtitle2" sx={{ lineHeight: 1.25 }}>{title}</Typography>
           {summary && (

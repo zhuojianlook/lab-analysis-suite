@@ -1,8 +1,11 @@
 """Saved Graphs analyses — a small SQLite database in the app-data dir.
 
 Each saved analysis is one row holding the data table (GraphDoc), the analysis
-settings and the figure settings as opaque JSON blobs, so the frontend can
-evolve its document shape (doc_version) without a schema change here. Names
+settings, the figure settings and the scratchpad (an Excel-like sheet of cell
+inputs, frontend-owned shape with its own "v") as opaque JSON blobs, so the
+frontend can evolve its document shape (doc_version) without a schema change
+here. Schema v2 added the scratchpad_json column ('' = no scratchpad); older
+libraries are migrated in place on first use, keeping every row. Names
 are unique ignoring case. Re-saving an analysis replaces its row and gives it
 a NEW id (as the qPCR run library does): the UI keys rendered results on ids,
 so changed data must never look like the old analysis. created_at survives a
@@ -21,12 +24,13 @@ from typing import Any, List, Optional
 
 import r_settings
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_BYTES = 5 * 1024 * 1024
+MAX_SCRATCH_BYTES = 2 * 1024 * 1024   # the scratchpad has its own cap, separate from MAX_BYTES
 MAX_NAME = 200
 MAX_INT = 2 ** 63 - 1     # SQLite INTEGER range
-_COLUMNS = {"id", "name", "template", "table_json", "analysis_json", "figure_json", "doc_version",
-            "created_at", "updated_at"}
+_COLUMNS = {"id", "name", "template", "table_json", "analysis_json", "figure_json", "scratchpad_json",
+            "doc_version", "created_at", "updated_at"}
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 _SCHEMA = """
@@ -37,6 +41,7 @@ CREATE TABLE IF NOT EXISTS analyses (
     table_json    TEXT NOT NULL,
     analysis_json TEXT NOT NULL,
     figure_json   TEXT NOT NULL,
+    scratchpad_json TEXT NOT NULL DEFAULT '',
     doc_version   INTEGER NOT NULL,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
@@ -67,11 +72,20 @@ def _connect():
             raise LibraryError(f"The Graphs library at {db_path()} was created by a newer version of the app. "
                                "Update the app to open it.", "db")
         con.executescript(_SCHEMA)
-        have = {r[1] for r in con.execute("PRAGMA table_info(analyses)").fetchall()}
+        have = _table_columns(con)
+        # v1 -> v2: add the scratchpad column to an existing library (rows keep all data).
+        if "scratchpad_json" not in have and (_COLUMNS - {"scratchpad_json"}) <= have:
+            try:
+                con.execute("ALTER TABLE analyses ADD COLUMN scratchpad_json TEXT NOT NULL DEFAULT ''")
+                con.commit()
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():   # another connection migrated first
+                    raise
+            have = _table_columns(con)
         if not _COLUMNS <= have:
             raise LibraryError(f"The Graphs library at {db_path()} has an unexpected format "
                                f"(missing {', '.join(sorted(_COLUMNS - have))}).", "db")
-        if ver == 0:
+        if ver < SCHEMA_VERSION:
             con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             con.commit()
     except sqlite3.Error as e:
@@ -95,6 +109,10 @@ def _connect():
         raise
     finally:
         con.close()
+
+
+def _table_columns(con) -> set:
+    return {r[1] for r in con.execute("PRAGMA table_info(analyses)").fetchall()}
 
 
 def _rollback(con) -> None:
@@ -190,6 +208,40 @@ def _find_name(con, name: str, exclude_id: Optional[int] = None):
 _SUMMARY_COLS = "id, name, template, table_json, created_at, updated_at"
 
 
+def _scratch_json(scratchpad: Any) -> str:
+    """The scratchpad blob as stored ('' = none). Its shape belongs to the
+    frontend; only the envelope ({"v": int, "cells": [...]}) and size are checked."""
+    if scratchpad is None:
+        return ""
+    if not isinstance(scratchpad, dict):
+        raise LibraryError("'scratchpad' must be an object.", "invalid")
+    v, cells = scratchpad.get("v"), scratchpad.get("cells")
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= MAX_INT or not isinstance(cells, list):
+        raise LibraryError("The scratchpad has an unexpected format.", "invalid")
+    cols = scratchpad.get("cols")
+    if not cells and not (isinstance(cols, dict) and cols):
+        return ""
+    try:
+        text = json.dumps(_scrub(scratchpad), allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError) as e:
+        raise LibraryError(f"The scratchpad can't be stored ({e}).", "invalid") from e
+    if len(text) > MAX_SCRATCH_BYTES:
+        raise LibraryError("The scratchpad is too large to save (over 2 MB).", "invalid")
+    return text
+
+
+def _parse_scratch(text: Any) -> Optional[dict]:
+    """Stored scratchpad -> dict, or None when empty or damaged (a damaged
+    scratchpad must never stop the analysis itself from opening)."""
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        v = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
 def list_analyses() -> List[dict]:
     with _connect() as con:
         rows = con.execute(f"SELECT {_SUMMARY_COLS} FROM analyses ORDER BY updated_at DESC, id DESC").fetchall()
@@ -198,8 +250,8 @@ def list_analyses() -> List[dict]:
 
 def get_analysis(aid: int) -> dict:
     with _connect() as con:
-        row = con.execute(f"SELECT {_SUMMARY_COLS}, analysis_json, figure_json, doc_version FROM analyses WHERE id = ?",
-                          (int(aid),)).fetchone()
+        row = con.execute(f"SELECT {_SUMMARY_COLS}, analysis_json, figure_json, doc_version, scratchpad_json "
+                          "FROM analyses WHERE id = ?", (int(aid),)).fetchone()
     if not row:
         raise LibraryError("That saved analysis no longer exists.", "not_found")
     out = _summary(row[:6])
@@ -207,6 +259,7 @@ def get_analysis(aid: int) -> dict:
         out.update(table=json.loads(row[3]), analysis=json.loads(row[6]), figure=json.loads(row[7]), doc_version=row[8])
     except (TypeError, ValueError) as e:
         raise LibraryError("This saved analysis is damaged and can't be opened.", "db") from e
+    out["scratchpad"] = _parse_scratch(row[9])
     return out
 
 
@@ -215,7 +268,7 @@ def _summary_by_id(con, aid: int) -> dict:
 
 
 def save_analysis(aid: Optional[int], name: Any, template: Any, table: Any, analysis: Any, figure: Any,
-                  doc_version: Any = 1, overwrite: bool = False):
+                  doc_version: Any = 1, overwrite: bool = False, scratchpad: Any = None):
     """Insert or replace. Returns (summary, replaced)."""
     name = _clean_name(name)
     if template not in ("column", "grouped", "xy"):
@@ -233,6 +286,7 @@ def save_analysis(aid: Optional[int], name: Any, template: Any, table: Any, anal
         raise LibraryError(f"The analysis can't be stored ({e}).", "invalid") from e
     if len(tj) + len(aj) + len(fj) > MAX_BYTES:
         raise LibraryError("The analysis is too large to save (over 5 MB).", "invalid")
+    sj = _scratch_json(scratchpad)
     now = _now()
     with _connect() as con:
         con.execute("BEGIN IMMEDIATE")
@@ -254,9 +308,9 @@ def save_analysis(aid: Optional[int], name: Any, template: Any, table: Any, anal
             cur = con.execute("DELETE FROM analyses WHERE id = ?", (int(aid),))
             replaced = replaced or cur.rowcount > 0
         new_id = con.execute(
-            "INSERT INTO analyses (name, template, table_json, analysis_json, figure_json, doc_version, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (name, template, tj, aj, fj, doc_version, created or now, now),
+            "INSERT INTO analyses (name, template, table_json, analysis_json, figure_json, scratchpad_json, doc_version, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, template, tj, aj, fj, sj, doc_version, created or now, now),
         ).lastrowid
         summary = _summary_by_id(con, new_id)
     return summary, replaced
@@ -278,7 +332,7 @@ def rename_analysis(aid: int, name: Any) -> dict:
 def duplicate_analysis(aid: int, name: Any = None) -> dict:
     with _connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        row = con.execute("SELECT name, template, table_json, analysis_json, figure_json, doc_version "
+        row = con.execute("SELECT name, template, table_json, analysis_json, figure_json, scratchpad_json, doc_version "
                           "FROM analyses WHERE id = ?", (int(aid),)).fetchone()
         if not row:
             raise LibraryError("That saved analysis no longer exists.", "not_found")
@@ -298,8 +352,8 @@ def duplicate_analysis(aid: int, name: Any = None) -> dict:
                 raise LibraryError(f"An analysis named '{clash['name']}' already exists.", "name_exists", clash)
         now = _now()
         new_id = con.execute(
-            "INSERT INTO analyses (name, template, table_json, analysis_json, figure_json, doc_version, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (new_name, *row[1:], now, now)).lastrowid
+            "INSERT INTO analyses (name, template, table_json, analysis_json, figure_json, scratchpad_json, doc_version, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (new_name, *row[1:], now, now)).lastrowid
         return _summary_by_id(con, new_id)
 
 
