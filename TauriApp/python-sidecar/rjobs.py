@@ -31,7 +31,9 @@ mpfig_plot <- function(filename=NULL, width=1200, height=900, res=150) {{
   while (dev.cur() > 1) try(dev.off(), silent=TRUE)
   .plot_count <<- .plot_count + 1
   if (is.null(filename)) filename <- sprintf("plot_%02d.png", .plot_count)
-  grDevices::png(file.path(.plot_dir, filename), width=width, height=height, res=res)
+  # cairo: exact colours (quartz colour-manages them); default device if R lacks cairo
+  if (isTRUE(capabilities("cairo"))) grDevices::png(file.path(.plot_dir, filename), width=width, height=height, res=res, type="cairo")
+  else grDevices::png(file.path(.plot_dir, filename), width=width, height=height, res=res)
 }}
 mpfig_data <- function(df, name="table") {{
   utils::write.csv(df, file.path(.table_dir, paste0(name, ".csv")), row.names=FALSE); invisible(df)

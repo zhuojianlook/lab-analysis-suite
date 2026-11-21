@@ -160,13 +160,23 @@ data <- if (file.exists("{dp}") && file.info("{dp}")$size > 1) read.csv("{dp}", 
 .plot_count <- 0
 .export_count <- 0
 
+# Bitmap device type: cairo writes colours exactly as given (macOS's quartz
+# device colour-manages them, e.g. #f71480 came out #f1006d). Falls back to the
+# platform default when R lacks cairo, or for TIFF when R lacks libtiff.
+.mpfig_dev <- function(dev, file, ...) {{
+  type <- if (isTRUE(capabilities("cairo")) &&
+              (!identical(dev, "tiff") || isTRUE(capabilities("tiff")))) "cairo" else NULL
+  args <- c(list(file, ...), if (!is.null(type)) list(type = type))
+  do.call(if (identical(dev, "tiff")) grDevices::tiff else grDevices::png, args)
+}}
+
 # Open a PNG device for the next plot. Call before each ggplot print().
 # bg may be "white" (default) or "transparent".
 mpfig_plot <- function(filename = NULL, width = 1200, height = 900, res = 150, bg = "white") {{
   while (dev.cur() > 1) try(dev.off(), silent = TRUE)
   .plot_count <<- .plot_count + 1
   if (is.null(filename)) filename <- sprintf("plot_%02d.png", .plot_count)
-  grDevices::png(file.path(.plot_dir, filename), width = width, height = height, res = res, bg = bg)
+  .mpfig_dev("png", file.path(.plot_dir, filename), width = width, height = height, res = res, bg = bg)
 }}
 
 # Render a ggplot object to (a) a PNG preview the WebView can display, and
@@ -184,9 +194,9 @@ mpfig_render <- function(p, width = 1200, height = 900, res = 150, format = "png
     ext <- if (fmt %in% c("tiff", "tif")) "tiff" else "png"
     ef <- file.path(.export_dir, sprintf("export_%02d.%s", .export_count, ext))
     if (ext == "tiff") {{
-      grDevices::tiff(ef, width = width, height = height, res = res, bg = bg, compression = "lzw")
+      .mpfig_dev("tiff", ef, width = width, height = height, res = res, bg = bg, compression = "lzw")
     }} else {{
-      grDevices::png(ef, width = width, height = height, res = res, bg = bg)
+      .mpfig_dev("png", ef, width = width, height = height, res = res, bg = bg)
     }}
     print(p)
     while (dev.cur() > 1) try(dev.off(), silent = TRUE)
