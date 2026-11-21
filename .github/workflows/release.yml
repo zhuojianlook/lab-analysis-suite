@@ -212,9 +212,12 @@ jobs:
           echo "LAS_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
         shell: bash
 
+      # `-- --locked` is passed through to cargo: build exactly the committed
+      # src-tauri/Cargo.lock (fails if it is stale instead of silently
+      # resolving newer crates). Refresh the lock locally when Cargo.toml changes.
       - name: Build Tauri (with updater signing)
         working-directory: TauriApp
-        run: npx tauri build --bundles ${{ matrix.bundles }}
+        run: npx tauri build --bundles ${{ matrix.bundles }} -- --locked
         shell: bash
 
       # macOS: sign WITHOUT hardened runtime (so the bundled R dylibs + sidecar

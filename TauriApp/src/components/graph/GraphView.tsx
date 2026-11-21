@@ -23,8 +23,8 @@ import { FigureTextPanel, readTextPanelOpen, writeTextPanelOpen } from "./Figure
 import { GraphResults } from "./GraphResults";
 import { flushScratch, scratchController, useScratchUi } from "./scratchpad/scratchBridge";
 import {
-  GRAPH_DEFAULT, MAX_COLS, MAX_REP, MAX_ROWS, POSTHOC_LABELS, TEST_LABELS, colHasData, countInvalid, defaultColTitle,
-  effectiveAnalysis, effectiveFigure, formatP, hasNumbers, hasPosthoc, normalizeAnalysis, templateInfo, toNumericTable, usedCols,
+  MAX_COLS, MAX_REP, MAX_ROWS, POSTHOC_LABELS, TEST_LABELS, colHasData, countInvalid, defaultColTitle,
+  effectiveAnalysis, effectiveFigure, formatP, hasNumbers, hasPosthoc, templateInfo, toNumericTable, usedCols,
   usedRows, valuesBeyondRep, type PasteResult,
 } from "./graphModel";
 
@@ -322,11 +322,12 @@ export function GraphView() {
   );
   const entities = withinCols ? table?.row_titles ?? [] : colNames;
 
-  // Keep the test / post-hoc / indices valid for the data as it changes.
+  // Keep the test / post-hoc / indices valid for the data as it changes. The
+  // store's load already did this for a newly opened document (before taking
+  // its saved baseline), so this changes nothing on open — only after edits.
   useEffect(() => {
     if (!doc || !hasData) return;
-    setAnalysis((a) => normalizeAnalysis(a, { template: doc.template, nGroups, nRows, nEntities: nEntitiesAll }));
-    if (!templateInfo(doc.template).graphs.some((g) => g.id === figure.graph_type)) setFigure({ graph_type: GRAPH_DEFAULT[doc.template] });
+    store.getState().normalize();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docSerial, hasData, nGroups, nRows, nEntitiesAll, analysis.within]);
 

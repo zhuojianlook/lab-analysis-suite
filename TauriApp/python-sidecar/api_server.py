@@ -8,6 +8,7 @@ PyInstaller --onefile binary and proxies HTTP to it on 127.0.0.1:<port>.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 print("[api-server] booting (loading analysis libraries)…", flush=True)
@@ -114,13 +115,59 @@ for _mod in ("platemap", "qpcr", "xcelligence", "rnaseq", "scrna", "spatial", "m
         print(f"[startup] failed to load {_mod} router: {_e}", file=sys.stderr, flush=True)
 
 
+def _watch_parent(pid: int) -> None:
+    """Exit when the app that started us is gone (crash, force-quit), so an
+    orphaned engine never keeps the port for the next launch."""
+    import threading
+    import time
+
+    started_under = os.getppid() if os.name != "nt" else None
+
+    def alive() -> bool:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            if not h:
+                return False
+            try:
+                return k32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+            finally:
+                k32.CloseHandle(h)
+        # Re-parented (to launchd/init) means the app is gone, even if its pid
+        # was reused by something else.
+        if started_under == pid and os.getppid() != pid:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def loop() -> None:
+        while True:
+            time.sleep(2)
+            if not alive():
+                print(f"[api-server] parent {pid} gone; exiting", flush=True)
+                os._exit(0)
+
+    threading.Thread(target=loop, daemon=True, name="parent-watch").start()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Lab Analysis Suite sidecar")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--r-env-dir", dest="r_env_dir", default=None,
                         help="Path to the bundled R engine (relocated conda env).")
+    parser.add_argument("--parent-pid", dest="parent_pid", type=int, default=None,
+                        help="Exit when this process (the app) is gone.")
     args = parser.parse_args()
+
+    if args.parent_pid:
+        _watch_parent(args.parent_pid)
 
     config.set_r_env_dir(args.r_env_dir)
 

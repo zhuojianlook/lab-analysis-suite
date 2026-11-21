@@ -115,6 +115,77 @@ export function parseCell(raw: string | null | undefined): { value: number | nul
 
 export const isBlank = (s: string | null | undefined) => (s ?? "").trim() === "";
 
+// ── row / column ids ────────────────────────────────────────────────────────
+// Every row and every column (data set) carries a hidden id that moves with it
+// through inserts, deletes and pastes; new rows / columns get a fresh one. Ids
+// never reach the statistics or the figure (toNumericTable leaves them out).
+
+/** A stored id worth keeping (anything else is replaced by a fresh one): the
+ *  kind prefix plus lowercase letters / digits. The prefix keeps ids from ever
+ *  being "__proto__" or all digits, which object keys (the file form's series
+ *  map) would mangle or reorder. */
+export const ID_RE = /^(row|col)-[0-9a-z]{4,60}$/;
+/** A stored id of the right kind ("row-…" in row_ids, "col-…" in col_ids). */
+export const isValidId = (v: unknown, kind: "row" | "col"): v is string =>
+  typeof v === "string" && ID_RE.test(v) && v.startsWith(`${kind}-`);
+const ID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz"; // Crockford base32: 10 chars ≈ 50 bits
+
+function randomChars(n: number): string {
+  const bytes = new Uint8Array(n);
+  const c = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
+  if (c?.getRandomValues) c.getRandomValues(bytes);
+  else for (let i = 0; i < n; i++) bytes[i] = Math.floor(Math.random() * 256);
+  let s = "";
+  for (let i = 0; i < n; i++) s += ID_ALPHABET[bytes[i] & 31];
+  return s;
+}
+
+let idSource: (kind: "row" | "col") => string = (kind) => `${kind}-${randomChars(10)}`;
+
+/** Tests: make minted ids predictable. Returns the previous source. */
+export function setIdSource(fn: (kind: "row" | "col") => string): (kind: "row" | "col") => string {
+  const prev = idSource;
+  idSource = fn;
+  return prev;
+}
+
+/** A fresh id not in `taken` (which it is added to). */
+export function mintId(kind: "row" | "col", taken: Set<string>): string {
+  for (;;) {
+    const id = idSource(kind);
+    if (!taken.has(id)) { taken.add(id); return id; }
+  }
+}
+
+/** `n` ids: valid, unique entries of `raw` are kept in place, the rest are minted. */
+export function repairIdList(raw: unknown, n: number, kind: "row" | "col"): string[] {
+  const src = Array.isArray(raw) ? raw : [];
+  const taken = new Set<string>();
+  const out: (string | null)[] = Array.from({ length: n }, (_, i) => {
+    const v = src[i];
+    if (!isValidId(v, kind) || taken.has(v)) return null;
+    taken.add(v);
+    return v;
+  });
+  return out.map((v) => v ?? mintId(kind, taken));
+}
+
+/** The doc with one valid, unique id per row and per column (unchanged when it has them). */
+export function withIds(doc: GraphDoc): GraphDoc {
+  const ok = (ids: unknown, n: number, kind: "row" | "col") =>
+    Array.isArray(ids) && ids.length === n && ids.every((v) => isValidId(v, kind)) && new Set(ids).size === n;
+  if (ok(doc.row_ids, doc.cells.length, "row") && ok(doc.col_ids, doc.col_titles.length, "col")) return doc;
+  return {
+    ...doc,
+    row_ids: repairIdList(doc.row_ids, doc.cells.length, "row"),
+    col_ids: repairIdList(doc.col_ids, doc.col_titles.length, "col"),
+  };
+}
+
+/** Row ids of a doc, repaired if they don't line up (never expected). */
+const rowIds = (doc: GraphDoc) => withIds(doc).row_ids;
+const colIds = (doc: GraphDoc) => withIds(doc).col_ids;
+
 // ── documents ───────────────────────────────────────────────────────────────
 
 const blankRow = (nCols: number, nRep: number): string[][] =>
@@ -134,17 +205,20 @@ export function colHasData(doc: GraphDoc, c: number): boolean {
 /** Pad to MIN_ROWS and keep exactly one blank row available after the last
  *  filled one (so typing in the last row always has somewhere to go next). */
 export function ensureRows(doc: GraphDoc): GraphDoc {
+  doc = withIds(doc);
   const nCols = doc.col_titles.length;
-  let cells = doc.cells, row_titles = doc.row_titles, x = doc.x;
+  let cells = doc.cells, row_titles = doc.row_titles, x = doc.x, row_ids = doc.row_ids;
+  let taken: Set<string> | null = null;
   const grow = () => {
-    if (cells === doc.cells) { cells = [...cells]; row_titles = [...row_titles]; x = [...x]; }
+    if (cells === doc.cells) { cells = [...cells]; row_titles = [...row_titles]; x = [...x]; row_ids = [...row_ids]; }
     cells.push(blankRow(nCols, doc.n_rep));
     row_titles.push("");
     x.push("");
+    row_ids.push(mintId("row", (taken ??= new Set(row_ids))));
   };
   while (cells.length < MIN_ROWS) grow();
   if (cells.length < MAX_ROWS && rowHasData({ ...doc, cells, row_titles, x }, cells.length - 1)) grow();
-  return cells === doc.cells ? doc : { ...doc, cells, row_titles, x };
+  return cells === doc.cells ? doc : { ...doc, cells, row_titles, x, row_ids };
 }
 
 export function emptyDoc(t: Template): GraphDoc {
@@ -159,12 +233,14 @@ export function emptyDoc(t: Template): GraphDoc {
     n_rep: nRep,
     x: [],
     cells: [],
+    row_ids: [],
+    col_ids: repairIdList([], nCols, "col"),
   });
 }
 
 /** Column-major sample values → a doc. */
-function fromValues(base: Omit<GraphDoc, "cells" | "row_titles" | "x">, rows: number, get: (r: number, c: number, k: number) => number | null,
-  rowTitles: string[] = [], x: (number | null)[] = []): GraphDoc {
+function fromValues(base: Omit<GraphDoc, "cells" | "row_titles" | "x" | "row_ids" | "col_ids">, rows: number,
+  get: (r: number, c: number, k: number) => number | null, rowTitles: string[] = [], x: (number | null)[] = []): GraphDoc {
   const cells = Array.from({ length: rows }, (_, r) =>
     base.col_titles.map((_, c) => Array.from({ length: base.n_rep }, (_, k) => {
       const v = get(r, c, k);
@@ -175,6 +251,8 @@ function fromValues(base: Omit<GraphDoc, "cells" | "row_titles" | "x">, rows: nu
     cells,
     row_titles: Array.from({ length: rows }, (_, r) => rowTitles[r] ?? ""),
     x: Array.from({ length: rows }, (_, r) => (x[r] == null ? "" : String(x[r]))),
+    row_ids: repairIdList([], rows, "row"),
+    col_ids: repairIdList([], base.col_titles.length, "col"),
   });
 }
 
@@ -243,6 +321,9 @@ export function migrateDoc(raw: unknown): GraphDoc | null {
     n_rep: nRep,
     x: Array.from({ length: nRows }, (_, r) => (t === "xy" ? str(xs[r]) : "")),
     cells,
+    // Documents saved before ids existed (or with damaged ones) get fresh ids here.
+    row_ids: repairIdList(d.row_ids, nRows, "row"),
+    col_ids: repairIdList(d.col_ids, nCols, "col"),
   });
 }
 
@@ -311,14 +392,17 @@ export function insertCol(doc: GraphDoc, at: number): GraphDoc {
   const i = Math.max(0, Math.min(at, doc.col_titles.length));
   const col_titles = [...doc.col_titles];
   col_titles.splice(i, 0, uniqueColTitle(doc));
+  const col_ids = [...colIds(doc)];
+  col_ids.splice(i, 0, mintId("col", new Set(col_ids)));
   const cells = doc.cells.map((row) => {
     const next = [...row];
     next.splice(i, 0, Array.from({ length: doc.n_rep }, () => ""));
     return next;
   });
-  return { ...doc, col_titles, cells };
+  return { ...withIds(doc), col_titles, cells, col_ids };
 }
 
+/** Blank a column's values; it keeps its title and id. */
 export function clearCol(doc: GraphDoc, c: number): GraphDoc {
   return { ...doc, cells: doc.cells.map((row) => row.map((reps, j) => (j === c ? reps.map(() => "") : reps))) };
 }
@@ -327,22 +411,25 @@ export function clearCol(doc: GraphDoc, c: number): GraphDoc {
 export function deleteCol(doc: GraphDoc, c: number): GraphDoc {
   if (doc.col_titles.length <= 1) return clearCol(doc, c);
   return {
-    ...doc,
+    ...withIds(doc),
     col_titles: doc.col_titles.filter((_, j) => j !== c),
     cells: doc.cells.map((row) => row.filter((_, j) => j !== c)),
+    col_ids: colIds(doc).filter((_, j) => j !== c),
   };
 }
 
 export function insertRow(doc: GraphDoc, at: number): GraphDoc {
   if (doc.cells.length >= MAX_ROWS) return doc;
   const i = Math.max(0, Math.min(at, doc.cells.length));
-  const cells = [...doc.cells], row_titles = [...doc.row_titles], x = [...doc.x];
+  const cells = [...doc.cells], row_titles = [...doc.row_titles], x = [...doc.x], row_ids = [...rowIds(doc)];
   cells.splice(i, 0, blankRow(doc.col_titles.length, doc.n_rep));
   row_titles.splice(i, 0, "");
   x.splice(i, 0, "");
-  return ensureRows({ ...doc, cells, row_titles, x });
+  row_ids.splice(i, 0, mintId("row", new Set(row_ids)));
+  return ensureRows({ ...withIds(doc), cells, row_titles, x, row_ids });
 }
 
+/** Blank a row (values, row title, X); it keeps its id. */
 export function clearRow(doc: GraphDoc, r: number): GraphDoc {
   const cells = [...doc.cells], row_titles = [...doc.row_titles], x = [...doc.x];
   cells[r] = blankRow(doc.col_titles.length, doc.n_rep);
@@ -353,10 +440,11 @@ export function clearRow(doc: GraphDoc, r: number): GraphDoc {
 
 export function deleteRow(doc: GraphDoc, r: number): GraphDoc {
   return ensureRows({
-    ...doc,
+    ...withIds(doc),
     cells: doc.cells.filter((_, i) => i !== r),
     row_titles: doc.row_titles.filter((_, i) => i !== r),
     x: doc.x.filter((_, i) => i !== r),
+    row_ids: rowIds(doc).filter((_, i) => i !== r),
   });
 }
 
@@ -467,16 +555,21 @@ export function applyPaste(doc: GraphDoc, anchor: PasteAnchor, text: string): Pa
   const rowsNeeded = row0 + lines.length;
   let truncated = groupsNeeded > MAX_COLS || rowsNeeded > MAX_ROWS;
 
+  const src = withIds(doc);
   let next: GraphDoc = {
-    ...doc,
-    col_titles: [...doc.col_titles],
-    row_titles: [...doc.row_titles],
-    x: [...doc.x],
-    cells: doc.cells.map((row) => row.map((reps) => [...reps])),
+    ...src,
+    col_titles: [...src.col_titles],
+    row_titles: [...src.row_titles],
+    x: [...src.x],
+    cells: src.cells.map((row) => row.map((reps) => [...reps])),
+    row_ids: [...src.row_ids],
+    col_ids: [...src.col_ids],
   };
   const nGroups = Math.min(MAX_COLS, Math.max(next.col_titles.length, groupsNeeded));
+  const takenCols = new Set(next.col_ids), takenRows = new Set(next.row_ids);
   while (next.col_titles.length < nGroups) {
     next.col_titles.push(uniqueColTitle(next));
+    next.col_ids.push(mintId("col", takenCols));
     next.cells.forEach((row) => row.push(Array.from({ length: next.n_rep }, () => "")));
   }
   const nRows = Math.min(MAX_ROWS, Math.max(next.cells.length, rowsNeeded));
@@ -484,6 +577,7 @@ export function applyPaste(doc: GraphDoc, anchor: PasteAnchor, text: string): Pa
     next.cells.push(blankRow(next.col_titles.length, next.n_rep));
     next.row_titles.push("");
     next.x.push("");
+    next.row_ids.push(mintId("row", takenRows));
   }
 
   const put = (r: number, j: number, raw: string) => {
@@ -658,6 +752,37 @@ export function defaultAnalysis(t: Template, nGroups: number, nRows: number): Gr
     test, posthoc, compare: comparesFor(posthoc)[0], control: null, pairs: [], alpha: 0.05,
     within: "rows", family: "all", correlation: "none",
   };
+}
+
+/** The automatic clean-up of the settings against the table: the analysis
+ *  normalised (normalizeAnalysis) and a graph type of another template
+ *  replaced by the template's default — only once the table holds numbers.
+ *  Run inside the store's load (before the saved baseline is taken, so opening
+ *  never counts as a change) and after edits. Returns the same objects when
+ *  nothing changes; running it twice changes nothing more. */
+export function normalizeSettings(doc: GraphDoc, analysis: GraphAnalysis, figure: GraphFigure): { analysis: GraphAnalysis; figure: GraphFigure } {
+  const table = toNumericTable(doc);
+  const withinCols = doc.template === "grouped" && analysis.within === "columns";
+  const nEntities = withinCols ? doc.cells.length : doc.col_titles.length;
+  // Before there are numbers only what points past the table is dropped (it
+  // doesn't depend on the data), so a document keeps the same settings after
+  // a trip through the file form (idMap drops such references too).
+  if (!hasNumbers(table)) return { analysis: dropOutOfRange(analysis, nEntities), figure };
+  const a = normalizeAnalysis(analysis, { template: doc.template, nGroups: usedCols(table), nRows: usedRows(table), nEntities });
+  const f = templateInfo(doc.template).graphs.some((g) => g.id === figure.graph_type)
+    ? figure : { ...figure, graph_type: GRAPH_DEFAULT[doc.template] };
+  return { analysis: a, figure: f };
+}
+
+/** The analysis without a control / pairs that index past `n` entities (the
+ *  same object when nothing points past). */
+function dropOutOfRange(a: GraphAnalysis, n: number): GraphAnalysis {
+  const inRange = (i: unknown) => typeof i === "number" && Number.isInteger(i) && i >= 0 && i < n;
+  const pairs = Array.isArray(a.pairs) ? a.pairs : [];
+  const keptPairs = pairs.filter((p) => Array.isArray(p) && inRange(p[0]) && inRange(p[1]));
+  const controlOk = a.control === null || a.control === undefined || inRange(a.control);
+  if (controlOk && keptPairs.length === pairs.length && Array.isArray(a.pairs)) return a;
+  return { ...a, control: controlOk ? a.control : null, pairs: keptPairs };
 }
 
 /** Tests that compare exactly two groups (one pair of columns). */

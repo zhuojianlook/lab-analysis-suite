@@ -1,3 +1,6 @@
+mod devenv;
+mod engineproc;
+
 use tauri::{Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 use std::sync::{Arc, Mutex};
@@ -82,26 +85,15 @@ async fn kill_sidecar(state: tauri::State<'_, SidecarChild>) -> Result<(), Strin
     Ok(())
 }
 
-/// Helper to kill sidecar and any child processes.
+/// Stop the engine this app spawned and the processes below it — never
+/// anything matched by name (see engineproc.rs). Does nothing when no engine
+/// was spawned (debug builds) or it was already stopped.
 fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<std::process::Child>>>) {
     if let Ok(mut guard) = child_mutex.lock() {
         if let Some(mut child) = guard.take() {
-            eprintln!("[cleanup] Killing engine process");
-            let _ = child.kill();
+            eprintln!("[cleanup] Stopping engine process {}", child.id());
+            engineproc::kill_tree(&mut child);
         }
-    }
-    // On Windows, PyInstaller --onefile spawns a child process that may survive.
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "api-server.exe", "/T"])
-            .output();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "api-server"])
-            .output();
     }
 }
 
@@ -338,21 +330,74 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 struct SidecarPort(u16);
 struct SidecarError(Arc<Mutex<Option<String>>>);
 struct SidecarChild(Arc<Mutex<Option<std::process::Child>>>);
+/// Folder for the app's own records (open tabs, drafts, journal). `None` only
+/// if a release build cannot resolve its app data folder.
+#[allow(dead_code)] // read by the file features (phase 1)
+struct StateDir(Option<std::path::PathBuf>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  // Debug builds: check LAS_SIDECAR_PORT / LAS_STATE_DIR before anything
+  // starts, and exit with a plain message (an error returned from the setup
+  // hook would abort inside the macOS app delegate with a long backtrace).
+  let dev_env: Option<devenv::DevEnv> = if cfg!(debug_assertions) {
+    let checked = devenv::dev_env_from_process().and_then(|dev| {
+      std::fs::create_dir_all(&dev.state_dir).map_err(|e| {
+        format!(
+          "Debug build refused to start: cannot create {}={}: {}",
+          devenv::ENV_STATE_DIR, dev.state_dir.display(), e
+        )
+      })?;
+      Ok(dev)
+    });
+    match checked {
+      Ok(dev) => Some(dev),
+      Err(msg) => {
+        eprintln!("\n[dev] {}\n", msg);
+        std::process::exit(2);
+      }
+    }
+  } else {
+    None
+  };
+
+  // Remembers window size + position across launches. Debug builds keep this
+  // file in LAS_STATE_DIR instead of the installed app's config folder (the
+  // plugin joins the name onto that folder, so an absolute path replaces it).
+  let window_state = match &dev_env {
+    Some(dev) => tauri_plugin_window_state::Builder::default()
+      .with_filename(dev.state_dir.join(".window-state.json").to_string_lossy())
+      .build(),
+    None => tauri_plugin_window_state::Builder::default().build(),
+  };
+
+  // Debug builds run under their own identifier, so every folder Tauri and its
+  // plugins derive from it (app config / data / cache / logs) is separate from
+  // the installed app's.
+  let mut context = tauri::generate_context!();
+  if dev_env.is_some() {
+    context.config_mut().identifier = devenv::DEV_IDENTIFIER.to_string();
+  }
+
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_updater::Builder::new().build())
     .plugin(tauri_plugin_process::init())
-    // Remembers window size + position across launches.
-    .plugin(tauri_plugin_window_state::Builder::default().build())
-    .setup(|app| {
-      if cfg!(debug_assertions) {
+    .plugin(window_state)
+    .setup(move |app| {
+      // Debug builds log to the terminal and to LAS_STATE_DIR/logs, never to
+      // the OS log folder (which is keyed by the app identifier).
+      if let Some(dev) = &dev_env {
+        use tauri_plugin_log::{Target, TargetKind};
         app.handle().plugin(
           tauri_plugin_log::Builder::default()
             .level(log::LevelFilter::Info)
+            .clear_targets()
+            .targets([
+              Target::new(TargetKind::Stdout),
+              Target::new(TargetKind::Folder { path: dev.state_dir.join("logs"), file_name: None }),
+            ])
             .build(),
         )?;
       }
@@ -365,10 +410,19 @@ pub fn run() {
       // normally unset → the sidecar discovers the host R itself.
       let r_env_dir: Option<String> = std::env::var("LAS_R_ENV_DIR").ok().filter(|s| !s.is_empty());
 
-      // Launch sidecar in production; in dev, assume it's already running.
+      // Launch sidecar in production; in dev, assume it's already running on
+      // the port given by LAS_SIDECAR_PORT (see devenv.rs — a debug build never
+      // falls back to the installed app's port or data folder).
       let port: u16;
+      let state_dir: Option<std::path::PathBuf>;
       if cfg!(debug_assertions) {
-        port = 8765;
+        let dev = dev_env.as_ref().ok_or("debug build started without its dev settings")?;
+        eprintln!(
+          "[dev] engine port {}, state folder {}, identifier {}",
+          dev.port, dev.state_dir.display(), app.config().identifier
+        );
+        port = dev.port;
+        state_dir = Some(dev.state_dir.clone());
       } else {
         // The engine is a PyInstaller --onedir folder bundled under
         // Contents/Resources/engine (resource_dir/engine) — no per-launch
@@ -397,7 +451,10 @@ pub fn run() {
             }
 
             let mut command = std::process::Command::new(&engine_exe);
-            command.arg("--port").arg("8765");
+            command.arg("--port").arg(devenv::RELEASE_SIDECAR_PORT.to_string());
+            // The engine exits by itself if this process dies without a clean
+            // quit (crash, force-quit), so no orphan keeps the port.
+            command.arg("--parent-pid").arg(std::process::id().to_string());
             if let Some(ref dir) = r_env_dir {
               command.arg("--r-env-dir").arg(dir);
             }
@@ -449,10 +506,16 @@ pub fn run() {
             *sidecar_error.lock().unwrap() = Some(msg);
           }
         }
-        port = 8765;
+        port = devenv::RELEASE_SIDECAR_PORT;
+        // Resolved only; nothing is created until something is written there.
+        state_dir = devenv::release_state_dir(
+          std::env::var(devenv::ENV_STATE_DIR).ok().as_deref(),
+          app.path().app_data_dir().ok(),
+        );
       }
 
       app.manage(SidecarPort(port));
+      app.manage(StateDir(state_dir));
       app.manage(SidecarError(sidecar_error));
       app.manage(SidecarChild(sidecar_child));
       Ok(())
@@ -472,7 +535,7 @@ pub fn run() {
       download_and_install_update,
       kill_sidecar
     ])
-    .build(tauri::generate_context!())
+    .build(context)
     .expect("error while building tauri application")
     .run(|app_handle, event| {
       match event {

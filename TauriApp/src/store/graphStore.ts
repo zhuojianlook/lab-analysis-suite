@@ -28,11 +28,15 @@ export interface GraphState {
   doc: GraphDoc | null;
   analysis: GraphAnalysis;
   figure: GraphFigure;
-  /** Library name ("" = not named yet). */
+  /** Library name ("" = not named yet). Not part of the saved content key. */
   name: string;
+  /** `name` at the last save/open (null when savedSnapshot is null). Kept apart from
+   *  the content key so the name can later become the file name. */
+  savedName: string | null;
   /** Library id of the saved version this document came from (null = never saved / deleted). */
   currentId: number | null;
-  /** snapshotKey() at the last save/open; null = has unsaved changes by definition. */
+  /** snapshotKey() (content only: table, analysis, figure) at the last save/open;
+   *  null = has unsaved changes by definition. */
   savedSnapshot: string | null;
   undoStack: Snapshot[];
   /** Cell being typed in — consecutive edits of one cell share one undo step. */
@@ -77,18 +81,25 @@ export interface GraphState {
   sendBlock: (anchor: M.PasteAnchor, text: string, clearFirst: boolean) => M.PasteResult | null;
   /** Replace the scratchpad text (touches nothing else: no undo step, no analysis/figure change). */
   setScratch: (text: string) => void;
+  /** The automatic settings clean-up (M.normalizeSettings) for the current table;
+   *  no undo step, no change when the settings already fit. load/newDoc run it
+   *  before taking the saved baseline. */
+  normalize: () => void;
   undo: () => boolean;
 
   setAnalysis: (patch: Partial<GraphAnalysis> | ((a: GraphAnalysis) => GraphAnalysis)) => void;
   setFigure: (patch: Partial<GraphFigure> | ((f: GraphFigure) => GraphFigure)) => void;
 }
 
-/** Everything that is saved; compared to tell whether there are unsaved changes. */
-export const snapshotKey = (s: Pick<GraphState, "name" | "doc" | "analysis" | "figure">) =>
-  JSON.stringify({ name: s.name, doc: s.doc, analysis: s.analysis, figure: s.figure });
+/** The saved content (table incl. row/column ids, analysis, figure); compared to
+ *  tell whether there are unsaved changes. The name and the scratchpad are
+ *  compared separately. */
+export const snapshotKey = (s: Pick<GraphState, "doc" | "analysis" | "figure">) =>
+  JSON.stringify({ doc: s.doc, analysis: s.analysis, figure: s.figure });
 
 export const isDirty = (s: GraphState) =>
-  !!s.doc && (s.savedSnapshot === null || s.scratch !== s.savedScratch || s.savedSnapshot !== snapshotKey(s));
+  !!s.doc && (s.savedSnapshot === null || s.scratch !== s.savedScratch || s.name !== s.savedName
+    || s.savedSnapshot !== snapshotKey(s));
 
 const paletteFields = (f: GraphFigure): Snapshot["palette"] => {
   const out: Record<string, unknown> = {};
@@ -120,7 +131,13 @@ function defaultsFor(doc: GraphDoc) {
 }
 
 /** Saved settings layered over the defaults, so records from older versions
- *  that lack a newer field still open with every field set. */
+ *  that lack a newer field still open with every field set; then the
+ *  automatic clean-up, so opening a document never changes it afterwards. */
+function openSettings(doc: GraphDoc, analysis?: Partial<GraphAnalysis>, figure?: Partial<GraphFigure>) {
+  const m = mergeSettings(doc, analysis, figure);
+  return M.normalizeSettings(doc, m.analysis, m.figure);
+}
+
 function mergeSettings(doc: GraphDoc, analysis?: Partial<GraphAnalysis>, figure?: Partial<GraphFigure>) {
   const d = defaultsFor(doc);
   const saved = (figure && typeof figure === "object" ? figure : {}) as Record<string, unknown>;
@@ -168,6 +185,7 @@ export const useGraphStore = create<GraphState>((set, get) => {
     analysis: placeholder.analysis,
     figure: placeholder.figure,
     name: "",
+    savedName: null,
     currentId: null,
     savedSnapshot: null,
     undoStack: [],
@@ -179,53 +197,52 @@ export const useGraphStore = create<GraphState>((set, get) => {
 
     newDoc: (t, sample) => {
       const doc = sample ? M.sampleDoc(t) : M.emptyDoc(t);
-      const { analysis, figure } = defaultsFor(doc);
-      const next = { doc, analysis, figure, name: "" };
+      const d = defaultsFor(doc);
+      const next = { doc, ...M.normalizeSettings(doc, d.analysis, d.figure), name: "" };
       // A fresh document only counts as changed once it is edited.
       set((s) => ({
-        ...next, currentId: null, savedSnapshot: snapshotKey(next), undoStack: [], lastEditKey: null,
+        ...next, savedName: "", currentId: null, savedSnapshot: snapshotKey(next), undoStack: [], lastEditKey: null,
         docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new", scratch: "", savedScratch: "",
       }));
     },
 
-    load: ({ doc, analysis, figure, name, id, saved, scratch }) => {
-      const merged = mergeSettings(doc, analysis, figure);
-      const next = { doc, ...merged, name };
+    load: ({ doc: raw, analysis, figure, name, id, saved, scratch }) => {
+      // Ids minted for documents without them, defaults, clean-up: all before the
+      // baseline, so a document is unchanged until the user changes it.
+      const doc = M.withIds(raw);
+      const next = { doc, ...openSettings(doc, analysis, figure), name };
       const sc = sanitizeScratch(scratch);
       set((s) => ({
-        ...next, currentId: id, savedSnapshot: saved ? snapshotKey(next) : null, undoStack: [], lastEditKey: null,
+        ...next, savedName: saved ? name : null, currentId: id, savedSnapshot: saved ? snapshotKey(next) : null,
+        undoStack: [], lastEditKey: null,
         docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft", scratch: sc, savedScratch: saved ? sc : null,
       }));
     },
 
     close: () => set((s) => ({
-      doc: null, name: "", currentId: null, savedSnapshot: null, undoStack: [], lastEditKey: null, docSerial: s.docSerial + 1,
+      doc: null, name: "", savedName: null, currentId: null, savedSnapshot: null, undoStack: [], lastEditKey: null, docSerial: s.docSerial + 1,
       scratch: "", savedScratch: null,
     })),
 
     setName: (name) => set({ name }),
 
     markSaved: (id, name, sent) => set({
-      name, currentId: id, savedSnapshot: snapshotKey({ name, doc: sent.doc, analysis: sent.analysis, figure: sent.figure }),
-      savedScratch: sent.scratch,
+      name, savedName: name, currentId: id, savedSnapshot: snapshotKey(sent), savedScratch: sent.scratch,
     }),
 
     // Renamed in the library: the saved version now carries the new name.
-    markRenamed: (name) => set((s) => {
-      const wasClean = s.savedSnapshot !== null && s.savedSnapshot === snapshotKey(s);
-      const next = { ...s, name };
-      return {
-        name,
-        savedSnapshot: wasClean ? snapshotKey(next)
-          : s.savedSnapshot === null ? null
-            : snapshotKey({ ...(JSON.parse(s.savedSnapshot) as Pick<GraphState, "doc" | "analysis" | "figure">), name }),
-      };
-    }),
+    markRenamed: (name) => set({ name, savedName: name }),
 
     // The open document's library record was deleted: keep it on screen, unsaved.
-    detach: () => set({ currentId: null, savedSnapshot: null, savedScratch: null }),
+    detach: () => set({ currentId: null, savedSnapshot: null, savedScratch: null, savedName: null }),
 
     setScratch: (text) => set((s) => (s.scratch === text ? {} : { scratch: text })),
+
+    normalize: () => set((s) => {
+      if (!s.doc) return {};
+      const n = M.normalizeSettings(s.doc, s.analysis, s.figure);
+      return n.analysis === s.analysis && n.figure === s.figure ? {} : n;
+    }),
 
     setCell: (r, c, k, v) =>
       type(`c:${r}:${c}:${k}`, (doc) => {

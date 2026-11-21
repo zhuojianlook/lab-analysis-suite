@@ -31,6 +31,12 @@ export interface GraphDoc {
   n_rep: number;
   x: string[];
   cells: string[][][];
+  /** Hidden stable id of each row (same length as `cells`) and of each column
+   *  / data set (same length as `col_titles`). They follow their row or column
+   *  through every structural edit, so later versions can be compared and
+   *  combined by id. Never part of an analysis or plot request. */
+  row_ids: string[];
+  col_ids: string[];
 }
 
 export type TestId =

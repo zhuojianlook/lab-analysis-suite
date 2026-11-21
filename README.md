@@ -61,9 +61,16 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r python-sidecar/requirements.txt
 ./scripts/build-sidecar.sh                 # → src-tauri/binaries/api-server-<triple>
 
-# Dev (run sidecar separately, then Vite + Tauri):
-python python-sidecar/api_server.py --port 8765 &
-npm run tauri dev
+# Dev (run the engine separately, then Vite + Tauri). Port 8765 and the app's
+# own folders belong to the installed Lab Analysis Suite, so the dev engine gets
+# another port and a scratch data folder, and a debug build must be told both
+# (it refuses to start without LAS_SIDECAR_PORT / LAS_STATE_DIR, and refuses
+# 8765 or a folder inside the installed app's folders):
+LAS_DATA_DIR="$(mktemp -d)" python python-sidecar/api_server.py --port 8766 &
+LAS_SIDECAR_PORT=8766 LAS_STATE_DIR="$(mktemp -d)" npm run tauri dev
+
+# Frontend unit tests (vitest):
+npm test
 
 # Production bundle:
 npm run tauri build
@@ -93,6 +100,6 @@ app discovers it automatically; you can also set a custom path in-app).
 
 All Python analysis logic + the 34 sidecar routes are verified locally. The
 TypeScript/Tauri build and the R/ggplot/Seurat/DESeq2/DADA2 templates are
-verified when you build and run with Node + Rust + R installed (`npm install &&
-npm run tauri dev`).
+verified when you build and run with Node + Rust + R installed (`npm install`,
+then the two dev commands above).
 ```
