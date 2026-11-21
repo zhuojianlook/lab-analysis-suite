@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { isTauri } from "../api/client";
+import { useFileSession } from "../components/graph/file/session";
 
 export type UpdaterStatus =
   | "idle"
@@ -99,6 +100,13 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
   },
 
   restart: async () => {
+    // Keep every open analysis's unsaved changes (and the open tabs) for after the
+    // restart: the updater's exit can't be stopped, so this runs first.
+    try {
+      await useFileSession.getState().quitRoutine("update");
+    } catch (e) {
+      console.warn("[updater] keeping unsaved changes failed", e);
+    }
     const { relaunch } = await import("@tauri-apps/plugin-process");
     await relaunch();
   },

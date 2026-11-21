@@ -30,3 +30,18 @@ tauri-plugin-process = "2"
 tauri-plugin-window-state = "2"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 url = "2"
+# Analysis files (.lag): ZIP container (deflate through flate2's pure-Rust
+# backend; zip's own "deflate" feature would pull zopfli + zlib-rs), hashes, ids.
+zip = { version = "~4.6", default-features = false, features = ["deflate-flate2"] }
+flate2 = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+# Default features off: the lock already has these crates with the features tao uses.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std"] }

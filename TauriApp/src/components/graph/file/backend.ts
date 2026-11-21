@@ -4,6 +4,9 @@
    tests, including simulated other computers. Not wired to the UI yet. */
 
 import type { FileHeader, GraphFileData, Manifest } from "./format";
+import type { FileEventP1, FileBackendP1 } from "./contract";
+
+export type { FileBackendP1 };
 
 /** Typed errors (plan §4.1). */
 export type FileErrorCode =
@@ -14,7 +17,8 @@ export type FileErrorCode =
   | "Dataless"          // online-only placeholder, not downloaded to this computer
   | "TooNew"            // save only: the file at the path was made by a newer app and would lose data
   | "IdentityMismatch"  // save only: the analysis id / document key doesn't match the path's record (§7 step 2)
-  | "Invalid";          // not an analysis file, or a save whose parts are missing
+  | "Invalid"           // not an analysis file, or a save whose parts are missing
+  | "Io";               // any other disk error (disk full, read-only volume, name too long…)
 
 export interface FileError {
   ok: false;
@@ -56,6 +60,9 @@ export interface SaveRequest {
    *  part found nowhere fails the save with Invalid. Parts no revision
    *  references any more are dropped. */
   newParts: Record<string, string>;
+  /** expectedHead null only. true (the person confirmed "Replace"): whatever is
+   *  at the path is moved aside (displaced/) first. Default false. */
+  replaceExisting?: boolean;
 }
 
 /** Outcome of a save (plan §7). */
@@ -104,6 +111,19 @@ export interface SessionTab {
   base_revision: string | null;
   accepted_head: string | null;
   active: boolean;
+  /** Untitled documents: their title ("Untitled 2"). */
+  title?: string;
+  /** Template of the document (untitled documents without a draft). */
+  template?: string;
+  /** Paths of copies this session made or the person answered about (never a rename target, no copy question). */
+  known_copies?: string[];
+  /** Copies the person called "the same analysis". */
+  copy_answer?: Record<string, "same">;
+  /** Heads this device journaled for the path whose content is kept elsewhere (a copy file, another
+   *  analysis) or was set aside on purpose: the journal check ignores them. */
+  settled_heads?: string[];
+  /** Same-analysis files seen beside this one (copies): never taken for this file renamed, also after a restart. */
+  seen_copies?: string[];
 }
 
 export interface GraphSession {
@@ -121,6 +141,9 @@ export interface DraftRecord {
   sections: Record<string, unknown>;
   /** ISO time. */
   saved_at: string;
+  /** Tab title when it was written ("Untitled 2"; the file name otherwise). */
+  title?: string;
+  template?: string;
 }
 
 /** A head this device has journaled for an analysis at a path (plan §3 journal/index.json, §8). */
@@ -152,6 +175,8 @@ export interface RecentEntry {
   analysis_id: string | null;
   /** ISO time. */
   opened_at: string;
+  /** The last check didn't find the file ("Remove from this list" or the startup check). */
+  missing?: boolean;
 }
 export const RECENT_MAX = 50;
 
@@ -174,17 +199,8 @@ export interface ExportMap {
 }
 export const emptyExportMap = (): ExportMap => ({ v: 1, rows: {} });
 
-/** Change notifications for tracked files (plan §5.1). */
-export type FileEvent =
-  | { type: "changed"; path: string; head: string }
-  /** The tracked file was renamed in its folder and followed (safe follow rule §5.2). */
-  | { type: "moved"; from: string; to: string }
-  /** Absent on two looks ≥ 5 s apart and no single safe successor. `candidates`:
-   *  same-id files in the folder that the rule would not follow (for the chooser). */
-  | { type: "missing"; path: string; candidates: string[] }
-  /** Another file with the same analysis id appeared in the folder of a tracked file. */
-  | { type: "sibling"; path: string; sibling: string; header: FileHeader }
-  | { type: "presence"; path: string };
+/** Change notifications for tracked files (plan §5.1; phase 1: contract §2.1). */
+export type FileEvent = FileEventP1;
 
 export interface FileBackend {
   device(): Promise<DeviceIdentity>;

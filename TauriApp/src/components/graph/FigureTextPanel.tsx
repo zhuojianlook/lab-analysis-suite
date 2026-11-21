@@ -91,7 +91,8 @@ async function copyText(text: string): Promise<boolean> {
 }
 
 const srOnly = {
-  position: "absolute", width: 1, height: 1, p: 0, m: "-1px", overflow: "hidden", clip: "rect(0 0 0 0)", whiteSpace: "nowrap", border: 0,
+  // "1px", not 1: in sx a bare 1 means 100%, which made each hidden status span as large as the panel.
+  position: "absolute", width: "1px", height: "1px", p: 0, m: "-1px", overflow: "hidden", clip: "rect(0 0 0 0)", whiteSpace: "nowrap", border: 0,
 } as const;
 
 function CopyButton({ text, label = "Copy", what, disabled }: { text: string; label?: string; what: string; disabled?: boolean }) {

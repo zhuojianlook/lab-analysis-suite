@@ -1,7 +1,20 @@
+mod appstate;
 mod devenv;
+// Debug builds only: the files self-test hook (LAS_E2E_SCRIPT).
+#[cfg(debug_assertions)]
+mod deve2e;
 mod engineproc;
+mod graphfile;
+mod graphwatch;
+mod menu;
+mod opens;
+mod quit;
+#[cfg(target_os = "macos")]
+mod quit_macos;
 
-use tauri::{Emitter, Manager};
+use graphfile::FileCtx;
+use quit::{Act, FinishHow, QuitDriver, QuitSource};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_updater::UpdaterExt;
 use std::sync::{Arc, Mutex};
 use std::io::{BufRead, BufReader};
@@ -327,6 +340,41 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(result)
 }
 
+// ── Phase 1 app commands: opened files, menu state, quit handshake ─────────
+
+/// Files opened before the frontend listened; marks the frontend ready (for
+/// open-files events and for the quit handshake).
+#[tauri::command]
+fn take_pending_opens(quit: tauri::State<'_, Arc<QuitDriver>>) -> Vec<String> {
+    quit.set_frontend_ready();
+    opens::take()
+}
+
+#[tauri::command]
+async fn app_set_menu_state(
+    app: tauri::AppHandle,
+    handles: tauri::State<'_, menu::MenuHandles<tauri::Wry>>,
+    state: menu::MenuState,
+) -> Result<(), graphfile::FileErr> {
+    menu::apply_state(&app, &handles, &state).map_err(|e| graphfile::FileErr::io(format!("menu: {e}")))
+}
+
+#[tauri::command]
+fn app_quit_reply(quit: tauri::State<'_, Arc<QuitDriver>>, request_id: u64, stage: String) -> Result<(), graphfile::FileErr> {
+    let stage = quit::Stage::parse(&stage).ok_or_else(|| graphfile::FileErr::invalid(format!("unknown stage {stage:?}")))?;
+    quit.reply(request_id, stage);
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bring_main_window_forward(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 struct SidecarPort(u16);
 struct SidecarError(Arc<Mutex<Option<String>>>);
 struct SidecarChild(Arc<Mutex<Option<std::process::Child>>>);
@@ -374,6 +422,10 @@ pub fn run() {
   // Debug builds run under their own identifier, so every folder Tauri and its
   // plugins derive from it (app config / data / cache / logs) is separate from
   // the installed app's.
+  // Files passed as arguments (Windows/Linux double-click, `open --args`).
+  let cwd = std::env::current_dir().unwrap_or_default();
+  let _ = opens::offer(opens::paths_from_args(std::env::args(), &cwd));
+
   let mut context = tauri::generate_context!();
   if dev_env.is_some() {
     context.config_mut().identifier = devenv::DEV_IDENTIFIER.to_string();
@@ -385,6 +437,14 @@ pub fn run() {
     .plugin(tauri_plugin_updater::Builder::new().build())
     .plugin(tauri_plugin_process::init())
     .plugin(window_state)
+    .on_menu_event(|app, ev| {
+      let handles = app.try_state::<menu::MenuHandles<tauri::Wry>>();
+      if menu::on_click(app, handles.as_deref(), ev.id().as_ref()) {
+        if let Some(q) = app.try_state::<Arc<QuitDriver>>() {
+          q.request(QuitSource::Menu);
+        }
+      }
+    })
     .setup(move |app| {
       // Debug builds log to the terminal and to LAS_STATE_DIR/logs, never to
       // the OS log folder (which is keyed by the app identifier).
@@ -514,6 +574,69 @@ pub fn run() {
         );
       }
 
+      // Analysis files: shared context, poll thread, startup pruning.
+      let ctx = Arc::new(FileCtx::new(state_dir.clone()));
+      {
+        let h = app.handle().clone();
+        ctx.set_emitter(Arc::new(move |name: &str, payload: serde_json::Value| {
+          let _ = h.emit(name, payload);
+        }));
+      }
+      graphwatch::start(ctx.clone());
+      if state_dir.is_some() {
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+          if let Err(e) = c.prune(10, 500 * 1024 * 1024, 30 * 24 * 3600 * 1000) {
+            log::warn!("[graphfile] pruning safety copies failed: {}", e.message);
+          }
+        });
+      }
+      app.manage(ctx);
+
+      // App menu (custom Quit / Close Tab).
+      let (app_menu, menu_handles) = menu::build(app.handle())?;
+      app.set_menu(app_menu)?;
+      app.manage(menu_handles);
+
+      // Quit handshake; the engine is stopped only when the quit really happens.
+      let quit_driver = {
+        let h = app.handle().clone();
+        let child = sidecar_child.clone();
+        QuitDriver::new(Box::new(move |_d, act| match act {
+          Act::Emit { id, source } => {
+            let _ = h.emit(quit::EVT_QUIT_REQUESTED, quit::QuitRequest { request_id: id, source });
+          }
+          Act::Finish(how) => {
+            kill_sidecar_process(&child);
+            match how {
+              #[cfg(target_os = "macos")]
+              FinishHow::ReplyTerminate => quit_macos::reply_terminate(&h, true),
+              #[cfg(not(target_os = "macos"))]
+              FinishHow::ReplyTerminate => h.exit(0),
+              FinishHow::Exit => h.exit(0),
+              FinishHow::None => {}
+            }
+          }
+          Act::CancelTerminate => {
+            #[cfg(target_os = "macos")]
+            quit_macos::reply_terminate(&h, false);
+          }
+          Act::StartWatchdog(_) => {}
+        }))
+      };
+      #[cfg(target_os = "macos")]
+      match quit_macos::install(quit_driver.clone()) {
+        Ok(line) => {
+          eprintln!("[quit] {line}");
+          log::info!("[quit] {line}");
+        }
+        Err(e) => {
+          eprintln!("[quit] ERROR: {e}. Dock Quit, logout and AppleScript quit will not ask about unsaved changes.");
+          log::error!("[quit] {e}. Dock Quit, logout and AppleScript quit will not ask about unsaved changes.");
+        }
+      }
+      app.manage(quit_driver);
+
       app.manage(SidecarPort(port));
       app.manage(StateDir(state_dir));
       app.manage(SidecarError(sidecar_error));
@@ -533,20 +656,95 @@ pub fn run() {
       open_url,
       check_update,
       download_and_install_update,
-      kill_sidecar
+      kill_sidecar,
+      take_pending_opens,
+      app_set_menu_state,
+      app_quit_reply,
+      appstate::app_info,
+      appstate::appstate_device,
+      appstate::appstate_set_device,
+      appstate::appstate_read_session,
+      appstate::appstate_write_session,
+      appstate::appstate_read_draft,
+      appstate::appstate_write_draft,
+      appstate::appstate_delete_draft,
+      appstate::appstate_list_drafts,
+      appstate::appstate_read_recent,
+      appstate::appstate_write_recent,
+      appstate::appstate_read_export_map,
+      appstate::appstate_write_export_map,
+      graphfile::graphfile_read,
+      graphfile::graphfile_header,
+      graphfile::graphfile_save,
+      graphfile::graphfile_scan_dir,
+      graphfile::graphfile_locate,
+      graphfile::graphfile_locate_cancel,
+      graphfile::graphfile_journal_heads,
+      graphfile::graphfile_read_journal,
+      graphfile::graphfile_write_journal,
+      graphfile::graphfile_list_displaced,
+      graphfile::graphfile_read_displaced,
+      graphfile::graphfile_reveal,
+      graphwatch::graphfile_track,
+      graphwatch::graphfile_untrack,
+      graphwatch::graphfile_poll_now,
+      #[cfg(debug_assertions)]
+      deve2e::dev_e2e_script,
+      #[cfg(debug_assertions)]
+      deve2e::dev_e2e_result,
+      #[cfg(debug_assertions)]
+      deve2e::dev_e2e_log,
+      #[cfg(debug_assertions)]
+      deve2e::dev_e2e_fs,
+      #[cfg(debug_assertions)]
+      deve2e::dev_e2e_quit
     ])
     .build(context)
     .expect("error while building tauri application")
     .run(|app_handle, event| {
+      let stop_engine = || {
+        if let Some(state) = app_handle.try_state::<SidecarChild>() {
+          kill_sidecar_process(&state.0);
+        }
+      };
       match event {
-        tauri::RunEvent::Exit => {
-          if let Some(state) = app_handle.try_state::<SidecarChild>() {
-            kill_sidecar_process(&state.0);
+        // Synchronous Rust-only backstop.
+        RunEvent::Exit => stop_engine(),
+        RunEvent::ExitRequested { code, api, .. } => {
+          if code == Some(quit::RESTART_EXIT_CODE) {
+            // The updater's restart: cannot be prevented; the frontend ran its
+            // quit routine before calling relaunch.
+            stop_engine();
+            return;
+          }
+          match app_handle.try_state::<Arc<QuitDriver>>() {
+            Some(q) => {
+              if !q.allowed() {
+                api.prevent_exit();
+                q.request(QuitSource::Exit);
+              }
+            }
+            None => stop_engine(),
           }
         }
-        tauri::RunEvent::ExitRequested { .. } => {
-          if let Some(state) = app_handle.try_state::<SidecarChild>() {
-            kill_sidecar_process(&state.0);
+        RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { api, .. }, .. } if label == "main" => {
+          if let Some(q) = app_handle.try_state::<Arc<QuitDriver>>() {
+            if !q.allowed() {
+              api.prevent_close();
+              q.request(QuitSource::Window);
+            }
+          }
+        }
+        RunEvent::WindowEvent { event: WindowEvent::Focused(true), .. } => {
+          if let Some(ctx) = app_handle.try_state::<Arc<FileCtx>>() {
+            graphwatch::poll_now(&ctx);
+          }
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Opened { urls } => {
+          if let Some(paths) = opens::offer(opens::paths_from_urls(&urls)) {
+            let _ = app_handle.emit(opens::EVT_OPEN_FILES, serde_json::json!({ "paths": paths }));
+            bring_main_window_forward(app_handle);
           }
         }
         _ => {}

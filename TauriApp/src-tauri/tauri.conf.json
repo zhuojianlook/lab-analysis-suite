@@ -51,6 +51,21 @@
     ],
     "resources": [
       "engine/**/*"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["lag"],
+        "name": "Lab Analysis Suite Analysis",
+        "description": "Lab Analysis Suite analysis",
+        "role": "Editor",
+        "rank": "Owner",
+        "mimeType": "application/vnd.labanalysissuite.graph+zip",
+        "contentTypes": ["com.zhuojianlook.analysis.graph"],
+        "exportedType": {
+          "identifier": "com.zhuojianlook.analysis.graph",
+          "conformsTo": ["public.data", "public.content"]
+        }
+      }
     ]
   }
 }

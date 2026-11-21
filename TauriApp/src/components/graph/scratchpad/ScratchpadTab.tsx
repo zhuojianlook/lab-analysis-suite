@@ -10,7 +10,8 @@ import UndoIcon from "@mui/icons-material/Undo";
 import RedoIcon from "@mui/icons-material/Redo";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import EastIcon from "@mui/icons-material/East";
-import { clearDraft, isDirty, useGraphStore, writeDraft } from "../../../store/graphStore";
+import { useGraphStore } from "../../../store/graphStore";
+import { useFileSession } from "../file/session";
 import { MOD_KEY } from "../GraphLibrary";
 import type { PasteResult } from "../graphModel";
 import { loadEngine } from "./engine";
@@ -55,10 +56,10 @@ function writeStore(): void {
   st.setScratch(text);
 }
 
-/** Before reloading the window after an engine crash: the draft backup must be current. */
-function flushDraftNow(): void {
-  const st = useGraphStore.getState();
-  if (isDirty(st)) writeDraft(st); else clearDraft();
+/** Before reloading the window after an engine crash: the open analysis's unsaved changes are
+ *  written now (the files controller keeps them per document and restores them after the reload). */
+async function flushDraftNow(): Promise<void> {
+  try { await useFileSession.internal.flushDraftNow(); } catch { /* the reload restores what was kept */ }
 }
 
 /** After an edit: write now when it is the first change since saving (so the
@@ -212,7 +213,7 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
     return (
       <Box sx={{ flexGrow: 1, display: "grid", placeItems: "center", p: 2 }}>
         <Alert severity="error" sx={{ maxWidth: 560 }}
-          action={<Button color="inherit" size="small" onClick={() => { flushDraftNow(); window.location.reload(); }}>Reload window</Button>}>
+          action={<Button color="inherit" size="small" onClick={() => { void flushDraftNow().finally(() => window.location.reload()); }}>Reload window</Button>}>
           {FATAL_MSG} Save the analysis, then reload the window to use the scratchpad again (unsaved changes in the Graphs
           tool are restored automatically). The entry was probably a formula that is too long or too deeply nested.
         </Alert>

@@ -25,6 +25,7 @@ import { MicrobiomeView } from "../microbiome/MicrobiomeView";
 import { PlatemapView } from "../platemap/PlatemapView";
 import { GraphView } from "../graph/GraphView";
 import { FiguresView } from "../figures/FiguresView";
+import { useFileSession } from "../graph/file/session";
 import { NavSidebar, type NavStatus } from "./NavSidebar";
 
 interface Tool {
@@ -85,6 +86,18 @@ export function AppShell() {
   const toggleCollapsed = () => {
     setCollapsed((c) => { writePref(PREF_COLLAPSED, c ? "0" : "1"); return !c; });
   };
+
+  // The files controller asks for the Graphs tool (a file opened from Finder, the
+  // File menu) and for the About window (the app menu's About item).
+  const focusSerial = useFileSession((s) => s.focusSerial);
+  const aboutSerial = useFileSession((s) => s.aboutSerial);
+  useEffect(() => {
+    if (focusSerial > 0) select("graph");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSerial]);
+  useEffect(() => {
+    if (aboutSerial > 0) setAboutOpen(true);
+  }, [aboutSerial]);
 
   // ⌘/Ctrl + 1…9 jumps to a tool (Graphs = 7, Plate Mapper = 8, Figures = 9).
   useEffect(() => {

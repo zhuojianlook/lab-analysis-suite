@@ -1,6 +1,7 @@
 import { ThemeProvider, createTheme, CssBaseline } from "@mui/material";
 import { AppShell } from "./components/layout/AppShell";
 import { UpdaterHost } from "./components/shared/UpdaterHost";
+import { FilesHost } from "./components/graph/files-ui/FilesHost";
 
 const darkTheme = createTheme({
   palette: {
@@ -51,6 +52,7 @@ export default function App() {
       <CssBaseline />
       <AppShell />
       <UpdaterHost />
+      <FilesHost />
     </ThemeProvider>
   );
 }

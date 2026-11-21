@@ -257,8 +257,8 @@ describe("two computers", () => {
     const to = `${DIR}/Dose response v2.lag`;
     a.rename(P, to, 0);
     w.clock.settle();
-    expect(a.events).toContainEqual({ type: "moved", from: P, to });
-    expect(b.events).toContainEqual({ type: "moved", from: P, to });
+    expect(a.events).toContainEqual({ type: "moved", from: P, to, head: "r-1" });
+    expect(b.events).toContainEqual({ type: "moved", from: P, to, head: "r-1" });
     expect(b.events.some((e) => e.type === "missing")).toBe(false);
     expect(b.trackedPaths()).toEqual([to]);
     expect(w.cloudPaths()).toEqual([to]);
@@ -274,7 +274,7 @@ describe("two computers", () => {
     w.clock.advance(3000 + MISSING_CONFIRM_MS);
     expect(b.events).toEqual([{ type: "missing", path: P, candidates: [] }]);
     w.clock.settle();
-    expect(b.events).toEqual([{ type: "missing", path: P, candidates: [] }, { type: "moved", from: P, to }]);
+    expect(b.events).toEqual([{ type: "missing", path: P, candidates: [] }, { type: "moved", from: P, to, head: "r-1" }]);
   });
 
   it("a save to a path renamed away goes to the file it was renamed to", async () => {

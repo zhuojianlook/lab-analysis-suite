@@ -9,14 +9,18 @@ import RefreshIcon from "@mui/icons-material/Refresh";
 import TableChartIcon from "@mui/icons-material/TableChart";
 import GridOnIcon from "@mui/icons-material/GridOn";
 import CalculateOutlinedIcon from "@mui/icons-material/CalculateOutlined";
-import { analyzeGraph, getGraphAnalysis, isGraphError, plotGraph, type AnalyzeResult, type GraphPlotResult } from "../../api/graph";
-import { clearDraft, isDirty, readDraft, useGraphStore, writeDraft, type DraftStatus } from "../../store/graphStore";
+import { analyzeGraph, plotGraph, type AnalyzeResult, type GraphPlotResult } from "../../api/graph";
+import { useGraphStore } from "../../store/graphStore";
 import { PlotResult } from "../shared/PlotResult";
 import { Workspace } from "../shared/Workspace";
 import { RailHeading, RailSection } from "../shared/RailSection";
 import { NumberField } from "../shared/NumberField";
 import { DataGrid } from "./DataGrid";
-import { FileBar, MOD_KEY, StartScreen, useGraphLibrary } from "./GraphLibrary";
+import { MOD_KEY, StartScreen } from "./GraphLibrary";
+import { useFileSession } from "./file/session";
+import { FILE_TABS_HEIGHT, FileTabs } from "./files-ui/FileTabs";
+import { DOC_BAR_HEIGHT, DocBar } from "./files-ui/DocBar";
+import { RestoreCardView } from "./files-ui/RestoreCardView";
 import { GraphAnalysisControls } from "./GraphAnalysisControls";
 import { GraphFigureControls, TitleFields } from "./GraphFigureControls";
 import { FigureTextPanel, readTextPanelOpen, writeTextPanelOpen } from "./FigureTextPanel";
@@ -181,11 +185,12 @@ function ScratchRail() {
   );
 }
 
-// Restore an unsaved document left over from the last session (once per app run).
-let draftChecked = false;
+/** Height the tab strip and the document bar add above the workspace, compared
+ *  with the single file bar the canvas heights below were tuned for. */
+const CHROME = FILE_TABS_HEIGHT + DOC_BAR_HEIGHT - 42;
 
-export function GraphView() {
-  const lib = useGraphLibrary();
+/** The open document: rail, canvas tabs and live analysis / figure. */
+function GraphEditor() {
   const doc = useGraphStore((s) => s.doc);
   const analysis = useGraphStore((s) => s.analysis);
   const figure = useGraphStore((s) => s.figure);
@@ -196,11 +201,6 @@ export function GraphView() {
   const store = useGraphStore;
 
   const name = useGraphStore((s) => s.name);
-  const [restored, setRestored] = useState(false);
-  /** How the scratchpad was restored when the draft backup had to leave it out. */
-  const [scratchRestoreNote, setScratchRestoreNote] = useState<string | null>(null);
-  /** Why unsaved changes aren't being kept as a local draft (null = they are, or nothing to keep). */
-  const [draftProblem, setDraftProblem] = useState<Exclude<DraftStatus, "saved"> | null>(null);
   const [open, setOpen] = useState<Record<Step, boolean>>({ table: true, analysis: true, graph: false });
   const [canvasTab, setCanvasTab] = useState<CanvasTab>("data");
   const [graphSeen, setGraphSeen] = useState(false);
@@ -223,66 +223,6 @@ export function GraphView() {
   const plotSeq = useRef(0);
   const plotKeyRendered = useRef<string | null>(null);
 
-  // ── restore a draft on first mount ────────────────────────────────────────
-  useEffect(() => {
-    if (draftChecked) return;
-    draftChecked = true;
-    if (store.getState().doc) return;
-    const d = readDraft();
-    if (!d) return;
-    // openedAs "draft" makes the per-document effect show the "restored" notice.
-    const restore = (scratch: unknown, id: number | null, name: string, note: string | null) => {
-      store.getState().load({ doc: d.doc, analysis: d.analysis, figure: d.figure, name, id, saved: false, scratch });
-      setScratchRestoreNote(note);
-    };
-    if (!d.scratchOmitted) { restore(d.scratchpad, d.currentId, d.name, null); return; }
-    // The scratchpad was too large for the backup. Never restore it as empty under the
-    // saved analysis's id (saving would erase the saved scratchpad): use the saved one.
-    if (d.currentId === null) {
-      restore(null, null, d.name, "The scratchpad was too large for the automatic backup, so it couldn't be restored.");
-      return;
-    }
-    const id = d.currentId;
-    let tries = 0;
-    const attempt = () => {
-      getGraphAnalysis(id).then((res) => {
-        if (store.getState().doc) return;
-        if (isGraphError(res) || !res.analysis) throw new Error("not available");
-        restore(res.analysis.scratchpad ?? null, id, d.name,
-          "The scratchpad was too large for the automatic backup: its last saved version was restored.");
-      }).catch(() => {
-        if (store.getState().doc) return;
-        if (++tries < 5) { setTimeout(attempt, 1500); return; }
-        restore(null, null, d.name ? `${d.name} (recovered)` : "",
-          "The scratchpad was too large for the automatic backup and its saved version couldn't be read, so these changes were restored "
-          + "as a new, unsaved analysis (saving it won't overwrite the saved one).");
-      });
-    };
-    attempt();
-  }, [store]);
-
-  // ── autosave unsaved changes as a local draft (debounced) ─────────────────
-  useEffect(() => {
-    let t: ReturnType<typeof setTimeout> | null = null;
-    const unsub = store.subscribe((s, prev) => {
-      if (s.doc === prev.doc && s.analysis === prev.analysis && s.figure === prev.figure && s.name === prev.name
-        && s.savedSnapshot === prev.savedSnapshot && s.scratch === prev.scratch && s.savedScratch === prev.savedScratch) return;
-      if (t) clearTimeout(t);
-      t = setTimeout(() => {
-        flushScratch();
-        const cur = store.getState();
-        if (isDirty(cur)) {
-          const st = writeDraft(cur);
-          setDraftProblem(st === "saved" ? null : st);
-        } else {
-          clearDraft();
-          setDraftProblem(null);
-        }
-      }, 1000);
-    });
-    return () => { unsub(); if (t) clearTimeout(t); };
-  }, [store]);
-
   // ── per-document view state ───────────────────────────────────────────────
   useEffect(() => {
     anSeq.current++;
@@ -302,8 +242,6 @@ export function GraphView() {
     setCanvasTab(showGraph ? "graph" : "data");
     setGraphSeen(showGraph);
     setOpen({ table: !showGraph, analysis: true, graph: showGraph });
-    setRestored(openedAs === "draft");
-    if (openedAs !== "draft") setScratchRestoreNote(null);
   }, [docSerial, openedAs]);
 
   // ── derived data ──────────────────────────────────────────────────────────
@@ -410,7 +348,7 @@ export function GraphView() {
   const plotStale = !!plot && plotKey !== plotKeyRendered.current && !plotting;
 
   // ── start screen ──────────────────────────────────────────────────────────
-  if (!doc || !table) return <StartScreen lib={lib} />;
+  if (!doc || !table) return <CanvasSpinner />;
 
   // ── rail ──────────────────────────────────────────────────────────────────
   const st = store.getState();
@@ -564,31 +502,8 @@ export function GraphView() {
     setPasteNote({ tone: r.truncated ? "warning" : "success", text: `${parts.join("; ")}. ${MOD_KEY} + Z undoes it.` });
   };
 
-  const sharedAlerts = (
-    <>
-      {restored && (
-        <Alert severity="info" onClose={() => setRestored(false)}>
-          Unsaved changes restored from your last session.
-        </Alert>
-      )}
-      {scratchRestoreNote && (
-        <Alert severity="warning" onClose={() => setScratchRestoreNote(null)}>{scratchRestoreNote}</Alert>
-      )}
-      {draftProblem && (
-        <Alert severity="warning">
-          {draftProblem === "too_large"
-            ? "This table is too large to keep unsaved changes automatically. Save it to keep your changes."
-            : draftProblem === "no_scratch"
-              ? "The scratchpad is too large to be included in the automatic backup of unsaved changes. Save to keep it."
-              : "Unsaved changes couldn't be kept as a local backup. Save to keep your changes."}
-        </Alert>
-      )}
-    </>
-  );
-
   const dataBody = (
     <Stack spacing={1.25} sx={{ minHeight: 0, flexGrow: 1 }}>
-      {sharedAlerts}
       {pasteNote && <Alert severity={pasteNote.tone} onClose={() => setPasteNote(null)}>{pasteNote.text}</Alert>}
       {invalid > 0 && (
         <Alert severity="warning">
@@ -600,7 +515,7 @@ export function GraphView() {
         {template === "column" ? " Each column is a group, each row one value." : template === "grouped"
           ? " Each row is a level of the row factor; each group has one sub-column per replicate." : " Each row is one X value with its Y values."}
       </Typography>
-      <DataGrid onPasted={onPasted} maxHeight="calc(100vh - 230px)" />
+      <DataGrid onPasted={onPasted} maxHeight={`calc(100vh - ${230 + CHROME}px)`} />
     </Stack>
   );
 
@@ -641,7 +556,7 @@ export function GraphView() {
           {/* stacked: cap the figure so the open legend panel starts above the fold */}
           <FigureView result={plot} busy={plotting} baseName={baseName}
             fitHeight={(() => {
-              const full = alerts ? "calc(100vh - 306px)" : "calc(100vh - 246px)";
+              const full = alerts ? `calc(100vh - ${306 + CHROME}px)` : `calc(100vh - ${246 + CHROME}px)`;
               return side || !textOpen ? full : `min(${full}, 42vh)`;
             })()} />
         </Stack>
@@ -657,7 +572,6 @@ export function GraphView() {
 
   const scratchBody = (
     <Stack spacing={1.25} sx={{ minHeight: 0, flexGrow: 1 }}>
-      {sharedAlerts}
       <ScratchBoundary>
         <Suspense fallback={
           <Box sx={{ flexGrow: 1, display: "grid", placeItems: "center" }}>
@@ -678,7 +592,6 @@ export function GraphView() {
 
   return (
     <Workspace rail={<>{canvasTab === "scratch" && <ScratchRail />}{tableSection}{analysisSection}{graphSection}</>} railFooter={railFooter} onKeyDown={onKeyDown}>
-      <FileBar lib={lib} />
       <Box sx={{ display: "flex", alignItems: "center", px: 2, borderBottom: 1, borderColor: "divider", flexShrink: 0, minHeight: 44 }}>
         <Tabs value={canvasTab} onChange={(_, v) => setCanvasTab(v)} variant="scrollable" scrollButtons={false} sx={tabSx}>
           <Tab value="scratch" label="Scratchpad" icon={<CalculateOutlinedIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
@@ -704,5 +617,52 @@ export function GraphView() {
       </Box>
       <Box sx={{ p: 2, flexGrow: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>{body}</Box>
     </Workspace>
+  );
+}
+
+function CanvasSpinner({ overlay }: { overlay?: boolean }) {
+  return (
+    <Box data-testid="canvas-busy" sx={{
+      position: "absolute", inset: 0, display: "grid", placeItems: "center", zIndex: 2,
+      bgcolor: overlay ? "rgba(28,28,30,0.55)" : "background.default",
+    }}>
+      <CircularProgress size={28} />
+    </Box>
+  );
+}
+
+/** The Graphs tool: open analyses as tabs; the active one's document bar and
+ *  workspace, its restore card, or the start screen (contract §5.2). */
+export function GraphView() {
+  const ready = useFileSession((s) => s.ready);
+  const hasTabs = useFileSession((s) => s.tabs.length > 0);
+  const activeKey = useFileSession((s) => s.activeKey);
+  const tab = useFileSession((s) => s.tabs.find((t) => t.key === s.activeKey) ?? null);
+  const card = useFileSession((s) => s.cards.find((c) => c.key === s.activeKey) ?? null);
+  const busy = useFileSession((s) => s.busy);
+  const loadedKey = useGraphStore((s) => (s.doc ? s.file?.docKey ?? null : null));
+  const loaded = !!activeKey && loadedKey === activeKey;
+
+  let main: ReactNode;
+  if (!ready && !hasTabs) main = <CanvasSpinner />;
+  else if (activeKey === null || !tab) main = <StartScreen />;
+  else if (card) main = <RestoreCardView card={card} />;
+  else {
+    main = (
+      <>
+        <DocBar tab={tab} />
+        <Box sx={{ position: "relative", flexGrow: 1, minHeight: 0 }}>
+          {loaded && <Box sx={{ position: "absolute", inset: 0 }}><GraphEditor /></Box>}
+          {(!loaded || busy || tab.status === "opening") && <CanvasSpinner overlay={loaded} />}
+        </Box>
+      </>
+    );
+  }
+
+  return (
+    <Box sx={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
+      {hasTabs && <FileTabs />}
+      <Box sx={{ flexGrow: 1, minHeight: 0, display: "flex", flexDirection: "column", position: "relative" }}>{main}</Box>
+    </Box>
   );
 }

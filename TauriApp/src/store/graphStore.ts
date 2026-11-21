@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create, type StoreApi, type UseBoundStore } from "zustand";
 import type { GraphAnalysis, GraphDoc, GraphFigure, Template } from "../api/graph";
 import * as M from "../components/graph/graphModel";
 import { sanitizeScratch, type ScratchDoc } from "../components/graph/scratchpad/scratchModel";
@@ -22,6 +22,27 @@ interface Snapshot {
 }
 
 const UNDO_LIMIT = 20;
+
+/** Which analysis file the open document is (phase 1: analyses saved as files). */
+export interface FileRef {
+  /** Local key of the open document (session tab, draft). */
+  docKey: string;
+  /** null only for documents that have none yet. */
+  analysisId: string | null;
+  /** Head of the file the content is based on; null = never saved. */
+  baseRevision: string | null;
+  /** null = untitled. */
+  path: string | null;
+}
+
+/** The content of a document as the store holds it (index-based open form). */
+export interface DocContent {
+  doc: GraphDoc;
+  analysis: GraphAnalysis;
+  figure: GraphFigure;
+  /** Canonical scratchpad text ("" = empty). */
+  scratch: string;
+}
 
 export interface GraphState {
   /** The open document; null = start screen. */
@@ -50,6 +71,10 @@ export interface GraphState {
   scratch: string;
   /** `scratch` at the last save/open (null when savedSnapshot is null). */
   savedScratch: string | null;
+  /** The file this document is (null = the old in-app library / nothing open). */
+  file: FileRef | null;
+  /** Bumped by every change of doc, analysis, figure or scratch (edits, loads, reloads). */
+  editSerial: number;
 
   newDoc: (t: Template, sample: boolean) => void;
   load: (p: {
@@ -89,6 +114,24 @@ export interface GraphState {
 
   setAnalysis: (patch: Partial<GraphAnalysis> | ((a: GraphAnalysis) => GraphAnalysis)) => void;
   setFigure: (patch: Partial<GraphFigure> | ((f: GraphFigure) => GraphFigure)) => void;
+
+  // ── analyses saved as files (phase 1) ──
+  /** Open a file's content: the load pipeline (ids → defaults → clean-up), the baseline
+   *  taken afterwards. `name` is the tab title (never makes the document dirty).
+   *  `inPlace`: a reload of the same document (docSerial kept, so the Scratchpad session
+   *  survives when its text is unchanged). */
+  loadFile: (p: {
+    file: FileRef; name: string; doc: GraphDoc; analysis?: Partial<GraphAnalysis>; figure?: Partial<GraphFigure>;
+    scratch?: unknown; saved: boolean; inPlace?: boolean;
+  }) => void;
+  /** Put unsaved work (a draft) on top of a loaded file: content changes; the baseline and `file` stay. */
+  replaceWorking: (p: { doc: GraphDoc; analysis?: Partial<GraphAnalysis>; figure?: Partial<GraphFigure>; scratch?: unknown }) => void;
+  /** Saved as `file`. `sent` is the round-tripped file form of what was saved: it becomes the
+   *  baseline, and the in-memory content when nothing was edited since the save was built
+   *  (`editSerialAtBuild`; omitted = nothing was). */
+  markFileSaved: (file: FileRef, name: string, sent: DocContent, editSerialAtBuild?: number) => void;
+  /** Path / base / id change without touching the content (rename follow, Save As). */
+  setFileRef: (patch: Partial<FileRef>, name?: string) => void;
 }
 
 /** The saved content (table incl. row/column ids, analysis, figure); compared to
@@ -158,215 +201,271 @@ function mergeSettings(doc: GraphDoc, analysis?: Partial<GraphAnalysis>, figure?
 
 const placeholder = defaultsFor(M.emptyDoc("column"));
 
-export const useGraphStore = create<GraphState>((set, get) => {
-  /** Apply a change to the open document, recording an undo step. */
-  const edit = (fn: (s: GraphState) => Partial<GraphState> | null) =>
-    set((s) => {
-      if (!s.doc) return {};
-      const patch = fn(s);
-      if (!patch) return {};
-      return { ...patch, undoStack: pushUndo(s, true), lastEditKey: null };
-    });
+/** The load pipeline without the store: ids minted where missing, settings layered
+ *  over the defaults and cleaned up, scratchpad sanitized. Opening this content
+ *  never changes it. */
+export function openContent(p: { doc: GraphDoc; analysis?: Partial<GraphAnalysis>; figure?: Partial<GraphFigure>; scratch?: unknown }): DocContent {
+  const doc = M.withIds(p.doc);
+  return { doc, ...openSettings(doc, p.analysis, p.figure), scratch: sanitizeScratch(p.scratch) };
+}
 
-  /** Typing in one cell: one undo step per cell, not per keystroke. */
-  const type = (key: string, fn: (doc: GraphDoc) => GraphDoc, extra?: (s: GraphState) => Partial<GraphState>) =>
-    set((s) => {
-      if (!s.doc) return {};
-      return {
-        doc: fn(s.doc),
-        ...(extra ? extra(s) : {}),
-        undoStack: s.lastEditKey === key ? s.undoStack : pushUndo(s, false),
-        lastEditKey: key,
-      };
-    });
+const CONTENT_KEYS = ["doc", "analysis", "figure", "scratch"] as const;
 
-  return {
-    doc: null,
-    analysis: placeholder.analysis,
-    figure: placeholder.figure,
-    name: "",
-    savedName: null,
-    currentId: null,
-    savedSnapshot: null,
-    undoStack: [],
-    lastEditKey: null,
-    docSerial: 0,
-    openedAs: "new",
-    scratch: "",
-    savedScratch: null,
+export type GraphStoreApi = UseBoundStore<StoreApi<GraphState>>;
 
-    newDoc: (t, sample) => {
-      const doc = sample ? M.sampleDoc(t) : M.emptyDoc(t);
-      const d = defaultsFor(doc);
-      const next = { doc, ...M.normalizeSettings(doc, d.analysis, d.figure), name: "" };
-      // A fresh document only counts as changed once it is edited.
-      set((s) => ({
-        ...next, savedName: "", currentId: null, savedSnapshot: snapshotKey(next), undoStack: [], lastEditKey: null,
-        docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new", scratch: "", savedScratch: "",
-      }));
-    },
+/** A graph store (the app has one, `useGraphStore`; tests make one per simulated computer). */
+export function createGraphStore(): GraphStoreApi {
+  return create<GraphState>((rawSet, get) => {
+    /** Every update that changes the content bumps editSerial. */
+    const set: typeof rawSet = ((partial: unknown, replace?: boolean) => rawSet((s: GraphState) => {
+      const p = (typeof partial === "function" ? (partial as (s: GraphState) => Partial<GraphState>)(s) : partial) as Partial<GraphState> | null;
+      if (!p) return {};
+      const changed = CONTENT_KEYS.some((k) => k in p && p[k] !== s[k]);
+      return changed && !("editSerial" in p) ? { ...p, editSerial: s.editSerial + 1 } : p;
+    }, replace as false | undefined)) as typeof rawSet;
 
-    load: ({ doc: raw, analysis, figure, name, id, saved, scratch }) => {
-      // Ids minted for documents without them, defaults, clean-up: all before the
-      // baseline, so a document is unchanged until the user changes it.
-      const doc = M.withIds(raw);
-      const next = { doc, ...openSettings(doc, analysis, figure), name };
-      const sc = sanitizeScratch(scratch);
-      set((s) => ({
-        ...next, savedName: saved ? name : null, currentId: id, savedSnapshot: saved ? snapshotKey(next) : null,
-        undoStack: [], lastEditKey: null,
-        docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft", scratch: sc, savedScratch: saved ? sc : null,
-      }));
-    },
-
-    close: () => set((s) => ({
-      doc: null, name: "", savedName: null, currentId: null, savedSnapshot: null, undoStack: [], lastEditKey: null, docSerial: s.docSerial + 1,
-      scratch: "", savedScratch: null,
-    })),
-
-    setName: (name) => set({ name }),
-
-    markSaved: (id, name, sent) => set({
-      name, savedName: name, currentId: id, savedSnapshot: snapshotKey(sent), savedScratch: sent.scratch,
-    }),
-
-    // Renamed in the library: the saved version now carries the new name.
-    markRenamed: (name) => set({ name, savedName: name }),
-
-    // The open document's library record was deleted: keep it on screen, unsaved.
-    detach: () => set({ currentId: null, savedSnapshot: null, savedScratch: null, savedName: null }),
-
-    setScratch: (text) => set((s) => (s.scratch === text ? {} : { scratch: text })),
-
-    normalize: () => set((s) => {
-      if (!s.doc) return {};
-      const n = M.normalizeSettings(s.doc, s.analysis, s.figure);
-      return n.analysis === s.analysis && n.figure === s.figure ? {} : n;
-    }),
-
-    setCell: (r, c, k, v) =>
-      type(`c:${r}:${c}:${k}`, (doc) => {
-        const cells = [...doc.cells];
-        const row = [...cells[r]];
-        const reps = [...row[c]];
-        reps[k] = v;
-        row[c] = reps;
-        cells[r] = row;
-        return M.ensureRows({ ...doc, cells });
-      }),
-
-    setX: (r, v) =>
-      type(`x:${r}`, (doc) => {
-        const x = [...doc.x];
-        x[r] = v;
-        return M.ensureRows({ ...doc, x });
-      }),
-
-    setRowTitle: (r, v) =>
-      type(`rt:${r}`, (doc) => {
-        const row_titles = [...doc.row_titles];
-        row_titles[r] = v;
-        return M.ensureRows({ ...doc, row_titles });
-      }),
-
-    setColTitle: (c, v) =>
-      type(`ct:${c}`, (doc) => {
-        const col_titles = [...doc.col_titles];
-        col_titles[c] = v;
-        return { ...doc, col_titles };
-      }),
-
-    // The X axis label follows the X column title until it is edited separately.
-    setXTitle: (v) =>
-      type("xt", (doc) => ({ ...doc, x_title: v }), (s) => {
-        const figure = M.followXLabel(s.figure, s.doc!.x_title, v);
-        return figure === s.figure ? {} : { figure };
-      }),
-
-    setNRep: (n) => edit((s) => {
-      const doc = M.setNRep(s.doc!, n);
-      return doc === s.doc ? null : { doc };
-    }),
-
-    insertCol: (at) => edit((s) => {
-      const doc = M.insertCol(s.doc!, at);
-      if (doc === s.doc) return null;
-      const op: M.IndexOp = { type: "insert", at };
-      return { doc, analysis: M.remapAnalysis(s.analysis, doc.template, "col", op), figure: M.remapFigure(s.figure, op) };
-    }),
-
-    deleteCol: (c) => edit((s) => {
-      if (s.doc!.col_titles.length <= 1) return { doc: M.clearCol(s.doc!, c) };
-      const op: M.IndexOp = { type: "delete", at: c };
-      return {
-        doc: M.deleteCol(s.doc!, c),
-        analysis: M.remapAnalysis(s.analysis, s.doc!.template, "col", op),
-        figure: M.remapFigure(s.figure, op),
-      };
-    }),
-
-    clearCol: (c) => edit((s) => ({ doc: M.clearCol(s.doc!, c) })),
-
-    insertRow: (at) => edit((s) => {
-      const doc = M.insertRow(s.doc!, at);
-      if (doc === s.doc) return null;
-      return { doc, analysis: M.remapAnalysis(s.analysis, doc.template, "row", { type: "insert", at }) };
-    }),
-
-    deleteRow: (r) => edit((s) => ({
-      doc: M.deleteRow(s.doc!, r),
-      analysis: M.remapAnalysis(s.analysis, s.doc!.template, "row", { type: "delete", at: r }),
-    })),
-
-    clearRow: (r) => edit((s) => ({ doc: M.clearRow(s.doc!, r) })),
-
-    paste: (anchor, text) => {
-      const s = get();
-      if (!s.doc) return null;
-      const res = M.applyPaste(s.doc, anchor, text);
-      if (!res) return null;
-      // A title line can set the X title: the axis label follows it as when typed.
-      const figure = M.followXLabel(M.resizeSeries(s.figure, res.doc.col_titles.length), s.doc.x_title, res.doc.x_title);
-      set({ doc: res.doc, figure, undoStack: pushUndo(s, true), lastEditKey: null });
-      return res;
-    },
-
-    sendBlock: (anchor, text, clearFirst) => {
-      const s = get();
-      if (!s.doc) return null;
-      const res = M.applyPaste(clearFirst ? M.clearValues(s.doc) : s.doc, anchor, text);
-      if (!res) return null;
-      const figure = M.followXLabel(M.resizeSeries(s.figure, res.doc.col_titles.length), s.doc.x_title, res.doc.x_title);
-      set({ doc: res.doc, figure, undoStack: pushUndo(s, true), lastEditKey: null });
-      return res;
-    },
-
-    undo: () => {
-      const s = get();
-      const prev = s.undoStack[s.undoStack.length - 1];
-      if (!prev || !s.doc) return false;
-      // An axis label still following the X title goes back with the title.
-      const following = M.followXLabel(s.figure, s.doc.x_title, prev.doc.x_title);
-      set({
-        doc: prev.doc,
-        ...(prev.structural ? {
-          figure: { ...following, colors: prev.colors, labels: prev.labels, ...prev.palette },
-          analysis: { ...s.analysis, control: prev.control, pairs: prev.pairs },
-        } : following === s.figure ? {} : { figure: following }),
-        undoStack: s.undoStack.slice(0, -1),
-        lastEditKey: null,
+    /** Apply a change to the open document, recording an undo step. */
+    const edit = (fn: (s: GraphState) => Partial<GraphState> | null) =>
+      set((s) => {
+        if (!s.doc) return {};
+        const patch = fn(s);
+        if (!patch) return {};
+        return { ...patch, undoStack: pushUndo(s, true), lastEditKey: null };
       });
-      return true;
-    },
 
-    setAnalysis: (patch) => set((s) => {
-      const analysis = typeof patch === "function" ? patch(s.analysis) : { ...s.analysis, ...patch };
-      return analysis === s.analysis ? {} : { analysis };
-    }),
+    /** Typing in one cell: one undo step per cell, not per keystroke. */
+    const type = (key: string, fn: (doc: GraphDoc) => GraphDoc, extra?: (s: GraphState) => Partial<GraphState>) =>
+      set((s) => {
+        if (!s.doc) return {};
+        return {
+          doc: fn(s.doc),
+          ...(extra ? extra(s) : {}),
+          undoStack: s.lastEditKey === key ? s.undoStack : pushUndo(s, false),
+          lastEditKey: key,
+        };
+      });
 
-    setFigure: (patch) => set((s) => ({ figure: typeof patch === "function" ? patch(s.figure) : { ...s.figure, ...patch } })),
-  };
-});
+    return {
+      doc: null,
+      analysis: placeholder.analysis,
+      figure: placeholder.figure,
+      name: "",
+      savedName: null,
+      currentId: null,
+      savedSnapshot: null,
+      undoStack: [],
+      lastEditKey: null,
+      docSerial: 0,
+      openedAs: "new",
+      scratch: "",
+      savedScratch: null,
+      file: null,
+      editSerial: 0,
+
+      newDoc: (t, sample) => {
+        const doc = sample ? M.sampleDoc(t) : M.emptyDoc(t);
+        const d = defaultsFor(doc);
+        const next = { doc, ...M.normalizeSettings(doc, d.analysis, d.figure), name: "" };
+        // A fresh document only counts as changed once it is edited.
+        set((s) => ({
+          ...next, savedName: "", currentId: null, savedSnapshot: snapshotKey(next), undoStack: [], lastEditKey: null,
+          docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new", scratch: "", savedScratch: "", file: null,
+        }));
+      },
+
+      load: ({ doc: raw, analysis, figure, name, id, saved, scratch }) => {
+        // Ids minted for documents without them, defaults, clean-up: all before the
+        // baseline, so a document is unchanged until the user changes it.
+        const doc = M.withIds(raw);
+        const next = { doc, ...openSettings(doc, analysis, figure), name };
+        const sc = sanitizeScratch(scratch);
+        set((s) => ({
+          ...next, savedName: saved ? name : null, currentId: id, savedSnapshot: saved ? snapshotKey(next) : null,
+          undoStack: [], lastEditKey: null,
+          docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft", scratch: sc, savedScratch: saved ? sc : null, file: null,
+        }));
+      },
+
+      close: () => set((s) => ({
+        doc: null, name: "", savedName: null, currentId: null, savedSnapshot: null, undoStack: [], lastEditKey: null, docSerial: s.docSerial + 1,
+        scratch: "", savedScratch: null, file: null,
+      })),
+
+      setName: (name) => set({ name }),
+
+      markSaved: (id, name, sent) => set({
+        name, savedName: name, currentId: id, savedSnapshot: snapshotKey(sent), savedScratch: sent.scratch,
+      }),
+
+      // Renamed in the library: the saved version now carries the new name.
+      markRenamed: (name) => set({ name, savedName: name }),
+
+      // The open document's library record was deleted: keep it on screen, unsaved.
+      detach: () => set({ currentId: null, savedSnapshot: null, savedScratch: null, savedName: null }),
+
+      setScratch: (text) => set((s) => (s.scratch === text ? {} : { scratch: text })),
+
+      normalize: () => set((s) => {
+        if (!s.doc) return {};
+        const n = M.normalizeSettings(s.doc, s.analysis, s.figure);
+        return n.analysis === s.analysis && n.figure === s.figure ? {} : n;
+      }),
+
+      setCell: (r, c, k, v) =>
+        type(`c:${r}:${c}:${k}`, (doc) => {
+          const cells = [...doc.cells];
+          const row = [...cells[r]];
+          const reps = [...row[c]];
+          reps[k] = v;
+          row[c] = reps;
+          cells[r] = row;
+          return M.ensureRows({ ...doc, cells });
+        }),
+
+      setX: (r, v) =>
+        type(`x:${r}`, (doc) => {
+          const x = [...doc.x];
+          x[r] = v;
+          return M.ensureRows({ ...doc, x });
+        }),
+
+      setRowTitle: (r, v) =>
+        type(`rt:${r}`, (doc) => {
+          const row_titles = [...doc.row_titles];
+          row_titles[r] = v;
+          return M.ensureRows({ ...doc, row_titles });
+        }),
+
+      setColTitle: (c, v) =>
+        type(`ct:${c}`, (doc) => {
+          const col_titles = [...doc.col_titles];
+          col_titles[c] = v;
+          return { ...doc, col_titles };
+        }),
+
+      // The X axis label follows the X column title until it is edited separately.
+      setXTitle: (v) =>
+        type("xt", (doc) => ({ ...doc, x_title: v }), (s) => {
+          const figure = M.followXLabel(s.figure, s.doc!.x_title, v);
+          return figure === s.figure ? {} : { figure };
+        }),
+
+      setNRep: (n) => edit((s) => {
+        const doc = M.setNRep(s.doc!, n);
+        return doc === s.doc ? null : { doc };
+      }),
+
+      insertCol: (at) => edit((s) => {
+        const doc = M.insertCol(s.doc!, at);
+        if (doc === s.doc) return null;
+        const op: M.IndexOp = { type: "insert", at };
+        return { doc, analysis: M.remapAnalysis(s.analysis, doc.template, "col", op), figure: M.remapFigure(s.figure, op) };
+      }),
+
+      deleteCol: (c) => edit((s) => {
+        if (s.doc!.col_titles.length <= 1) return { doc: M.clearCol(s.doc!, c) };
+        const op: M.IndexOp = { type: "delete", at: c };
+        return {
+          doc: M.deleteCol(s.doc!, c),
+          analysis: M.remapAnalysis(s.analysis, s.doc!.template, "col", op),
+          figure: M.remapFigure(s.figure, op),
+        };
+      }),
+
+      clearCol: (c) => edit((s) => ({ doc: M.clearCol(s.doc!, c) })),
+
+      insertRow: (at) => edit((s) => {
+        const doc = M.insertRow(s.doc!, at);
+        if (doc === s.doc) return null;
+        return { doc, analysis: M.remapAnalysis(s.analysis, doc.template, "row", { type: "insert", at }) };
+      }),
+
+      deleteRow: (r) => edit((s) => ({
+        doc: M.deleteRow(s.doc!, r),
+        analysis: M.remapAnalysis(s.analysis, s.doc!.template, "row", { type: "delete", at: r }),
+      })),
+
+      clearRow: (r) => edit((s) => ({ doc: M.clearRow(s.doc!, r) })),
+
+      paste: (anchor, text) => {
+        const s = get();
+        if (!s.doc) return null;
+        const res = M.applyPaste(s.doc, anchor, text);
+        if (!res) return null;
+        // A title line can set the X title: the axis label follows it as when typed.
+        const figure = M.followXLabel(M.resizeSeries(s.figure, res.doc.col_titles.length), s.doc.x_title, res.doc.x_title);
+        set({ doc: res.doc, figure, undoStack: pushUndo(s, true), lastEditKey: null });
+        return res;
+      },
+
+      sendBlock: (anchor, text, clearFirst) => {
+        const s = get();
+        if (!s.doc) return null;
+        const res = M.applyPaste(clearFirst ? M.clearValues(s.doc) : s.doc, anchor, text);
+        if (!res) return null;
+        const figure = M.followXLabel(M.resizeSeries(s.figure, res.doc.col_titles.length), s.doc.x_title, res.doc.x_title);
+        set({ doc: res.doc, figure, undoStack: pushUndo(s, true), lastEditKey: null });
+        return res;
+      },
+
+      undo: () => {
+        const s = get();
+        const prev = s.undoStack[s.undoStack.length - 1];
+        if (!prev || !s.doc) return false;
+        // An axis label still following the X title goes back with the title.
+        const following = M.followXLabel(s.figure, s.doc.x_title, prev.doc.x_title);
+        set({
+          doc: prev.doc,
+          ...(prev.structural ? {
+            figure: { ...following, colors: prev.colors, labels: prev.labels, ...prev.palette },
+            analysis: { ...s.analysis, control: prev.control, pairs: prev.pairs },
+          } : following === s.figure ? {} : { figure: following }),
+          undoStack: s.undoStack.slice(0, -1),
+          lastEditKey: null,
+        });
+        return true;
+      },
+
+      setAnalysis: (patch) => set((s) => {
+        const analysis = typeof patch === "function" ? patch(s.analysis) : { ...s.analysis, ...patch };
+        return analysis === s.analysis ? {} : { analysis };
+      }),
+
+      setFigure: (patch) => set((s) => ({ figure: typeof patch === "function" ? patch(s.figure) : { ...s.figure, ...patch } })),
+
+      loadFile: ({ file, name, doc, analysis, figure, scratch, saved, inPlace }) => {
+        const c = openContent({ doc, analysis, figure, scratch });
+        set((s) => ({
+          ...c, name, savedName: name, currentId: null, file: { ...file },
+          savedSnapshot: saved ? snapshotKey(c) : null, savedScratch: saved ? c.scratch : null,
+          undoStack: [], lastEditKey: null,
+          docSerial: inPlace ? s.docSerial : s.docSerial + 1, openedAs: saved ? "saved" : "draft",
+        }));
+      },
+
+      replaceWorking: (p) => {
+        if (!get().doc) return;
+        const c = openContent(p);
+        set({ ...c, undoStack: [], lastEditKey: null });
+      },
+
+      markFileSaved: (file, name, sent, editSerialAtBuild) => set((s) => {
+        const untouched = editSerialAtBuild === undefined || editSerialAtBuild === s.editSerial;
+        return {
+          ...(untouched ? { doc: sent.doc, analysis: sent.analysis, figure: sent.figure, scratch: sent.scratch } : {}),
+          name, savedName: name, file: { ...file }, savedSnapshot: snapshotKey(sent), savedScratch: sent.scratch,
+        };
+      }),
+
+      setFileRef: (patch, name) => set((s) => ({
+        file: { ...(s.file ?? { docKey: "", analysisId: null, baseRevision: null, path: null }), ...patch },
+        ...(name !== undefined ? { name, savedName: s.savedName === null ? null : name } : {}),
+      })),
+    };
+  });
+}
+
+export const useGraphStore = createGraphStore();
 
 // ── local persistence (best-effort: storage can be unavailable) ─────────────
 
