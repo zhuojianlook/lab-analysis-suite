@@ -1,4 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Reference only: releases do NOT build from this file. .github/workflows/
+# release.yml runs `pyinstaller --onedir --name las-engine ... api_server.py`
+# with its own flags (and regenerates a las-engine.spec in CI as it does).
+# Change the engine build there; the name must stay las-engine (engine.rs).
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
@@ -40,7 +44,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='api-server',
+    name='las-engine',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

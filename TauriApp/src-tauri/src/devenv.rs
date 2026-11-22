@@ -1,10 +1,12 @@
 //! Which engine port and which state folder this build uses.
 //!
-//! Release builds: the bundled engine on port 8765, and the app's own data
-//! folder for its records (overridable with `LAS_STATE_DIR`).
+//! Release builds: the bundled engine on a free port picked at each start
+//! (engine.rs), and the app's own data folder for its records (overridable
+//! with `LAS_STATE_DIR`).
 //!
-//! Falling back to 8765 or to the app data folder would silently talk to —
-//! and write into — the installed copy of the app. A debug build therefore
+//! Falling back to 8765 (the port release builds used up to 0.2.22, still used
+//! by other apps' engines) or to the app data folder would silently talk to —
+//! and write into — another app or the installed copy of this one. A debug build therefore
 //! refuses to start unless both `LAS_SIDECAR_PORT` and `LAS_STATE_DIR` are
 //! set, and refuses the installed app's port and folders even when they are
 //! given explicitly. It also runs under its own identifier (`DEV_IDENTIFIER`),
@@ -13,7 +15,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// Port the bundled engine is started on in release builds.
+/// The fixed engine port release builds used up to 0.2.22 (and other apps'
+/// engines still use). Nothing listens on it for this app any more; it is kept
+/// so a debug build refuses it and the port picker never chooses it.
 pub const RELEASE_SIDECAR_PORT: u16 = 8765;
 /// The installed app's bundle identifier (tauri.conf.json `identifier`).
 pub const RELEASE_IDENTIFIER: &str = "com.zhuojianlook.analysis";

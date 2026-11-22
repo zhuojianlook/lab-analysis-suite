@@ -59,15 +59,25 @@ npm install
 # Build the Python sidecar (PyInstaller)
 python -m venv .venv && . .venv/bin/activate
 pip install -r python-sidecar/requirements.txt
-./scripts/build-sidecar.sh                 # → src-tauri/binaries/api-server-<triple>
+./scripts/build-sidecar.sh                 # → src-tauri/binaries/las-engine-<triple>
 
-# Dev (run the engine separately, then Vite + Tauri). Port 8765 and the app's
-# own folders belong to the installed Lab Analysis Suite, so the dev engine gets
+# Dev (run the engine separately, then Vite + Tauri). Port 8765 (other apps'
+# engines; this app's releases up to 0.2.22) and the app's own folders belong
+# to someone else, so the dev engine gets
 # another port and a scratch data folder, and a debug build must be told both
 # (it refuses to start without LAS_SIDECAR_PORT / LAS_STATE_DIR, and refuses
 # 8765 or a folder inside the installed app's folders):
 LAS_DATA_DIR="$(mktemp -d)" python python-sidecar/api_server.py --port 8766 &
 LAS_SIDECAR_PORT=8766 LAS_STATE_DIR="$(mktemp -d)" npm run tauri dev
+
+# Or let the debug build start and supervise the engine like a release build
+# (free port, per-launch token, restart when it dies):
+LAS_DEV_ENGINE_CMD='["'"$PWD"'/.venv/bin/python", "-B", "'"$PWD"'/python-sidecar/api_server.py"]' \
+  LAS_SIDECAR_PORT=8766 LAS_STATE_DIR="$(mktemp -d)" npm run tauri dev
+
+# Check a built engine identifies itself (release CI runs this on the frozen
+# las-engine; it also takes the dev engine command):
+python scripts/smoke-engine.py python-sidecar/dist/las-engine/las-engine
 
 # Frontend unit tests (vitest):
 npm test

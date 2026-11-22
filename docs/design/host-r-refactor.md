@@ -44,7 +44,7 @@ The refactor's thesis: **delete the bundled engine, keep host-R discovery, add (
 
 Keep `"targets": "all"` for now (it's about *installer formats*, not R). **Recommendation:** leave `targets` alone — it's orthogonal to this refactor. Delete the now-empty `TauriApp/src-tauri/resources/r-env/` directory from the tree (and add `src-tauri/resources/` to `.gitignore` if it isn't already, in case the build script ever repopulates it during a power-user portable build).
 
-**Impact:** installer drops from the conda-env-bloated size to ~90MB (Tauri shell + WebView assets + the PyInstaller sidecar `binaries/api-server-*`). No R inside.
+**Impact:** installer drops from the conda-env-bloated size to ~90MB (Tauri shell + WebView assets + the PyInstaller sidecar `binaries/las-engine-*`, formerly `api-server-*`). No R inside.
 
 ### 1.2 `TauriApp/src-tauri/src/lib.rs` — the `--r-env-dir` arg
 

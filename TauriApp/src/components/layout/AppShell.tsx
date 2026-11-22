@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Box } from "@mui/material";
+import { Alert, Box, Snackbar } from "@mui/material";
 import BiotechIcon from "@mui/icons-material/Biotech";
 import TimelineIcon from "@mui/icons-material/Timeline";
 import ScatterPlotIcon from "@mui/icons-material/ScatterPlot";
@@ -10,7 +10,9 @@ import GridOnIcon from "@mui/icons-material/GridOn";
 import BarChartIcon from "@mui/icons-material/BarChart";
 import CollectionsIcon from "@mui/icons-material/Collections";
 import type { SvgIconComponent } from "@mui/icons-material";
-import { checkHealth, lastHealthError, getSidecarError } from "../../api/client";
+import { probeEngine, getSidecarError } from "../../api/client";
+import { engineStatusLine, nextPollDelayMs, wasRestarted } from "../../api/engineHealth";
+import { useEngineStore } from "../../store/engineStore";
 import { useRStore } from "../../store/rStore";
 import { useFiguresStore } from "../../store/figuresStore";
 import { AboutDialog } from "../shared/AboutDialog";
@@ -55,8 +57,6 @@ const PREF_COLLAPSED = "las.navCollapsed";
 const readPref = (k: string): string | null => { try { return localStorage.getItem(k); } catch { return null; } };
 const writePref = (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* ignore */ } };
 
-type Health = "checking" | "ok" | "down";
-
 export function AppShell() {
   const [active, setActive] = useState<string>(() => {
     const saved = readPref(PREF_TOOL);
@@ -71,8 +71,15 @@ export function AppShell() {
     return saved === null ? window.innerWidth < 1440 : saved === "1";
   });
   const [aboutOpen, setAboutOpen] = useState(false);
-  const [health, setHealth] = useState<Health>("checking");
+  const health = useEngineStore((s) => s.health);
+  const notOkSince = useEngineStore((s) => s.notOkSince);
   const [engineErr, setEngineErr] = useState("");
+  // Re-render now and then while the engine is not ok, so "starting" turns
+  // into "down" after the grace period even if nothing else changes.
+  const [, setTick] = useState(0);
+  // Shown once after the app restarted a dead engine: what was loaded into
+  // open analyses lived in the old engine (in-memory sessions, jobs).
+  const [restartNotice, setRestartNotice] = useState(false);
   const rState = useRStore((s) => s.state);
   const recheckR = useRStore((s) => s.recheck);
   const figureCount = useFiguresStore((s) => s.figures.length);
@@ -113,54 +120,72 @@ export function AppShell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Poll sidecar health until it comes up. The PyInstaller --onefile sidecar
-  // (pandas/scipy/statsmodels) extracts + imports on FIRST launch, which can
-  // take 30-90s on macOS — so poll fast for ~2 min, then keep slow-retrying so
-  // a late start still recovers. If it never comes up, surface the sidecar's
-  // captured stderr (the real reason) instead of a generic request error.
+  // Watch the engine for as long as the app runs: fast while it is starting,
+  // restarting or down, every 10 s once it is up (so the indicators turn red
+  // when it goes away, and come back when the app has restarted it). A
+  // first start of the engine can take 30-90 s, so "starting" is shown as
+  // "down" only after START_GRACE_MS. The state comes from Rust, which checks
+  // the engine's per-launch token: another program answering on the port is
+  // never shown as ready.
   useEffect(() => {
     let cancelled = false;
-    let tries = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let inFlight = false;
+    let again = false;
+    const { setHealth, setPoller } = useEngineStore.getState();
+    let lastOkGeneration: number | undefined;
     const poll = async () => {
-      const ok = await checkHealth();
       if (cancelled) return;
-      if (ok) {
-        setHealth("ok");
-        setEngineErr("");
-        recheckR();
+      if (inFlight) {
+        again = true;
         return;
       }
-      tries += 1;
-      if (tries < 120) {
-        setHealth("checking");
-        setTimeout(poll, 1000);
-      } else {
-        setHealth("down");
-        if (!engineErr) {
-          const se = await getSidecarError();
-          if (!cancelled && se) setEngineErr(se);
-        }
-        setTimeout(poll, 5000);
+      inFlight = true;
+      clearTimeout(timer);
+      const h = await probeEngine();
+      inFlight = false;
+      if (cancelled) return;
+      if (setHealth(h)) {
+        // Up (again): the R probe and anything cached from a dead engine are stale.
+        setEngineErr("");
+        recheckR();
+        if (wasRestarted(lastOkGeneration, h)) setRestartNotice(true);
+        lastOkGeneration = h.generation;
+      } else if (h.state === "ok") {
+        // The R probe after the last recovery failed (e.g. the engine died
+        // again in between): try again rather than keep a stale answer.
+        const r = useRStore.getState();
+        if (r.failed && !r.checking) void recheckR();
       }
+      if (h.state !== "ok") {
+        const se = await getSidecarError();
+        if (!cancelled) setEngineErr(se);
+      }
+      setTick((t) => t + 1);
+      const since = useEngineStore.getState().notOkSince;
+      const delay = again ? 0 : nextPollDelayMs(h.state, since == null ? 0 : Date.now() - since);
+      again = false;
+      timer = setTimeout(poll, delay);
     };
-    poll();
+    setPoller(() => void poll());
+    void poll();
     return () => {
       cancelled = true;
+      clearTimeout(timer);
+      setPoller(() => {});
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recheckR]);
 
+  const engineOk = health.state === "ok";
   const statuses: NavStatus[] = [
-    {
-      checking: { label: "Engine starting…", tone: "pending" as const },
-      ok: { label: "Engine ready", tone: "ok" as const },
-      down: { label: "Engine down", tone: "error" as const, detail: engineErr || lastHealthError || "Sidecar not reachable" },
-    }[health],
-    !rState
-      ? { label: "R: checking…", tone: "pending" }
-      : rState.installed
-        ? { label: "R ready", tone: "ok", detail: `${rState.version}${rState.bundled ? " (portable)" : ""}` }
-        : { label: "R not found", tone: "warn", detail: "Install R or set a custom Rscript path" },
+    engineStatusLine(health, notOkSince == null ? 0 : Date.now() - notOkSince, engineErr),
+    !engineOk
+      ? { label: "R: waiting for engine", tone: "pending" }
+      : !rState
+        ? { label: "R: checking…", tone: "pending" }
+        : rState.installed
+          ? { label: "R ready", tone: "ok", detail: `${rState.version}${rState.bundled ? " (portable)" : ""}` }
+          : { label: "R not found", tone: "warn", detail: "Install R or set a custom Rscript path" },
   ];
 
   return (
@@ -193,6 +218,18 @@ export function AppShell() {
         </Box>
       </Box>
       <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
+      <Snackbar
+        open={restartNotice}
+        onClose={(_e, reason) => {
+          if (reason !== "clickaway") setRestartNotice(false);
+        }}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="info" onClose={() => setRestartNotice(false)} sx={{ maxWidth: 560 }}>
+          The analysis engine stopped and was restarted. Data loaded into an open analysis (uploads, running jobs) may
+          need to be loaded again.
+        </Alert>
+      </Snackbar>
     </Box>
   );
 }

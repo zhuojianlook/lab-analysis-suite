@@ -51,7 +51,10 @@ jobs:
       - name: Build sidecar
         working-directory: TauriApp/python-sidecar
         run: |
-          pyinstaller --onedir --name api-server \
+          # The engine is named las-engine (not api-server) so another app's
+          # `pkill -f api-server` cannot stop it; src-tauri/src/engine.rs
+          # engine_exe_name must match.
+          pyinstaller --onedir --name las-engine \
             --hidden-import=uvicorn.logging \
             --hidden-import=uvicorn.protocols.http \
             --hidden-import=uvicorn.protocols.http.auto \
@@ -73,11 +76,19 @@ jobs:
             --exclude-module cv2 --exclude-module tkinter \
             --noconfirm api_server.py
         shell: bash
+      # Start the frozen engine like the app does (free port, launch token)
+      # and fail the release if it does not come up, does not identify itself
+      # with the token, or lacks its routes.
+      - name: Smoke-test the frozen engine
+        working-directory: TauriApp/python-sidecar
+        run: python ../scripts/smoke-engine.py dist/las-engine/las-engine
+        shell: bash
       - name: Stage engine (onedir folder)
         run: |
           rm -rf TauriApp/src-tauri/engine
           mkdir -p TauriApp/src-tauri/engine
-          cp -R TauriApp/python-sidecar/dist/api-server/. TauriApp/src-tauri/engine/
+          cp -R TauriApp/python-sidecar/dist/las-engine/. TauriApp/src-tauri/engine/
+          test -e TauriApp/src-tauri/engine/las-engine || test -e TauriApp/src-tauri/engine/las-engine.exe
           ls TauriApp/src-tauri/engine | head
         shell: bash
       - name: Upload sidecar artifact
@@ -146,7 +157,7 @@ jobs:
           path: TauriApp/src-tauri/engine/
       - name: Make engine executable
         if: runner.os != 'Windows'
-        run: chmod +x TauriApp/src-tauri/engine/api-server
+        run: chmod +x TauriApp/src-tauri/engine/las-engine
 
       # R is the user's local install — nothing R-related is bundled or built
       # here. Installers stay small (~90 MB); each tab installs the R packages
@@ -231,7 +242,7 @@ jobs:
           APP_PATH=$(find "$MACOS_DIR" -maxdepth 1 -name "*.app")
           APP_NAME=$(basename "$APP_PATH")
           # ALWAYS (re)sign so the signature is valid over ALL nested binaries
-          # (the api-server sidecar + dylibs). An incomplete seal makes macOS
+          # (the las-engine sidecar + dylibs). An incomplete seal makes macOS
           # report the app as "damaged" on Apple Silicon. Real cert if provided,
           # else ad-hoc ("-"). NO hardened runtime so the sidecar can dlopen.
           ID="${LAS_SIGN_IDENTITY:--}"

@@ -9,6 +9,7 @@ import type {
   CheckRResponse,
   RunRResponse,
 } from "./types";
+import { judgeHealthBody, type EngineHealth } from "./engineHealth";
 
 // Browser-preview fallback only; inside Tauri every call goes through the Rust proxy.
 const DEFAULT_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8765";
@@ -115,21 +116,37 @@ export async function saveBase64ToPath(path: string, dataB64: string): Promise<v
 
 export let lastHealthError = "";
 
-/** Is the sidecar reachable? */
-export async function checkHealth(): Promise<boolean> {
+/** Is the engine up, and is it this app's engine? Inside the app this asks
+ *  Rust (`engine_health`), which checks the per-launch token; in a browser
+ *  preview it checks the app name in /api/health. Never throws. */
+export async function probeEngine(): Promise<EngineHealth> {
+  const invoke = await getInvoke();
   try {
-    const text = await apiRequest("/api/health");
-    const data = JSON.parse(text);
-    if (data.status === "ok") {
-      lastHealthError = "";
-      return true;
-    }
-    lastHealthError = `Health response: ${text.substring(0, 200)}`;
-    return false;
+    if (invoke) return (await invoke("engine_health", {})) as EngineHealth;
+    const res = await fetch(`${DEFAULT_BASE}/api/health`, { signal: AbortSignal.timeout(5000) });
+    return judgeHealthBody(await res.text());
   } catch (e) {
-    lastHealthError = e instanceof Error ? e.message : String(e);
+    return { state: "down", detail: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** After the app gave up restarting the engine: start it again. False when
+ *  there was nothing to restart (not down, or a browser preview). */
+export async function restartEngine(): Promise<boolean> {
+  const invoke = await getInvoke();
+  if (!invoke) return false;
+  try {
+    return Boolean(await invoke("restart_engine", {}));
+  } catch {
     return false;
   }
+}
+
+/** Is this app's engine reachable? */
+export async function checkHealth(): Promise<boolean> {
+  const h = await probeEngine();
+  lastHealthError = h.state === "ok" ? "" : (h.detail ?? h.state);
+  return h.state === "ok";
 }
 
 /** The sidecar's captured startup stderr / exit info (for diagnostics when the

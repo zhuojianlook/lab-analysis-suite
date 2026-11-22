@@ -5,8 +5,10 @@
 //! command line contains "api-server": another installed copy of this app, a
 //! different app that bundles an engine of the same name, or the installed app
 //! when a debug build quits. Now only the process this app spawned and the
-//! processes below it are stopped. A debug build spawns no engine, so it stops
-//! nothing.
+//! processes below it are stopped. A debug build spawns no engine (unless its
+//! LAS_DEV_ENGINE_CMD hook asks for one), so it normally stops nothing. The
+//! engine is also no longer called "api-server" but "las-engine", so another
+//! app's `pkill -f api-server` cannot stop it (engine.rs).
 
 use std::process::{Child, Command};
 
@@ -39,6 +41,27 @@ pub fn kill_tree(child: &mut Child) {
         let _ = child.kill();
     }
     let _ = child.wait();
+}
+
+/// Kill every process in the process group `pgid` (unix). The engine is
+/// started as the leader of its own group (engine.rs `spawn_once`), so this
+/// reaches the R processes it started even after the engine itself died and
+/// they were re-parented. Only ever called with the pid of an engine this app
+/// spawned, right after it exited or before it is reaped: while any member of
+/// the group lives, no new process can get that id. Does nothing on Windows
+/// (taskkill /T in `kill_tree` covers a live engine's tree there).
+pub fn kill_group(pgid: u32) {
+    #[cfg(unix)]
+    {
+        if pgid > 1 {
+            // SAFETY: plain syscall; ESRCH (no such group) is ignored.
+            unsafe {
+                libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
 }
 
 /// Every process below `pid` (children, grandchildren, ...), breadth first.
@@ -104,6 +127,29 @@ mod tests {
 
         assert!(wait_until(|| !alive(root) && below.iter().all(|p| !alive(*p))), "tree survived: {below:?}");
         assert!(alive(decoy.id()), "the unrelated process was killed");
+        let _ = decoy.kill();
+        let _ = decoy.wait();
+    }
+
+    #[test]
+    fn group_kill_reaches_children_of_an_engine_killed_from_outside() {
+        use std::os::unix::process::CommandExt;
+        // An unrelated process outside the group must survive.
+        let mut decoy = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut engine = Command::new("sh").args(["-c", "sleep 30 & wait"]).process_group(0).spawn().unwrap();
+        assert!(wait_until(|| !descendants_of(engine.id()).is_empty()), "child did not start");
+        let orphan = descendants_of(engine.id())[0];
+        let pgid = engine.id();
+        // Killed from outside: its child is re-parented and survives.
+        Command::new("kill").args(["-9", &pgid.to_string()]).status().unwrap();
+        let _ = engine.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(alive(orphan), "test setup: the orphan should still run");
+
+        kill_group(pgid);
+
+        assert!(wait_until(|| !alive(orphan)), "the dead engine's child survived");
+        assert!(alive(decoy.id()), "a process outside the group was killed");
         let _ = decoy.kill();
         let _ = decoy.wait();
     }

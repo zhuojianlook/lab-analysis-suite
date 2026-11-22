@@ -1,6 +1,8 @@
 #!/bin/bash
 # Build the Python sidecar as a standalone binary using PyInstaller.
 # Usage: ./scripts/build-sidecar.sh [target-triple]
+# (Releases build the engine in .github/workflows/release.yml as a --onedir
+# folder named las-engine; never api-server, see src-tauri/src/engine.rs.)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -18,7 +20,7 @@ echo "Building sidecar for: $TRIPLE"
 cd "$SIDECAR_DIR"
 
 pyinstaller --onefile \
-    --name "api-server" \
+    --name "las-engine" \
     --hidden-import=uvicorn.logging \
     --hidden-import=uvicorn.protocols.http \
     --hidden-import=uvicorn.protocols.http.auto \
@@ -55,9 +57,9 @@ pyinstaller --onefile \
     api_server.py
 
 mkdir -p "$BIN_DIR"
-cp "dist/api-server" "$BIN_DIR/api-server-${TRIPLE}"
-chmod +x "$BIN_DIR/api-server-${TRIPLE}"
+cp "dist/las-engine" "$BIN_DIR/las-engine-${TRIPLE}"
+chmod +x "$BIN_DIR/las-engine-${TRIPLE}"
 
 echo ""
-echo "Sidecar built: $BIN_DIR/api-server-${TRIPLE}"
-ls -lh "$BIN_DIR/api-server-${TRIPLE}"
+echo "Sidecar built: $BIN_DIR/las-engine-${TRIPLE}"
+ls -lh "$BIN_DIR/las-engine-${TRIPLE}"

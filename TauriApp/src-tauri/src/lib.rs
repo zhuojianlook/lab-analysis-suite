@@ -1,5 +1,6 @@
 mod appstate;
 mod devenv;
+mod engine;
 // Debug builds only: the files self-test hook (LAS_E2E_SCRIPT).
 #[cfg(debug_assertions)]
 mod deve2e;
@@ -16,8 +17,9 @@ use graphfile::FileCtx;
 use quit::{Act, FinishHow, QuitDriver, QuitSource};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_updater::UpdaterExt;
-use std::sync::{Arc, Mutex};
-use std::io::{BufRead, BufReader};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use engine::Engine;
 
 #[derive(serde::Serialize, Clone)]
 struct UpdateProgress {
@@ -26,36 +28,84 @@ struct UpdateProgress {
 }
 
 #[tauri::command]
-fn get_sidecar_port(state: tauri::State<'_, SidecarPort>) -> u16 {
-    state.0
+fn get_sidecar_port(state: tauri::State<'_, Arc<Engine>>) -> u16 {
+    state.port()
 }
 
 #[tauri::command]
-fn get_sidecar_error(state: tauri::State<'_, SidecarError>) -> Option<String> {
-    state.0.lock().unwrap().clone()
+fn get_sidecar_error(state: tauri::State<'_, Arc<Engine>>) -> Option<String> {
+    state.last_error()
 }
 
 /// HTTP client that never routes through a system/env proxy. The sidecar lives
 /// on 127.0.0.1, but a configured HTTP(S)_PROXY / ALL_PROXY env var or a macOS
 /// system proxy would otherwise make reqwest try to proxy localhost and fail
 /// with "error sending request" — even though the sidecar is up (curl works).
-fn local_client() -> reqwest::Client {
+///
+/// Timeouts: connecting to a local engine takes milliseconds, so 5 s without a
+/// connection means it is not there (or hung). The overall limit has to cover
+/// the longest request the engine answers synchronously: R console commands
+/// (`/api/analysis/run-console`, up to 600 s) and R plots (120 s); long R jobs
+/// and package installs are polled, not held open. 15 minutes leaves room.
+///
+/// No idle connections are kept (`pool_max_idle_per_host(0)`): the engine
+/// (uvicorn) closes an idle keep-alive connection after 5 s, and a request
+/// sent on a pooled connection at that moment fails with a reset although the
+/// engine is fine. A new local connection per request costs well under 1 ms.
+fn local_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| local_client_builder().build().unwrap_or_else(|_| reqwest::Client::new()))
+}
+
+fn local_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .pool_max_idle_per_host(0)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15 * 60))
+}
+
+/// The engine's port, if a request may be sent there now (engine.rs
+/// `request_gate`): only this launch's confirmed engine, never another
+/// program that answers on the port. A debug build's external engine is
+/// health-checked here before the first request (the frontend's own health
+/// poll may not have run yet).
+async fn engine_port_for_request(eng: &Engine) -> Result<u16, String> {
+    if eng.external_unchecked() {
+        if let Ok(body) = probe_health(eng.port()).await {
+            judge_health(eng, &body);
+        }
+    }
+    eng.may_send().map_err(|why| format!("{ENGINE_NOT_ANSWERING} {why}"))?;
+    Ok(eng.port())
+}
+
+const ENGINE_NOT_ANSWERING: &str = "The analysis engine isn't answering.";
+
+/// User-facing text for a failed request to the engine.
+fn engine_request_error(e: &reqwest::Error, what: &str) -> String {
+    if e.is_timeout() && !e.is_connect() {
+        format!("{ENGINE_NOT_ANSWERING} No reply within 15 minutes. ({e})")
+    } else if e.is_connect() || e.is_request() || e.is_body() {
+        // Refused, connect timeout, or the connection dropped mid-request
+        // (the engine stopped; the app restarts it).
+        format!("{ENGINE_NOT_ANSWERING} It may be starting or restarting; try again in a moment. ({e})")
+    } else {
+        format!("{what} failed: {e}")
+    }
 }
 
 /// Proxy HTTP requests to the sidecar through Rust, bypassing WebView restrictions
 /// on localhost (WKWebView / WebView2 block fetch() to http://127.0.0.1).
+/// The port is read per request: it changes when the engine is restarted.
 #[tauri::command]
 async fn proxy_request(
     method: String,
     path: String,
     body: Option<String>,
-    state: tauri::State<'_, SidecarPort>,
+    state: tauri::State<'_, Arc<Engine>>,
 ) -> Result<String, String> {
-    let port = state.0;
+    let port = engine_port_for_request(&state).await?;
     let url = format!("http://127.0.0.1:{}{}", port, path);
     let client = local_client();
 
@@ -86,28 +136,107 @@ async fn proxy_request(
         _ => return Err(format!("Unsupported method: {}", method)),
     };
 
-    let resp = req.send().await.map_err(|e| format!("Request failed: {}", e))?;
-    let text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+    let resp = req.send().await.map_err(|e| engine_request_error(&e, "Request"))?;
+    let text = resp.text().await.map_err(|e| engine_request_error(&e, "Reading the response"))?;
     Ok(text)
 }
 
-/// Kill the sidecar process — called before update restart.
-#[tauri::command]
-async fn kill_sidecar(state: tauri::State<'_, SidecarChild>) -> Result<(), String> {
-    kill_sidecar_process(&state.0);
-    Ok(())
+/// The engine's state for the status indicators and the R tool gates:
+/// `state` is "ok" (this launch's engine answered with its token), "starting",
+/// "restarting", "foreign" (another program answers on the engine's port) or
+/// "down". The token itself never leaves Rust.
+#[derive(serde::Serialize)]
+struct EngineHealth {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    port: u16,
+    /// Changes every time the engine is (re)started.
+    generation: u32,
 }
 
-/// Stop the engine this app spawned and the processes below it — never
-/// anything matched by name (see engineproc.rs). Does nothing when no engine
-/// was spawned (debug builds) or it was already stopped.
-fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<std::process::Child>>>) {
-    if let Ok(mut guard) = child_mutex.lock() {
-        if let Some(mut child) = guard.take() {
-            eprintln!("[cleanup] Stopping engine process {}", child.id());
-            engineproc::kill_tree(&mut child);
+#[tauri::command]
+async fn engine_health(state: tauri::State<'_, Arc<Engine>>) -> Result<EngineHealth, String> {
+    use engine::{Status, Verdict};
+    let eng = state.inner().clone();
+    let port = eng.port();
+    let generation = eng.generation();
+    let status = eng.status();
+    let out = |state: &'static str, detail: Option<String>| Ok(EngineHealth { state, detail, port, generation });
+    match &status {
+        Status::Restarting { attempt } => {
+            return out("restarting", Some(format!("The analysis engine stopped unexpectedly; restarting it (attempt {attempt}).")))
         }
+        Status::Down(msg) => return out("down", Some(msg.clone())),
+        Status::Stopped => return out("down", Some("The analysis engine was stopped.".into())),
+        _ => {}
     }
+    if port == 0 {
+        return out("starting", None);
+    }
+    let body = match probe_health(port).await {
+        Ok(body) => body,
+        Err(e) => {
+            return if status == Status::Starting {
+                out("starting", None)
+            } else {
+                out("down", Some(format!("{ENGINE_NOT_ANSWERING} (port {port}: {e})")))
+            }
+        }
+    };
+    match judge_health(&eng, &body) {
+        Verdict::Ours => out(engine::state_when_ours(&status), None),
+        Verdict::Foreign(why) => out(
+            "foreign",
+            Some(format!(
+                "Another program is answering on the engine's port {port}: {why}. It is not used."
+            )),
+        ),
+    }
+}
+
+/// GET /api/health on the engine's port; the body of any answer.
+async fn probe_health(port: u16) -> Result<String, reqwest::Error> {
+    static HEALTH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = HEALTH_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .pool_max_idle_per_host(0) // see local_client
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+    let r = client.get(format!("http://127.0.0.1:{port}/api/health")).send().await?;
+    Ok(r.text().await.unwrap_or_default())
+}
+
+/// Judge a health answer; for a debug build's external engine (no supervisor
+/// confirming it) also remember the verdict, which the proxy relies on.
+fn judge_health(eng: &Engine, body: &str) -> engine::Verdict {
+    let verdict = engine::verify_health(body, eng.token().as_deref());
+    if eng.status() == engine::Status::External {
+        eng.note_external(match verdict {
+            engine::Verdict::Ours => engine::ExternalVerdict::Ours,
+            engine::Verdict::Foreign(_) => engine::ExternalVerdict::Foreign,
+        });
+    }
+    verdict
+}
+
+/// Start the engine again after the app gave up restarting it (the gates'
+/// Try again while the engine is down). True when a new start was begun.
+#[tauri::command]
+fn restart_engine(state: tauri::State<'_, Arc<Engine>>) -> bool {
+    state.inner().restart()
+}
+
+/// Kill the sidecar process — called before update restart. Final: the
+/// engine is not restarted afterwards.
+#[tauri::command]
+async fn kill_sidecar(state: tauri::State<'_, Arc<Engine>>) -> Result<(), String> {
+    state.stop();
+    Ok(())
 }
 
 #[tauri::command]
@@ -249,9 +378,9 @@ async fn proxy_upload(
     path: String,
     files: Vec<FileData>,
     field_name: String,
-    state: tauri::State<'_, SidecarPort>,
+    state: tauri::State<'_, Arc<Engine>>,
 ) -> Result<String, String> {
-    let port = state.0;
+    let port = engine_port_for_request(&state).await?;
     let url = format!("http://127.0.0.1:{}{}", port, path);
     let client = local_client();
 
@@ -266,9 +395,9 @@ async fn proxy_upload(
     }
 
     let resp = client.post(&url).multipart(form).send().await
-        .map_err(|e| format!("Upload request failed: {}", e))?;
+        .map_err(|e| engine_request_error(&e, "Upload"))?;
     let text = resp.text().await
-        .map_err(|e| format!("Failed to read upload response: {}", e))?;
+        .map_err(|e| engine_request_error(&e, "Reading the upload response"))?;
     Ok(text)
 }
 
@@ -284,9 +413,9 @@ async fn upload_files_from_paths(
     api_path: String,
     file_paths: Vec<String>,
     field_name: String,
-    state: tauri::State<'_, SidecarPort>,
+    state: tauri::State<'_, Arc<Engine>>,
 ) -> Result<String, String> {
-    let port = state.0;
+    let port = engine_port_for_request(&state).await?;
     let url = format!("http://127.0.0.1:{}{}", port, api_path);
     let client = local_client();
 
@@ -307,9 +436,9 @@ async fn upload_files_from_paths(
     }
 
     let resp = client.post(&url).multipart(form).send().await
-        .map_err(|e| format!("Upload request failed: {}", e))?;
+        .map_err(|e| engine_request_error(&e, "Upload"))?;
     let text = resp.text().await
-        .map_err(|e| format!("Failed to read upload response: {}", e))?;
+        .map_err(|e| engine_request_error(&e, "Reading the upload response"))?;
     Ok(text)
 }
 
@@ -375,9 +504,32 @@ fn bring_main_window_forward(app: &tauri::AppHandle) {
     }
 }
 
-struct SidecarPort(u16);
-struct SidecarError(Arc<Mutex<Option<String>>>);
-struct SidecarChild(Arc<Mutex<Option<std::process::Child>>>);
+/// Debug builds only: `LAS_DEV_ENGINE_CMD` (a JSON array: program and its
+/// first arguments, e.g. `["/path/venv/bin/python", "-B", "/path/api_server.py"]`)
+/// makes the app start and supervise the engine exactly like a release build —
+/// free port, token, restarts — so that path can be exercised without
+/// packaging. Release builds never read it.
+#[cfg(debug_assertions)]
+fn dev_engine_hook(r_env_dir: Option<String>) -> Result<Option<engine::LaunchSpec>, String> {
+    let Some(raw) = std::env::var("LAS_DEV_ENGINE_CMD").ok().filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let parts: Vec<String> = serde_json::from_str(&raw)
+        .map_err(|e| format!("LAS_DEV_ENGINE_CMD must be a JSON array of strings: {e}"))?;
+    let (program, rest) = parts.split_first().ok_or("LAS_DEV_ENGINE_CMD is empty")?;
+    Ok(Some(engine::LaunchSpec {
+        program: program.into(),
+        pre_args: rest.to_vec(),
+        cwd: None,
+        r_env_dir,
+    }))
+}
+
+#[cfg(not(debug_assertions))]
+fn dev_engine_hook(_r_env_dir: Option<String>) -> Result<Option<engine::LaunchSpec>, String> {
+    Ok(None)
+}
+
 /// Folder for the app's own records (open tabs, drafts, journal). `None` only
 /// if a release build cannot resolve its app data folder.
 #[allow(dead_code)] // read by the file features (phase 1)
@@ -462,27 +614,38 @@ pub fn run() {
         )?;
       }
 
-      let sidecar_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-      let sidecar_child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
-
       // The app uses the user's locally-installed R. Power users on locked-down
       // machines can point at a portable R tree via the LAS_R_ENV_DIR env var;
       // normally unset → the sidecar discovers the host R itself.
       let r_env_dir: Option<String> = std::env::var("LAS_R_ENV_DIR").ok().filter(|s| !s.is_empty());
 
-      // Launch sidecar in production; in dev, assume it's already running on
-      // the port given by LAS_SIDECAR_PORT (see devenv.rs — a debug build never
-      // falls back to the installed app's port or data folder).
-      let port: u16;
+      // Release builds start the bundled engine on a free port with a
+      // per-launch token and keep it running (engine.rs). Debug builds talk to
+      // a dev engine already running on LAS_SIDECAR_PORT (devenv.rs — never
+      // the installed app's port or data folder), unless the debug-only
+      // LAS_DEV_ENGINE_CMD hook asks them to start one like a release build.
+      let engine: Arc<Engine>;
       let state_dir: Option<std::path::PathBuf>;
       if cfg!(debug_assertions) {
         let dev = dev_env.as_ref().ok_or("debug build started without its dev settings")?;
+        state_dir = Some(dev.state_dir.clone());
+        engine = match dev_engine_hook(r_env_dir.clone())? {
+          Some(spec) => {
+            eprintln!(
+              "[dev] starting the engine like a release build ({} …) on a free port; LAS_SIDECAR_PORT={} is not used",
+              spec.program.display(), dev.port
+            );
+            let e = Engine::supervised(spec, engine::RespawnPolicy::default());
+            e.start();
+            e
+          }
+          None => Engine::external(dev.port),
+        };
         eprintln!(
           "[dev] engine port {}, state folder {}, identifier {}",
-          dev.port, dev.state_dir.display(), app.config().identifier
+          if engine.port() == 0 { "(picked at start)".to_string() } else { engine.port().to_string() },
+          dev.state_dir.display(), app.config().identifier
         );
-        port = dev.port;
-        state_dir = Some(dev.state_dir.clone());
       } else {
         // The engine is a PyInstaller --onedir folder bundled under
         // Contents/Resources/engine (resource_dir/engine) — no per-launch
@@ -490,8 +653,19 @@ pub fn run() {
         match app.path().resource_dir() {
           Ok(res_dir) => {
             let engine_dir = res_dir.join("engine");
-            let exe_name = if cfg!(target_os = "windows") { "api-server.exe" } else { "api-server" };
-            let engine_exe = engine_dir.join(exe_name);
+            let engine_exe = engine_dir.join(engine::engine_exe_name(std::env::consts::OS));
+
+            // Windows: the installer updates in place and leaves files a new
+            // version no longer ships; the engine was called api-server.exe up
+            // to 0.2.22. Nothing starts it any more — just remove the dead copy
+            // (best effort; an install folder that is not writable keeps it).
+            #[cfg(target_os = "windows")]
+            {
+              let stale = engine_dir.join("api-server.exe");
+              if stale.is_file() && std::fs::remove_file(&stale).is_ok() {
+                eprintln!("[las-engine] removed the old engine file {}", stale.display());
+              }
+            }
 
             // macOS: clear the download quarantine off the whole .app (covers the
             // engine + its dylibs) and make the engine executable, so Gatekeeper
@@ -510,63 +684,18 @@ pub fn run() {
               }
             }
 
-            let mut command = std::process::Command::new(&engine_exe);
-            command.arg("--port").arg(devenv::RELEASE_SIDECAR_PORT.to_string());
-            // The engine exits by itself if this process dies without a clean
-            // quit (crash, force-quit), so no orphan keeps the port.
-            command.arg("--parent-pid").arg(std::process::id().to_string());
-            if let Some(ref dir) = r_env_dir {
-              command.arg("--r-env-dir").arg(dir);
-            }
-            command.current_dir(&engine_dir);
-            command.stdout(std::process::Stdio::piped());
-            command.stderr(std::process::Stdio::piped());
-            #[cfg(target_os = "windows")]
-            {
-              use std::os::windows::process::CommandExt;
-              command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            }
-
-            match command.spawn() {
-              Ok(mut child) => {
-                if let Some(out) = child.stdout.take() {
-                  std::thread::spawn(move || {
-                    for line in BufReader::new(out).lines().map_while(Result::ok) {
-                      eprintln!("[engine] {}", line);
-                    }
-                  });
-                }
-                if let Some(errpipe) = child.stderr.take() {
-                  let err_clone = sidecar_error.clone();
-                  std::thread::spawn(move || {
-                    for line in BufReader::new(errpipe).lines().map_while(Result::ok) {
-                      eprintln!("[engine stderr] {}", line);
-                      if let Ok(mut e) = err_clone.lock() {
-                        let current = e.get_or_insert_with(String::new);
-                        if current.len() < 2000 {
-                          current.push_str(&line);
-                          current.push('\n');
-                        }
-                      }
-                    }
-                  });
-                }
-                *sidecar_child.lock().unwrap() = Some(child);
-              }
-              Err(e) => {
-                let msg = format!("Failed to spawn engine ({}): {}", engine_exe.display(), e);
-                eprintln!("{}", msg);
-                *sidecar_error.lock().unwrap() = Some(msg);
-              }
-            }
+            engine = Engine::supervised(
+              engine::LaunchSpec { program: engine_exe, pre_args: Vec::new(), cwd: Some(engine_dir), r_env_dir },
+              engine::RespawnPolicy::default(),
+            );
+            engine.start();
           }
           Err(e) => {
             let msg = format!("Failed to resolve resource dir: {}", e);
             eprintln!("{}", msg);
-            *sidecar_error.lock().unwrap() = Some(msg);
+            engine = Engine::failed(msg);
           }
         }
-        port = devenv::RELEASE_SIDECAR_PORT;
         // Resolved only; nothing is created until something is written there.
         state_dir = devenv::release_state_dir(
           std::env::var(devenv::ENV_STATE_DIR).ok().as_deref(),
@@ -601,13 +730,13 @@ pub fn run() {
       // Quit handshake; the engine is stopped only when the quit really happens.
       let quit_driver = {
         let h = app.handle().clone();
-        let child = sidecar_child.clone();
+        let eng = engine.clone();
         QuitDriver::new(Box::new(move |_d, act| match act {
           Act::Emit { id, source } => {
             let _ = h.emit(quit::EVT_QUIT_REQUESTED, quit::QuitRequest { request_id: id, source });
           }
           Act::Finish(how) => {
-            kill_sidecar_process(&child);
+            eng.stop();
             match how {
               #[cfg(target_os = "macos")]
               FinishHow::ReplyTerminate => quit_macos::reply_terminate(&h, true),
@@ -637,15 +766,15 @@ pub fn run() {
       }
       app.manage(quit_driver);
 
-      app.manage(SidecarPort(port));
+      app.manage(engine);
       app.manage(StateDir(state_dir));
-      app.manage(SidecarError(sidecar_error));
-      app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
       get_sidecar_port,
       get_sidecar_error,
+      engine_health,
+      restart_engine,
       proxy_request,
       proxy_upload,
       upload_files_from_paths,
@@ -707,8 +836,8 @@ pub fn run() {
     .expect("error while building tauri application")
     .run(|app_handle, event| {
       let stop_engine = || {
-        if let Some(state) = app_handle.try_state::<SidecarChild>() {
-          kill_sidecar_process(&state.0);
+        if let Some(eng) = app_handle.try_state::<Arc<Engine>>() {
+          eng.stop();
         }
       };
       match event {
@@ -754,4 +883,65 @@ pub fn run() {
         _ => {}
       }
     });
+}
+
+#[cfg(test)]
+mod proxy_client_tests {
+    use std::time::Duration;
+
+    /// Many clients, each sending a request and then another just around
+    /// uvicorn's 5 s keep-alive limit; returns how many sends failed.
+    /// The clients start 25 ms apart: 160 connects at the same instant
+    /// overflow macOS's listen backlog (kern.ipc.somaxconn = 128) and get
+    /// resets that have nothing to do with keep-alive.
+    fn race(make: fn() -> reqwest::Client, port: u16) -> usize {
+        tauri::async_runtime::block_on(async move {
+            let mut tasks = Vec::new();
+            for i in 0..160u64 {
+                let client = make();
+                tasks.push(tauri::async_runtime::spawn(async move {
+                    let url = format!("http://127.0.0.1:{port}/api/health");
+                    let start = Duration::from_millis(i * 25);
+                    let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(start)).await;
+                    let mut failed = 0;
+                    for _ in 0..3 {
+                        // POST: unlike a GET, it is not retried on a reused
+                        // connection the server closed. Any answer counts
+                        // (405 here); only a failed send is a failure.
+                        if let Err(e) = client.post(&url).body("{}").send().await {
+                            eprintln!("send failed: {e}");
+                            failed += 1;
+                        }
+                        let d = Duration::from_millis(4_990 + i % 21);
+                        let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(d)).await;
+                    }
+                    failed
+                }));
+            }
+            let mut n = 0;
+            for t in tasks {
+                n += t.await.unwrap_or(1);
+            }
+            n
+        })
+    }
+
+    /// Regression for "The analysis engine isn't answering" on a healthy
+    /// engine: a pooled connection reused just as uvicorn closes it (idle
+    /// 5 s) was reset. Needs a dev engine:
+    /// `LAS_TEST_ENGINE_PORT=<port> cargo test -- --ignored keep_alive`
+    #[test]
+    #[ignore]
+    fn keep_alive_race_does_not_fail_requests() {
+        let port: u16 = std::env::var("LAS_TEST_ENGINE_PORT")
+            .expect("set LAS_TEST_ENGINE_PORT to a running dev engine's port")
+            .parse()
+            .unwrap();
+        // For comparison only (not asserted: the race window is milliseconds).
+        let pooled = || reqwest::Client::builder().no_proxy().build().unwrap();
+        eprintln!("pooled clients (the bug): {} of 480 sends failed", race(pooled, port));
+        let failed = race(|| super::local_client_builder().build().unwrap(), port);
+        eprintln!("local_client: {failed} of 480 sends failed");
+        assert_eq!(failed, 0);
+    }
 }
