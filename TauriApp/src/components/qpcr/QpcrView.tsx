@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type HTMLAttributes, type Key, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type HTMLAttributes, type Key, type KeyboardEvent, type ReactNode } from "react";
 import {
   Alert,
   Autocomplete,
@@ -42,6 +42,7 @@ import {
   plotQpcrCp,
   saveQpcrManualRun,
   type QpcrAnalyzeResult,
+  type QpcrExcludedWell,
   type QpcrLibrary,
   type QpcrLibraryRun,
 } from "../../api/client";
@@ -56,6 +57,10 @@ import { NumberField } from "../shared/NumberField";
 import { QpcrManualEntry } from "./QpcrManualEntry";
 import { QpcrOverview } from "./QpcrOverview";
 import { assignColors, buildDataset, notDetected, pick } from "./qpcrData";
+import { GeneOrderList } from "./GeneOrderList";
+import {
+  applyShownOrder, orderGenes, panelKey, readGeneOrderStore, refsFirst, savedOrderFor, withSavedOrder, writeGeneOrderStore,
+} from "./geneOrder";
 
 const PALETTES: Record<string, string[]> = {
   Default: ["#5a7fa8", "#63a66a", "#c1666b", "#d4a05a", "#8a6fae", "#4aa3a3", "#b07aa1", "#9c9c4a"],
@@ -79,8 +84,12 @@ const writeIncluded = (ids: Iterable<number>) => {
 
 type Step = "data" | "analysis" | "figure";
 type StepError = { step: Step; msg: string } | null;
-type Selection = { genes: string[]; refs: string[]; samples: string[]; key: string };
+/** `boKey`: the inputs that decide which wells best of three leaves out. */
+type Selection = { genes: string[]; refs: string[]; samples: string[]; key: string; boKey: string };
 type CanvasTab = "overview" | "cp" | "figure" | "results";
+
+/** A figure response; `notes` = what the engine had to leave off the figure. */
+type PlotResult = RunRResponse & { notes?: string[] };
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -196,6 +205,55 @@ const Rendering = ({ what }: { what: string }) => (
   </Box>
 );
 
+/** `s` with line-break opportunities after "_", "-" and "." (long sample names
+ *  wrap at their parts, not mid-word). */
+function breakAfterSeparators(s: string): ReactNode {
+  const parts = s.match(/[^_.-]*[_.-]|[^_.-]+$/g) ?? [s];
+  return parts.length < 2 ? s : parts.map((p, i) => <Fragment key={i}>{p}{i < parts.length - 1 && <wbr />}</Fragment>);
+}
+
+/** The wells best of three left out, grouped by run (the run name heads its
+ *  group in full, so two plates are easy to tell apart): gene, sample, well, Cp. */
+function LeftOutTable({ rows }: { rows: QpcrExcludedWell[] }) {
+  const cell = { py: 0.25, pr: 0.75, fontSize: 12, verticalAlign: "top" as const, overflowWrap: "anywhere" as const };
+  const runs: string[] = [];
+  const byRun = new Map<string, QpcrExcludedWell[]>();
+  for (const r of rows) {
+    const k = r.Run ?? "";
+    if (!byRun.has(k)) { byRun.set(k, []); runs.push(k); }
+    byRun.get(k)!.push(r);
+  }
+  return (
+    <Box sx={{ mt: 0.5, maxHeight: 260, overflowY: "auto" }}>
+      <Box component="table" sx={{
+        borderCollapse: "collapse", width: "100%", tableLayout: "fixed",
+        "& th": { ...cell, textAlign: "left", fontWeight: 600 }, "& td": cell, "& .num": { textAlign: "right", pr: 0 },
+        "& .run": { pt: 0.75, fontWeight: 600, borderBottom: 1, borderColor: "divider" },
+      }}>
+        <colgroup><col style={{ width: "24%" }} /><col style={{ width: "46%" }} /><col style={{ width: "13%" }} /><col style={{ width: "17%" }} /></colgroup>
+        <thead><tr><th>Gene</th><th>Sample</th><th>Well</th><th className="num">Cp</th></tr></thead>
+        <tbody>
+          {runs.map((run) => (
+            <Fragment key={run}>
+              <tr><td colSpan={4} className="run">{run || "–"}</td></tr>
+              {byRun.get(run)!.map((r, i) => (
+                <tr key={i}>
+                  <td title={r.Step === "reference" ? `${r.Gene} (reference gene, trimmed within its run)` : undefined}>
+                    {r.Gene}{r.Step === "reference" ? " (ref)" : ""}
+                  </td>
+                  <td>{breakAfterSeparators(r.Sample)}</td>
+                  <td>{r.Well ?? "–"}</td>
+                  <td className="num">{r.Cp == null ? "–" : r.Cp.toFixed(2)}</td>
+                </tr>
+              ))}
+            </Fragment>
+          ))}
+        </tbody>
+      </Box>
+    </Box>
+  );
+}
+
 export function QpcrView() {
   // ── run library ───────────────────────────────────────────────────────────
   const [library, setLibrary] = useState<QpcrLibraryRun[] | null>(null);
@@ -220,6 +278,8 @@ export function QpcrView() {
   const [control, setControl] = useState<string>("");
   const [experimental, setExperimental] = useState<string[]>([]);
   const [method, setMethod] = useState<"auto" | "ttest" | "anova">("auto");
+  const [bestOfThree, setBestOfThree] = useState(false);
+  const [showLeftOut, setShowLeftOut] = useState(false);
   const [analysis, setAnalysis] = useState<QpcrAnalyzeResult | null>(null);
   const [analyzedSel, setAnalyzedSel] = useState<Selection | null>(null);
   const [analysisWarnings, setAnalysisWarnings] = useState<string[]>([]);
@@ -228,6 +288,11 @@ export function QpcrView() {
   const [layout, setLayout] = useState<"grouped" | "faceted">("grouped");
   const [plotType, setPlotType] = useState<"bar" | "violin" | "box" | "dot">("bar");
   const [showRefs, setShowRefs] = useState(false);
+  /** The user's gene order (view-only; see geneOrder.ts), per gene panel. */
+  const [geneOrderStore, setGeneOrderStore] = useState(readGeneOrderStore);
+  const [sampleLabels, setSampleLabels] = useState(false);
+  /** null = automatic: "Vs control only" for panels with many samples (ANOVA), else all pairs. */
+  const [bracketsChoice, setBracketsChoice] = useState<"all" | "control" | null>(null);
   const [theme, setTheme] = useState<"prism" | "classic" | "minimal">("prism");
   const [errorType, setErrorType] = useState<"SD" | "SEM">("SD");
   const [showPoints, setShowPoints] = useState(false);
@@ -276,7 +341,23 @@ export function QpcrView() {
   const genes = useCommon ? ds.genesCommon : ds.genesAll;
   const samples = ds.samples;
   const sampleOrder = control ? [control, ...experimental] : experimental;
-  const cpGenes = targetGenes.length ? [...refGenes, ...targetGenes.filter((g) => !refGenes.includes(g))] : ds.genesAll;
+  // Gene order: what the user arranged, for the genes in the ticked runs.
+  const orderKey = panelKey(ds.genesAll);
+  const savedOrder = savedOrderFor(geneOrderStore, orderKey);
+  const saveOrder = (order: string[]) => {
+    const next = withSavedOrder(geneOrderStore, orderKey, order, ds.genesAll);
+    writeGeneOrderStore(next);
+    setGeneOrderStore(next);
+  };
+  /** Genes on the fold-change graph for these choices, in the user's order. */
+  const plottedGenes = (genesSel: string[], refsSel: string[]) =>
+    orderGenes(savedOrder, showRefs ? [...refsSel.filter((r) => !genesSel.includes(r)), ...genesSel] : genesSel,
+      showRefs ? refsSel : []);   // a reference gene not yet arranged goes first
+  const shownGenes = plottedGenes(targetGenes, refGenes);
+  // The Cp graph keeps the reference genes first, each group in the user's order.
+  const cpGenes = targetGenes.length
+    ? refsFirst(savedOrder, [...refGenes, ...targetGenes.filter((g) => !refGenes.includes(g))], refGenes)
+    : orderGenes(savedOrder, ds.genesAll);
   const cpSamples = experimental.length ? sampleOrder : samples;
   const lowCp = useMemo(
     () => notDetected(ds.runs, ds.genesAll, cpSamples, cpLimit),
@@ -284,25 +365,43 @@ export function QpcrView() {
     [ds, cpSamples.join("\u0000"), cpLimit],
   );
   // Everything that changes the analysis input (not view-only switches).
-  const selKey = JSON.stringify([refGenes, targetGenes, sampleOrder, method, ds.runIds, excludeHigh ? cpLimit : null]);
+  // (The gene order is view-only and not part of it.)
+  const selKey = JSON.stringify([refGenes, targetGenes, sampleOrder, method, ds.runIds, excludeHigh ? cpLimit : null, bestOfThree]);
+  // What decides the wells best of three leaves out (not the targets or the
+  // samples compared: each gene x sample is trimmed on its own).
+  const boKey = JSON.stringify([ds.runIds, refGenes, excludeHigh ? cpLimit : null, bestOfThree]);
   const stale = !!analysis && analyzedSel?.key !== selKey;
   const canAnalyze = ds.runs.length > 0 && refGenes.length > 0 && targetGenes.length > 0 && !!control && experimental.length > 0;
   const toggle = (s: Step) => (o: boolean) => setOpen((p) => ({ ...p, [s]: o }));
 
+  // Panel per gene with many samples: every Tukey pair is too many brackets
+  // for a panel, so only the comparisons with the control are drawn unless
+  // the user picks "All pairs".
+  const manyPairs = layout === "faceted" && (analyzedSel?.samples.length ?? 0) > 4 && !!analysis?.anova_tukey_results.length;
+  const bracketsMode = bracketsChoice ?? (manyPairs ? "control" : "all");
   const buildParams = (sel: Selection) => ({
-    gene_order: showRefs ? [...sel.refs.filter((r) => !sel.genes.includes(r)), ...sel.genes] : sel.genes,
+    gene_order: plottedGenes(sel.genes, sel.refs),
     sample_order: sel.samples, colors: pick(colors, sel.samples), labels: pick(labels, sel.samples),
     error_type: errorType, layout, plot_type: plotType, show_points: showPoints,
     point_size: pointSize, bar_width: barWidth, theme, significance_level: sigLevel,
     hide_ns: hideNs, title, xlabel, ylabel, font_size: fontSize,
     width: plotWidth, height: plotHeight, dpi, export_format: exportFormat, transparent,
+    // Only sent when they change the figure, so toggling them elsewhere doesn't re-render.
+    ...(layout === "faceted" && sampleLabels ? { sample_labels: true } : {}),
+    ...(bracketsMode === "control" ? { brackets: "control" } : {}),
   });
   const paramsKey = analyzedSel ? JSON.stringify(buildParams(analyzedSel)) : "";
 
+  // Wells best of three left out, marked on the Cp graph — exactly the set the
+  // current analysis used. Kept while only the targets or samples changed
+  // (that doesn't change which wells are left out); dropped once the runs,
+  // reference genes, Cp limit or the switch change.
+  const leftOut: QpcrExcludedWell[] = analysis && analyzedSel?.boKey === boKey ? analysis.excluded_wells ?? [] : [];
   const cpParams = {
     run_ids: ds.runIds, gene_order: cpGenes, sample_order: cpSamples, reference_genes: refGenes, cp_limit: cpLimit,
     colors: pick(colors, cpSamples), labels: pick(labels, cpSamples), theme, point_size: pointSize,
     font_size: fontSize, width: plotWidth, height: plotHeight, dpi, export_format: exportFormat, transparent,
+    ...(leftOut.length ? { excluded_wells: leftOut.map(({ Run, Well, Gene, Sample, Cp }) => ({ Run, Well, Gene, Sample, Cp })) } : {}),
   };
   const cpKey = JSON.stringify(cpParams);
 
@@ -495,15 +594,18 @@ export function QpcrView() {
       const res = await analyzeQpcr({
         run_ids: ds.runIds, cp_max: excludeHigh ? cpLimit : null,
         reference_genes: refGenes, target_genes: targetGenes, control, experimental, method,
+        ...(bestOfThree ? { best_of_three: true } : {}),
       });
       setAnalysisWarnings(res.warnings ?? []);
       if (res.error) { setErr({ step: "analysis", msg: res.error }); return; }
-      const sel: Selection = { genes: targetGenes, refs: refGenes, samples: sampleOrder, key: selKey };
+      const sel: Selection = { genes: targetGenes, refs: refGenes, samples: sampleOrder, key: selKey, boKey };
       setAnalysis(res);
       setAnalyzedSel(sel);
+      setShowLeftOut(false);
       setPlot(null);
-      // Keep the Analysis step open when samples were left out, so the warning is seen.
-      setOpen({ data: false, analysis: !!res.warnings?.length, figure: true });
+      // Keep the Analysis step open when samples were left out, so the warning is seen
+      // (or best of three left wells out, so that count is seen).
+      setOpen({ data: false, analysis: !!res.warnings?.length || !!res.excluded_wells?.length, figure: true });
       setCanvasTab("figure");
       void runPlot(res, sel); // render straight away
     } catch (e) {
@@ -554,10 +656,11 @@ export function QpcrView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cpKey, canvasTab]);
 
-  // Swap the x-axis label default (Gene ↔ Sample) unless the user typed one.
+  // Swap the x-axis label default unless the user typed one: "Gene" for the
+  // single graph; none for panels (samples are named by the legend there).
   const changeLayout = (v: "grouped" | "faceted") => {
     setLayout(v);
-    setXlabel((cur) => (cur === "Gene" || cur === "Sample" || cur === "") ? (v === "grouped" ? "Gene" : "Sample") : cur);
+    setXlabel((cur) => (cur === "Gene" || cur === "Sample" || cur === "") ? (v === "grouped" ? "Gene" : "") : cur);
   };
 
   const applyPalette = (name: string) => {
@@ -587,7 +690,7 @@ export function QpcrView() {
   const testName = analysis?.anova_tukey_results.length ? "ANOVA + Tukey"
     : analysis?.ttest_results.length ? "t-test" : "no test";
   const analysisSummary = analysis && analyzedSel
-    ? `${analyzedSel.genes.length} gene${analyzedSel.genes.length > 1 ? "s" : ""} × ${analyzedSel.samples.length} samples · ${testName}${analysisWarnings.length ? " · samples left out" : ""}${stale ? " · changed" : ""}`
+    ? `${analyzedSel.genes.length} gene${analyzedSel.genes.length > 1 ? "s" : ""} × ${analyzedSel.samples.length} samples · ${testName}${analysis.best_of_three_note ? ` · best of three (${analysis.excluded_wells?.length ?? 0} left out)` : ""}${analysisWarnings.length ? " · samples left out" : ""}${stale ? " · changed" : ""}`
     : ds.runs.length ? "Pick genes and samples" : "Tick at least one run";
 
   // The filter box only exists above 6 runs; ignore a leftover filter below that.
@@ -754,6 +857,16 @@ export function QpcrView() {
         </Box>
       </Stack>
 
+      <RailHeading>Replicates</RailHeading>
+      <FormControlLabel sx={{ ml: -0.5 }}
+        control={<Switch size="small" checked={bestOfThree} onChange={(e) => setBestOfThree(e.target.checked)} />}
+        label={<Typography variant="body2">Pick best of three values</Typography>} />
+      <Typography variant="caption" color="text.secondary" component="div">
+        Where a gene has 4 or more replicates for a sample, keep the 3 closest values. With several runs, each well
+        is first normalised to its own run's reference genes; reference genes are trimmed within each run only.
+        Fewer values means a smaller spread and smaller P values, so report the wells left out.
+      </Typography>
+
       <RailHeading>Statistics</RailHeading>
       <ToggleButtonGroup fullWidth exclusive size="small" value={method}
         onChange={(_, v) => { if (v) setMethod(v); }}>
@@ -783,6 +896,17 @@ export function QpcrView() {
         <Typography variant="caption" color="warning.main" component="div" sx={{ mt: 0.75 }}>
           Runs or selections changed since the last run — re-run to update the figure.
         </Typography>
+      )}
+      {analysis?.best_of_three_note && !stale && (
+        <Alert severity="info" sx={{ mt: 1.5, "& .MuiAlert-message": { width: "100%", minWidth: 0 } }}>
+          <div>{analysis.best_of_three_note}</div>
+          {!!analysis.excluded_wells?.length && (
+            <Button size="small" color="inherit" onClick={() => setShowLeftOut((v) => !v)} sx={{ ml: -0.75, mt: 0.25, minWidth: 0 }}>
+              {showLeftOut ? "Hide wells" : "Show wells"}
+            </Button>
+          )}
+          {showLeftOut && <LeftOutTable rows={analysis.excluded_wells ?? []} />}
+        </Alert>
       )}
       {analysisWarnings.length > 0 && (
         <Alert severity="warning" onClose={() => setAnalysisWarnings([])} sx={{ mt: 1.5 }}>
@@ -816,6 +940,37 @@ export function QpcrView() {
           control={<Switch size="small" checked={showRefs} onChange={(e) => setShowRefs(e.target.checked)} />}
           label={<Typography variant="body2">Show reference genes</Typography>} />
       </Tooltip>
+      {layout === "faceted" && (
+        <FormControlLabel sx={{ ml: -0.5, display: "flex" }}
+          control={<Switch size="small" checked={sampleLabels} onChange={(e) => setSampleLabels(e.target.checked)} />}
+          label={<Typography variant="body2">Sample names under the panels</Typography>} />
+      )}
+
+      {shownGenes.length > 1 && (
+        <>
+          <Stack direction="row" alignItems="center" sx={{ mt: 2, mb: 0.25 }}>
+            <Typography variant="overline" color="text.secondary" sx={{ fontSize: 10.5, letterSpacing: 0.8, lineHeight: 1.6, flexGrow: 1 }}>
+              Gene order
+            </Typography>
+            <Tooltip title="Sort alphabetically">
+              <Button size="small" onClick={() => saveOrder(applyShownOrder(savedOrder, [...shownGenes].sort((a, b) => a.localeCompare(b))))}
+                sx={{ minWidth: 0, px: 0.75 }}>A–Z</Button>
+            </Tooltip>
+            <Tooltip title="Back to the order the genes were chosen in">
+              <Button size="small" color="inherit" onClick={() => saveOrder([])} sx={{ minWidth: 0, px: 0.75, color: "text.secondary" }}>
+                Reset
+              </Button>
+            </Tooltip>
+          </Stack>
+          <GeneOrderList genes={shownGenes} refs={new Set(refGenes)}
+            onChange={(next) => saveOrder(applyShownOrder(savedOrder, next))} />
+          {stale && (
+            <Typography variant="caption" color="warning.main" component="div" sx={{ mt: 0.25 }}>
+              The figure follows the new order after you re-run the analysis.
+            </Typography>
+          )}
+        </>
+      )}
       <Box sx={{ mt: 1 }}>
         <Grid2>
           <TextField select size="small" label="Theme" value={theme} onChange={(e) => setTheme(e.target.value as typeof theme)}>
@@ -853,6 +1008,20 @@ export function QpcrView() {
           control={<Switch size="small" checked={hideNs} onChange={(e) => setHideNs(e.target.checked)} />}
           label={<Typography variant="body2">Hide ns</Typography>} />
       </Grid2>
+      {!!analysis?.anova_tukey_results.length && (
+        <>
+          <ToggleButtonGroup fullWidth exclusive size="small" value={bracketsMode} sx={{ mt: 1 }}
+            onChange={(_, v) => { if (v) setBracketsChoice(v); }}>
+            <ToggleButton value="all">All pairs</ToggleButton>
+            <ToggleButton value="control">Vs control only</ToggleButton>
+          </ToggleButtonGroup>
+          {bracketsChoice === null && manyPairs && (
+            <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }}>
+              With more than 4 samples, each panel shows only the comparisons with the control. All pairs are in the Results tab.
+            </Typography>
+          )}
+        </>
+      )}
 
       <RailHeading>Text</RailHeading>
       <Stack spacing={1}>
@@ -948,7 +1117,11 @@ export function QpcrView() {
           Runs or selections changed since this figure was made — re-run the analysis to update it.
         </Alert>
       )}
-      <FigureView result={plot} busy={plotting} baseName="qpcr_plot" fitHeight={stale ? "calc(100vh - 200px)" : "calc(100vh - 140px)"} />
+      {!!(plot as PlotResult).notes?.length && (
+        <Alert severity="warning">{(plot as PlotResult).notes!.map((n) => <div key={n}>{n}</div>)}</Alert>
+      )}
+      <FigureView result={plot} busy={plotting} baseName="qpcr_plot"
+        fitHeight={`calc(100vh - ${140 + (stale ? 60 : 0) + ((plot as PlotResult).notes?.length ? 70 : 0)}px)`} />
     </Stack>
   );
 
@@ -958,6 +1131,7 @@ export function QpcrView() {
         <Typography variant="caption" color="text.secondary" sx={{ flexGrow: 1, minWidth: 260 }}>
           {targetGenes.length ? "Reference and target genes" : "All genes"}, {experimental.length ? "selected samples" : "all samples"},{" "}
           {ds.runs.length} run{ds.runs.length > 1 ? "s" : ""}. Each dot is a well and each bar the mean; the dotted line is the Cp limit ({cpLimit}).
+          {leftOut.length ? ` Hollow grey dots are the ${leftOut.length} wells best of three left out (not in the mean).` : ""}
         </Typography>
         <FormControlLabel sx={{ mr: 0 }}
           control={<Switch size="small" checked={excludeHigh} onChange={(e) => setExcludeHigh(e.target.checked)} />}
@@ -994,7 +1168,13 @@ export function QpcrView() {
       {analysis.anova_tukey_results.length > 0 && (
         <RecordTable rows={analysis.anova_tukey_results} title="ANOVA + Tukey HSD" downloadName="qpcr_anova_tukey.csv" />
       )}
-      <RecordTable rows={analysis.analysis_data} title="Per-replicate ΔΔCt" downloadName="qpcr_replicates.csv" />
+      <RecordTable rows={analysis.analysis_data}
+        title={analysis.best_of_three_note ? "Per-replicate ΔΔCt (wells kept by best of three)" : "Per-replicate ΔΔCt"}
+        downloadName="qpcr_replicates.csv" />
+      {!!analysis.excluded_wells?.length && (
+        <RecordTable rows={analysis.excluded_wells as unknown as Record<string, unknown>[]}
+          title="Left out by best of three" downloadName="qpcr_best_of_three_left_out.csv" />
+      )}
     </Stack>
   ) : null;
 

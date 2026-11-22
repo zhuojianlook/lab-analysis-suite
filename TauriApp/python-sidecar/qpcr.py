@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import itertools
 import math
+import re
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -271,6 +272,7 @@ class AnalyzeRequest(BaseModel):
     control: str
     experimental: List[str]
     method: str = "auto"            # auto | ttest | anova
+    best_of_three: bool = False     # gene x sample with >= 4 replicates: keep the 3 closest (see _best_of_three)
 
 
 def _num(x) -> Optional[float]:
@@ -299,6 +301,71 @@ def _star(p: Optional[float], sig: float) -> str:
     return "*"
 
 
+# ── Best of three ───────────────────────────────────────────────────────────
+#
+# Where a gene x sample has 4 or more replicates, keep the 3 closest values and
+# leave the rest out. Two steps:
+#   1. Reference genes, within each run, on Cp — before the run's reference Cp
+#      is averaged (each run is normalised to its own plate).
+#   2. Target genes, pooled across runs, on dCp — each well already
+#      normalised to its own plate's reference genes for that sample, so plates
+#      with an offset can be compared. With one run this is the 3 closest Cps.
+#      (Reference genes are not trimmed again here: every reference well kept
+#      in step 1 was used to normalise its plate.)
+# "Closest" = the triple with the smallest range (max - min); ties go to the
+# smallest SD, then to the earliest run and well, so the choice is repeatable.
+
+_WELL_RE = re.compile(r"^\s*([A-Za-z]+)\s*0*(\d+)\s*$")
+
+
+def _well_key(w) -> tuple:
+    """Plate order for a well name: A1 < A2 < A10 < B1 < AA1. Other names
+    sort after those (as text), missing wells last."""
+    if w is None or (isinstance(w, float) and math.isnan(w)):
+        return (2, 0, "", 0, "")
+    m = _WELL_RE.match(str(w))
+    if m:
+        row = m.group(1).upper()
+        return (0, len(row), row, int(m.group(2)), "")
+    return (1, 0, "", 0, str(w))
+
+
+def _closest_three(values: List[float], order: List[tuple]) -> List[int]:
+    """Positions (into `values`) of the 3 values to keep. `order` gives each
+    value's (run, well) sort key, used only to break exact ties."""
+    n = len(values)
+    if n <= 3:
+        return list(range(n))
+    idx = sorted(range(n), key=lambda i: order[i])
+    if n <= 40:
+        cands = itertools.combinations(idx, 3)
+    else:   # the smallest range is always a window of 3 neighbours in value order
+        by_v = sorted(idx, key=lambda i: (values[i], order[i]))
+        cands = (tuple(sorted(by_v[k:k + 3], key=lambda i: order[i])) for k in range(n - 2))
+    best = None
+    for c in cands:
+        v = [values[i] for i in c]
+        key = (round(max(v) - min(v), 9), round(float(np.std(v, ddof=1)), 9), [order[i] for i in c])
+        if best is None or key < best[0]:
+            best = (key, c)
+    return sorted(best[1])
+
+
+def _pick_three(df: pd.DataFrame, value: str, by: List[str]) -> pd.Series:
+    """Boolean mask over `df`: True for the rows kept by best of three within
+    each `by` group (groups of 3 or fewer rows keep everything)."""
+    keep = pd.Series(True, index=df.index)
+    for _, grp in df.groupby(by, sort=False):
+        if len(grp) <= 3:
+            continue
+        order = list(zip(grp["_run"], grp["Well"].map(_well_key) if "Well" in grp else [()] * len(grp), grp["_pos"]))
+        kept = set(_closest_three(grp[value].tolist(), order))
+        for i, ix in enumerate(grp.index):
+            if i not in kept:
+                keep[ix] = False
+    return keep
+
+
 def _complete_samples(ref: pd.DataFrame, refs: List[str]) -> set:
     """Samples for which every reference gene has at least one well."""
     n = ref.groupby("Sample")["Gene"].nunique()
@@ -316,6 +383,9 @@ def analyze(body: AnalyzeRequest):
         if df.empty:
             continue
         df["Cp"] = pd.to_numeric(df["Cp"], errors="coerce")
+        # Where each well came from (run order, row in the run): best of three
+        # breaks ties with it and reports left-out wells by run. Dropped below.
+        df["_run"], df["_runname"], df["_pos"] = len(frames), p.get("name", ""), range(len(df))
         measured = df.dropna(subset=["Cp"])          # undetermined wells
         kept = measured[measured["Cp"] < body.cp_max] if body.cp_max is not None else measured
         frames.append((p.get("name", ""), measured, kept))
@@ -329,7 +399,18 @@ def analyze(body: AnalyzeRequest):
 
     warnings = []
     combined = pd.DataFrame()
+    left_out = []            # best of three: DataFrames of the wells left out
+    trimmed_groups = set()   # (Gene, Sample) that had more than 3 replicates
     for run_name, measured, df in frames:
+        ref_dropped = None
+        if body.best_of_three:
+            # Step 1: reference genes, within this run, on Cp.
+            is_ref = df["Gene"].isin(refs)
+            keep = _pick_three(df[is_ref], "Cp", ["Gene", "Sample"])
+            if not keep.all():
+                ref_dropped = df.loc[keep[~keep].index].copy()
+                trimmed_groups.update(zip(ref_dropped["Gene"], ref_dropped["Sample"]))
+                df = df.drop(index=ref_dropped.index)
         ref = df[df["Gene"].isin(refs)]
         # Normalise a sample only if EVERY reference gene was measured for it in
         # this run; pooling runs normalised to different reference sets gives a
@@ -353,6 +434,24 @@ def analyze(body: AnalyzeRequest):
         m = pd.merge(tar, avg_ref, on="Sample")
         m["dCp"] = m["Cp"] - m["Average_Ref_Cp"]
         combined = pd.concat([combined, m], ignore_index=True)
+        if ref_dropped is not None:
+            d = pd.merge(ref_dropped, avg_ref, on="Sample", how="left")
+            d["dCp"] = d["Cp"] - d["Average_Ref_Cp"]
+            d["Step"] = "reference"
+            left_out.append(d)
+
+    if body.best_of_three and not combined.empty:
+        # Step 2: target genes, pooled across runs, on dCp. Reference genes were
+        # trimmed in step 1 only: every reference well kept there normalised its
+        # plate, so dropping it again here would misreport what was used.
+        tgt = ~combined["Gene"].isin(refs)
+        keep = _pick_three(combined[tgt], "dCp", ["Gene", "Sample"]).reindex(combined.index, fill_value=True).astype(bool)
+        if not keep.all():
+            d = combined[~keep].copy()
+            d["Step"] = "replicates"
+            left_out.append(d)
+            trimmed_groups.update(zip(d["Gene"], d["Sample"]))
+            combined = combined[keep].reset_index(drop=True)
 
     if combined.empty:
         return {"error": "No target/reference data after matching genes.", "warnings": warnings}
@@ -436,13 +535,52 @@ def analyze(body: AnalyzeRequest):
             .agg(mean=("Fold_Change", "mean"), sd=("SD", "mean"), sem=("SEM", "mean"),
                  n=("Fold_Change", "size")).reset_index())
 
-    return {
-        "analysis_data": _records(final.drop(columns=[c for c in ("Average_Ref_Cp",) if c in final])),
+    per_well = final.drop(columns=[c for c in ("Average_Ref_Cp", "_run", "_pos") if c in final])
+    if body.best_of_three:
+        # Kept wells from several plates share well names: say which run each
+        # came from, next to the well (as the left-out list does). Only with
+        # best of three, so the output without it is unchanged.
+        per_well = per_well.rename(columns={"_runname": "Run"})
+        cols = [c for c in per_well.columns if c != "Run"]
+        at = cols.index("Well") + 1 if "Well" in cols else 0
+        per_well = per_well[cols[:at] + ["Run"] + cols[at:]]
+    else:
+        per_well = per_well.drop(columns=["_runname"])
+    out = {
+        "analysis_data": _records(per_well),
         "summary": _records(summ),
         "ttest_results": ttest_results,
         "anova_tukey_results": anova_tukey_results,
         "warnings": warnings,
     }
+    if body.best_of_three:
+        out.update(_best_of_three_report(left_out, trimmed_groups, keep_samples))
+    return out
+
+
+def _best_of_three_report(left_out: List[pd.DataFrame], groups: set, samples: List[str]) -> dict:
+    """The wells best of three left out (for the samples in the analysis) and
+    a one-line note saying how many."""
+    keep = set(samples)
+    rows = []
+    for d in left_out:
+        for r in d.to_dict("records"):
+            if r["Sample"] not in keep:
+                continue
+            rows.append({"Gene": r["Gene"], "Sample": r["Sample"], "Run": r["_runname"],
+                         "Well": None if pd.isna(r.get("Well")) else str(r.get("Well")),
+                         "Cp": _num(r["Cp"]), "dCp": _num(r.get("dCp")), "Step": r["Step"],
+                         "_k": (r["_run"], _well_key(r.get("Well")), r["_pos"])})
+    rows.sort(key=lambda r: (r["Gene"], r["Sample"], r["_k"]))
+    for r in rows:
+        del r["_k"]
+    n_groups = len({g for g in groups if g[1] in keep})
+    if rows:
+        note = (f"Best of three: {len(rows)} well{'s' if len(rows) != 1 else ''} left out "
+                f"({n_groups} gene × sample group{'s' if n_groups != 1 else ''} had more than 3 replicates).")
+    else:
+        note = "Best of three: no gene × sample has more than 3 replicates, so no wells were left out."
+    return {"excluded_wells": rows, "best_of_three_note": note}
 
 
 # ── Plot (ggplot2 via the R bridge) ─────────────────────────────────────────
@@ -465,6 +603,8 @@ class PlotRequest(BaseModel):
     theme: str = "prism"                      # prism | classic | minimal
     significance_level: float = 0.05
     hide_ns: bool = True
+    brackets: str = "all"                     # all | control (only comparisons with the control = first sample)
+    sample_labels: bool = False               # faceted: sample names under each panel (the legend names them otherwise)
     title: str = "Fold change per gene"
     xlabel: str = "Sample"
     ylabel: str = "Fold change"
@@ -477,20 +617,22 @@ class PlotRequest(BaseModel):
 
 
 def _resc(s: str) -> str:
-    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+    return (str(s).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
 
 
 def _r_vec(items: List[str]) -> str:
     return "c(" + ", ".join(f'"{_resc(i)}"' for i in items) + ")"
 
 
-def _theme_layer(theme: str, font_size: int) -> str:
+def _theme_layer(theme: str, font_size: float) -> str:
+    fs = f"{float(font_size):.2f}"
     if theme == "classic":
-        return f'p <- p + ggplot2::theme_classic(base_size={int(font_size)})\n'
+        return f'p <- p + ggplot2::theme_classic(base_size={fs})\n'
     if theme == "minimal":
-        return f'p <- p + ggplot2::theme_minimal(base_size={int(font_size)})\n'
-    return (f'if (requireNamespace("ggprism", quietly=TRUE)) p <- p + ggprism::theme_prism(base_size={int(font_size)}) '
-            f'else p <- p + ggplot2::theme_classic(base_size={int(font_size)})\n')
+        return f'p <- p + ggplot2::theme_minimal(base_size={fs})\n'
+    return (f'if (requireNamespace("ggprism", quietly=TRUE)) p <- p + ggprism::theme_prism(base_size={fs}) '
+            f'else p <- p + ggplot2::theme_classic(base_size={fs})\n')
 
 
 def _transparent_layer(transparent: bool) -> str:
@@ -506,8 +648,11 @@ def _build_comparisons(body: PlotRequest):
     out = []
     rows = [(r["Gene"], r["Control"], r["Experimental"], r.get("p_val")) for r in body.ttest_results]
     rows += [(r["Gene"], r["Group1"], r["Group2"], r.get("p_val")) for r in body.anova_tukey_results]
+    control = body.sample_order[0] if body.sample_order else None
     for gene, s1, s2, p in rows:
         if p is None:            # untestable (single replicate / zero variance) — draw nothing
+            continue
+        if body.brackets == "control" and control not in (s1, s2):
             continue
         st = _star(p, body.significance_level)
         if body.hide_ns and st == "ns":
@@ -526,6 +671,406 @@ def _indexed(df: pd.DataFrame, genes: List[str], samples: List[str]) -> pd.DataF
     out["gi"] = out.pop("Gene").map(gi)
     out["si"] = out.pop("Sample").map(si)
     return out
+
+
+# ── Figure geometry (computed here so the R code stays presentational) ──────
+
+_LABEL_BREAK = re.compile(r"(?<=[_\- /])")
+
+
+def _wrap_label(s: str, width: int) -> str:
+    """Wrap a sample name onto lines of at most `width` characters, breaking
+    after "_", "-", "/" or spaces (a run longer than a line is hard-broken).
+    Nothing is dropped, so the full name is always shown."""
+    s = str(s)
+    width = max(4, int(width))
+    if len(s) <= width:
+        return s
+    toks: List[str] = []
+    for t in _LABEL_BREAK.split(s):
+        # A separator stays with the text before it ("20251210_" is not split
+        # into "20251210" + a lone "_"): a line may run one character over.
+        while len(t.rstrip("_-/ ")) > width:
+            toks.append(t[:width])
+            t = t[width:]
+        if t:
+            toks.append(t)
+    lines: List[str] = []
+    cur = ""
+    for t in toks:
+        if cur and len(cur) + len(t.rstrip("_-/ ")) > width:
+            lines.append(cur)
+            cur = t
+        else:
+            cur += t
+    if cur:
+        lines.append(cur)
+    return "\n".join(ln.strip() for ln in lines if ln.strip())
+
+
+def _shorten(s: str, width: int, head: Optional[int] = None) -> str:
+    """`s` cut to `width` characters by dropping its middle ("start…end");
+    `head` = characters kept at the start (default: half)."""
+    if len(s) <= width:
+        return s
+    head = width // 2 if head is None else max(1, min(head, width - 1))
+    tail = width - 1 - head
+    return s[:head] + "…" + (s[len(s) - tail:] if tail > 0 else "")
+
+
+def _shorten_all(names: List[str], width: int) -> List[str]:
+    """_shorten for a set of names, moving the cut so that different names
+    stay different where possible (the part that differs is often mid-name)."""
+    for head in sorted(range(1, width), key=lambda h: abs(h - width // 2)):
+        out = [_shorten(n, width, head) for n in names]
+        if len(set(out)) == len(set(names)):
+            return out
+    return [_shorten(n, width) for n in names]
+
+
+def _lines(s: str) -> List[str]:
+    return str(s).split("\n")
+
+
+def _bracket_levels(brackets: List[tuple], label_half: Optional[List[float]] = None) -> List[int]:
+    """Stack level (1 = lowest) per bracket: within a gene, shorter brackets go
+    lower and brackets that don't overlap share a level (Prism-like), instead
+    of one level per comparison. brackets = [(gene, x1, x2, ...)];
+    label_half = half the width of each bracket's star, in x units, so stars
+    on one level don't run into each other."""
+    levels = [0] * len(brackets)
+    by_gene: Dict[str, List[int]] = {}
+    for i, b in enumerate(brackets):
+        by_gene.setdefault(b[0], []).append(i)
+    for idx in by_gene.values():
+        used: List[List[tuple]] = []        # per level: occupied [lo, hi] spans
+        for i in sorted(idx, key=lambda i: (abs(brackets[i][2] - brackets[i][1]), min(brackets[i][1], brackets[i][2]))):
+            lo, hi = sorted((brackets[i][1], brackets[i][2]))
+            if label_half:
+                mid = (lo + hi) / 2.0
+                lo, hi = min(lo, mid - label_half[i]), max(hi, mid + label_half[i])
+            for lv, spans in enumerate(used):
+                # touching ends would merge two brackets into one line: keep a gap
+                if all(hi < a - 1e-6 or lo > b + 1e-6 for a, b in spans):
+                    spans.append((lo, hi))
+                    levels[i] = lv + 1
+                    break
+            else:
+                used.append([(lo, hi)])
+                levels[i] = len(used)
+    return levels
+
+
+class _Px:
+    """Rough text metrics in device pixels (bold sans), for layout decisions."""
+
+    def __init__(self, dpi: int):
+        self.ppt = dpi / 72.0
+
+    def char(self, pt: float) -> float:
+        return 0.6 * pt * self.ppt
+
+    def line(self, pt: float) -> float:
+        return 1.2 * pt * self.ppt
+
+    def text_w(self, s: str, pt: float) -> float:
+        return max(len(ln) for ln in _lines(s)) * self.char(pt)
+
+
+def _legend_box(labels: List[str], wrap: int, ncol: int, pt: float, px: _Px):
+    """Wrapped labels and the (width, height) in px of a legend with `ncol` columns."""
+    wrapped = [_wrap_label(lb, wrap) for lb in labels]
+    key = 1.15 * pt * px.ppt
+    ew = key + 0.5 * pt * px.ppt + max(px.text_w(w, pt) for w in wrapped) + 1.0 * pt * px.ppt
+    # Wrapped entries get a gap between them (_legend_layer), so the lines of
+    # one name don't run into the next.
+    gap = _LEGEND_GAP * pt * px.ppt if any("\n" in w for w in wrapped) else 0.35 * pt * px.ppt
+    eh = max(key, max(len(_lines(w)) for w in wrapped) * px.line(pt)) + gap
+    nrow = math.ceil(len(labels) / ncol)
+    return wrapped, ncol * ew + 10, nrow * eh + 10
+
+
+def _choose_grid(n: int, w: float, h: float, n_samples: int, strip: float, xaxis, yaxis: float,
+                 sp_x: float, sp_y: float, min_pw: float = 0.0, min_ph: float = 0.0):
+    """(ncol, nrow, panel_w, panel_h): the grid whose panels are closest to a
+    pleasant aspect ratio (wider when a panel holds more samples). `xaxis` is
+    the height of the x axis, or a function of the panel width returning
+    (height, penalty) — sample names wrap differently in narrow panels. With a
+    free y but shared x scale, facet_wrap draws the x axis once, under the
+    bottom panel of each column, so it costs its height once, not per row.
+    Panels narrower than `min_pw` (the gene name) or shorter than `min_ph`
+    (room for the significance brackets) are penalised."""
+    target = min(1.6, max(0.95, 0.85 + 0.09 * n_samples))
+    best = None
+    for ncol in range(1, n + 1):
+        nrow = math.ceil(n / ncol)
+        if (nrow - 1) * ncol >= n:            # a wholly empty row
+            continue
+        pw = (w - ncol * yaxis - (ncol - 1) * sp_x) / ncol
+        xa, penalty = xaxis(pw) if callable(xaxis) else (xaxis, 0.0)
+        ph = (h - nrow * strip - xa - (nrow - 1) * sp_y) / nrow
+        if pw <= 10 or ph <= 10:
+            continue
+        score = abs(math.log((pw / ph) / target)) + 0.05 * (nrow * ncol - n) + penalty
+        if pw < min_pw:
+            score += 1.0 + 2.0 * (min_pw / pw - 1)
+        if ph < min_ph:
+            score += 5.0 * (min_ph / ph - 1)   # strongly: else brackets get left out
+        if best is None or score < best[0]:
+            best = (score, ncol, nrow, pw, ph)
+    if best is None:                          # absurdly small figure: one row
+        return n, 1, max(10.0, w / n), max(10.0, h)
+    return best[1], best[2], best[3], best[4]
+
+
+# Significance brackets: a level is 0.85 star heights, plus a gap below the
+# lowest and the star above the highest; together at most _BRACKET_FMAX of a
+# panel's height (the data keep the rest). Stars shrink to _STAR_MIN of their
+# size (not below _STAR_MIN_PT) before brackets that still don't fit are left out.
+_BRACKET_FMAX = 0.72
+_STAR_MIN = 0.5
+_STAR_MIN_PT = 6.0
+
+
+def _bracket_need(levels: int, star_px: float) -> float:
+    """Height (px) that `levels` stacked brackets with their stars take."""
+    return (0.4 + 0.85 * max(0, levels - 1) + 0.75) * star_px
+
+
+def _fit_strip(genes: List[str], pw: float, fs: float, px: _Px):
+    """Gene names for the panel titles, wrapped at spaces / separators to the
+    panel width, and the font size (shrunk, down to 65%, when one word is still
+    too wide). Returns (labels, pt, lines)."""
+    pt = fs
+    names = [str(g) for g in genes] or [""]
+    # A word is never split ("BIGLY/CAN"): the font shrinks instead, and a word
+    # still too wide at 65% runs a little into the gap beside its panel.
+    longest_word = max(len(t.strip(" _-/")) for g in names for t in _LABEL_BREAK.split(g) or [g])
+    for _ in range(8):
+        chars = max(4, int(pw * 0.96 / px.char(pt)))
+        if longest_word <= chars or pt <= fs * 0.65 + 1e-6:
+            break
+        pt = max(fs * 0.65, pt * 0.9)
+    width = max(chars, longest_word)
+    wrapped = [_wrap_label(g, width) if len(g) > width else g for g in names]
+    lines = max(len(_lines(w)) for w in wrapped)
+    return wrapped, pt, lines
+
+
+def _facet_layout(n: int, labels: List[str], body: PlotRequest, n_levels: int = 0) -> dict:
+    """Grid, font scale, legend placement and label wrapping for the panel-per-
+    gene figure, from the panel count, the samples, the figure size and how
+    many significance-bracket levels a panel must hold (`n_levels`)."""
+    px = _Px(body.dpi)
+    W, H = float(body.width), float(body.height)
+    S = max(1, len(labels))
+    fs0 = float(body.font_size)
+    genes = [str(g) for g in body.gene_order]
+
+    def frame(fs: float):
+        has_title, has_x = bool(body.title.strip()), bool(body.xlabel.strip())
+        top = (px.line(fs * 1.25) + 0.6 * fs * px.ppt) if has_title else 0.5 * fs * px.ppt
+        left = (px.line(fs) + 0.4 * fs * px.ppt) if body.ylabel.strip() else 0.3 * fs * px.ppt
+        bottom = (px.line(fs) + 0.4 * fs * px.ppt) if has_x else 0.3 * fs * px.ppt
+        return W - left - 0.6 * fs * px.ppt, H - top - bottom
+
+    def parts(fs: float):
+        strip = px.line(fs) + 0.5 * fs * px.ppt
+        yaxis = 4.2 * px.char(fs * 0.85) + 0.5 * fs * px.ppt
+        return strip, yaxis, 1.1 * fs * px.ppt, 0.5 * fs * px.ppt   # strip, y axis, spacing x, spacing y
+
+    def name_w(fs: float) -> float:
+        """Width a gene title wants: the longest name, but one very long name
+        is wrapped / shrunk rather than forcing a grid of narrow columns."""
+        ws = sorted(px.text_w(g, fs) for g in genes) or [0.0]
+        return min(ws[-1], 1.5 * ws[len(ws) // 2]) * 1.05 + 0.6 * fs * px.ppt
+
+    def bracket_ph(fs: float) -> float:
+        """Panel height the brackets need at the smallest star size."""
+        if n_levels <= 0:
+            return 0.0
+        star_px = max(_STAR_MIN_PT, _STAR_MIN * fs * 1.15) * px.ppt
+        return _bracket_need(n_levels, star_px) / _BRACKET_FMAX
+
+    # Font scale from a first guess at the panel size: a 12-panel figure at
+    # 1200 x 800 px keeps readable (not oversized) text; a physically small
+    # figure (high dpi, few pixels) scales further down, to about 5 pt.
+    fw, fh = frame(fs0)
+    strip, yaxis, spx, spy = parts(fs0)
+    _, _, pw0, ph0 = _choose_grid(n, fw * 0.85, fh, S, strip, 0.3 * fs0 * px.ppt, yaxis, spx, spy, name_w(fs0))
+    cell_in = math.sqrt(max(1.0, pw0) * max(1.0, ph0)) / body.dpi
+    k = min(1.0, max(0.42, 0.45 + 0.32 * cell_in))
+    fs = min(fs0, max(5.0, fs0 * k))
+    k = fs / fs0
+    fw, fh = frame(fs)
+    strip, yaxis, spx, spy = parts(fs)
+    leg_pt = fs * 0.9
+    tick_pt = fs * 0.85
+    min_pw = name_w(fs)
+    min_ph = bracket_ph(fs)
+
+    def x_labels(pw: float):
+        """(wrapped sample names, rotated 90°?, axis height px, font pt, fits?)
+        for the names under the panels — None when they are off (the legend
+        names the samples). Horizontal and wrapped when the slots are wide
+        enough (more lines allowed with few samples); otherwise vertical,
+        wrapped onto as many lines as a slot can hold, so neighbouring names
+        never overlap (45° names run into the next one)."""
+        if not body.sample_labels:
+            return None, False, 0.3 * fs * px.ppt, tick_pt, True
+        slot = pw / (S + 0.2)                     # the discrete scale pads 0.6 slot each side
+        budget = (0.2 if n_levels > 3 else 0.3) * H   # at most this tall (less when brackets need the room)
+        pad = 0.6 * fs * px.ppt
+        max_h_lines = 5 if S <= 3 else 3
+        longest = max(len(str(lb)) for lb in labels)
+        for tp in (tick_pt, tick_pt * 0.85, tick_pt * 0.72):
+            chars = int(slot * 0.92 / px.char(tp))
+            if chars >= min(5, longest):          # short names ("A", "WT") need less
+                # wrapped one short of the slot: a separator may run one over
+                wrapped = [str(lb) if len(str(lb)) <= chars else _wrap_label(lb, chars - 1) for lb in labels]
+                n_lines = max(len(_lines(w)) for w in wrapped)
+                height = n_lines * px.line(tp) + pad
+                if n_lines <= max_h_lines and height <= budget:
+                    return wrapped, False, height, tp, True
+            # n lines at lineheight 0.9 stack to about (1 + 0.9 (n - 1)) x the font size
+            max_lines = int((slot * 0.95 / (tp * px.ppt) - 1) / 0.9) + 1 if slot * 0.95 >= tp * px.ppt else 0
+            if max_lines >= 1:
+                longest = max(len(str(lb)) for lb in labels)
+                for width in range(8, max(9, longest + 1)):
+                    wrapped = [_wrap_label(lb, width) for lb in labels]
+                    if max(len(_lines(w)) for w in wrapped) <= max_lines:
+                        break
+                height = max(px.text_w(w, tp) for w in wrapped) + pad
+                if height <= budget:
+                    return wrapped, True, height, tp, True
+        # Doesn't fit: the smallest font, vertical, one line per name, long
+        # names shortened in the middle to the height budget — the legend
+        # still names every sample in full. (Wrapped names would overlap.)
+        tp = tick_pt * 0.72
+        chars = max(6, int((budget - pad) / px.char(tp)))
+        short = _shorten_all([str(lb) for lb in labels], chars)
+        return short, True, max(px.text_w(w, tp) for w in short) + pad, tp, False
+
+    def grid(w: float, h: float):
+        def xaxis(pw: float):
+            xl = x_labels(pw)
+            return xl[2], 0.0 if xl[4] else 2.0
+        g = _choose_grid(n, w, h, S, strip, xaxis, yaxis, spx, spy, min_pw, min_ph)
+        xl, ang, xa, tp, fits = x_labels(g[2])
+        return g, xl, ang, xa, tp, fits
+
+    def score(g, fits: bool = True) -> float:
+        """Bigger panels are better; panels too short for their brackets, or
+        sample names that run into each other, much less so."""
+        pw, ph = g[2], g[3]
+        return pw * ph * (min(1.0, ph / min_ph) ** 2 if min_ph else 1.0) * (1.0 if fits else 0.25)
+
+    options = []
+    # 1) In the empty cells of the last row — costs no space at all. (Not with
+    # sample names on: the columns beside the gap draw theirs into it.)
+    g, xl, ang, xa, tp, fits = grid(fw, fh)
+    ncol, nrow, pw, ph = g
+    empty = ncol * nrow - n
+    if empty > 0 and not body.sample_labels:
+        reg_w = empty * (pw + yaxis + spx) - spx
+        reg_h = ph + strip + xa
+        for wrap in (22, 18, 15, 12):
+            lcols = max(1, min(S, int(reg_w * 0.95 // max(1.0, _legend_box(labels, wrap, 1, leg_pt, px)[1]))))
+            wrapped, lw, lh = _legend_box(labels, wrap, lcols, leg_pt, px)
+            if lw <= reg_w * 0.98 and lh <= reg_h * 0.95:
+                options.append(dict(pos="inside", wrapped=wrapped, lcols=lcols, grid=g, xl=xl, ang=ang, xa=xa, tp=tp,
+                                    inside=(1 - empty / (2.0 * ncol), 0.5 / nrow), score=score(g, fits) * 1.15))
+                break
+    # 2) Right: one column of wrapped labels (two if very tall).
+    for wrap in (20, 16, 13):
+        for lcols in (1, 2):
+            wrapped, lw, lh = _legend_box(labels, wrap, lcols, leg_pt, px)
+            if lh <= fh * 0.92 and lw <= W * 0.3:
+                g2 = grid(fw - lw, fh)
+                options.append(dict(pos="right", wrapped=wrapped, lcols=lcols, grid=g2[0], xl=g2[1], ang=g2[2],
+                                    xa=g2[3], tp=g2[4], score=score(g2[0], g2[5])))
+                break
+        else:
+            continue
+        break
+    # 3) Bottom: as many columns as fit across the figure.
+    for wrap in (24, 18, 14):
+        one = _legend_box(labels, wrap, 1, leg_pt, px)[1]
+        lcols = max(1, min(S, int((W * 0.96) // max(1.0, one))))
+        wrapped, lw, lh = _legend_box(labels, wrap, lcols, leg_pt, px)
+        if lh <= fh * 0.3 or wrap == 14:
+            g3 = grid(fw, fh - lh)
+            options.append(dict(pos="bottom", wrapped=wrapped, lcols=lcols, grid=g3[0], xl=g3[1], ang=g3[2],
+                                xa=g3[3], tp=g3[4], score=score(g3[0], g3[5])))
+            break
+    best = max(options, key=lambda o: o["score"])
+    ncol, nrow, pw, ph = best["grid"]
+    # Gene titles: wrapped / shrunk to the panel width. Extra title lines come
+    # out of the panel height.
+    strip_labels, strip_pt, strip_lines = _fit_strip(genes, pw, fs, px)
+    ph -= (strip_lines - 1) * px.line(strip_pt) + (strip_pt - fs) * 1.2 * px.ppt
+    # Fewer y ticks in short panels, so their labels don't run together.
+    ph_pt = ph / px.ppt
+    y_breaks = 4 if ph_pt >= 7 * tick_pt else 3     # n=2 can leave a panel with one label
+    return dict(fs=fs, k=k, ncol=ncol, nrow=nrow, panel_h=max(20.0, ph), panel_w=max(20.0, pw), legend=best, tick_pt=tick_pt,
+                leg_pt=leg_pt, spx=spx / px.ppt, spy=spy / px.ppt, strip_labels=strip_labels, strip_pt=strip_pt,
+                y_breaks=y_breaks)
+
+
+def _grouped_legend(labels: List[str], body: PlotRequest) -> dict:
+    """Legend for the single graph: on the right as before, with long sample
+    names wrapped; below the graph when even wrapped they'd take too much width."""
+    px = _Px(body.dpi)
+    pt = float(body.font_size) * 0.9
+    W, H = float(body.width), float(body.height)
+    if max((len(str(lb)) for lb in labels), default=0) <= 24:   # short names: the legend as it always was
+        return dict(pos="right", wrapped=[str(lb) for lb in labels], lcols=1)
+    for wrap in (24, 20, 16):
+        wrapped, lw, lh = _legend_box(labels, wrap, 1, pt, px)
+        if lw <= W * 0.3 and lh <= H * 0.8:
+            return dict(pos="right", wrapped=wrapped, lcols=1)
+    for wrap in (24, 18):
+        one = _legend_box(labels, wrap, 1, pt, px)[1]
+        lcols = max(1, min(len(labels), int((W * 0.96) // max(1.0, one))))
+        wrapped, lw, lh = _legend_box(labels, wrap, lcols, pt, px)
+        if lh <= H * 0.3:
+            break
+    return dict(pos="bottom", wrapped=wrapped, lcols=lcols)
+
+
+_LEGEND_GAP = 0.6   # space between wrapped legend entries, in units of the legend font size
+
+
+def _legend_layer(leg: dict, text_pt: Optional[float], key_pt: Optional[float], override: str = "",
+                  base_pt: Optional[float] = None) -> str:
+    """Legend position/columns as ggplot code. An 'inside' legend needs
+    ggplot2 >= 3.5 (legend.position.inside); older versions put it below.
+    `override` = extra guide_legend() arguments (e.g. bigger dot-plot keys).
+    When a name is wrapped, entries get a gap between them (`base_pt` = the
+    legend font size when `text_pt` isn't set)."""
+    guide = (f'p <- p + ggplot2::guides(fill=ggplot2::guide_legend(ncol={int(leg["lcols"])}, byrow=TRUE{override}))\n')
+    size = f"size={text_pt:.2f}, " if text_pt else ""
+    key = f'legend.key.size=ggplot2::unit({key_pt:.2f}, "pt"), ' if key_pt else ""
+    gap_pt = _LEGEND_GAP * float(text_pt or base_pt or 11.0)
+    # ggplot2 >= 3.5 spaces keys with legend.key.spacing.y; older versions only
+    # through the text margins.
+    spaced = any("\n" in str(w) for w in leg.get("wrapped", []))
+    spacing = ('if (utils::packageVersion("ggplot2") >= "3.5.0") p <- p + ggplot2::theme('
+               f'legend.key.spacing.y=ggplot2::unit({gap_pt:.2f}, "pt")) '
+               'else p <- p + ggplot2::theme(legend.text=ggplot2::element_text('
+               f'margin=ggplot2::margin(t={gap_pt / 2:.2f}, b={gap_pt / 2:.2f}, l={0.4 * gap_pt:.2f})))\n') if spaced else ""
+    style = (f'p <- p + ggplot2::theme(legend.text=ggplot2::element_text({size}lineheight=0.9), '
+             f'{key}legend.title=ggplot2::element_blank())\n'
+             'if (utils::packageVersion("ggplot2") >= "3.5.0") p <- p + ggplot2::theme(legend.key.justification="left")\n'
+             + spacing)
+    if leg["pos"] == "inside":
+        x, y = leg["inside"]
+        pos = ('if (utils::packageVersion("ggplot2") >= "3.5.0") p <- p + ggplot2::theme(legend.position="inside", '
+               f'legend.position.inside=c({x:.4f}, {y:.4f}), legend.justification.inside=c(0.5, 0.5)) '
+               'else p <- p + ggplot2::theme(legend.position="bottom")\n')
+    else:
+        pos = f'p <- p + ggplot2::theme(legend.position="{leg["pos"]}")\n'
+    return guide + style + pos
 
 
 @router.post("/api/qpcr/plot")
@@ -555,31 +1100,89 @@ def plot(body: PlotRequest):
     export_fmt = "tiff" if str(body.export_format).lower() in ("tiff", "tif") else "png"
     bg = "transparent" if body.transparent else "white"
     ptype = body.plot_type if body.plot_type in ("bar", "violin", "box", "dot") else "bar"
-    star_size = max(2, body.font_size // 3)
     faceted = str(body.layout).lower() == "faceted"
     bw = min(1.0, max(0.05, float(body.bar_width)))
     show_pts = body.show_points or ptype == "dot"
     angle = 'p <- p + ggplot2::theme(axis.text.x=ggplot2::element_text(angle=45, hjust=1, vjust=1))\n'
+    px = _Px(body.dpi)
+    # Dot plots: the legend shows the (coloured) points; make its keys readable.
+    key_override = f", override.aes=list(size={max(2.5, float(body.point_size) * 1.3):.2f})" if ptype == "dot" else ""
+
+    comps = _build_comparisons(body)
+    # Violins need 2+ values; a single replicate is drawn as a point instead.
+    violin_single = ('.vd <- dat %>% dplyr::group_by(Gene, Sample) %>% dplyr::filter(dplyr::n() >= 2) %>% dplyr::ungroup()\n'
+                     '.v1 <- dat %>% dplyr::group_by(Gene, Sample) %>% dplyr::filter(dplyr::n() < 2) %>% dplyr::ungroup()\n')
+    single_pt = f'size={max(2.2, float(body.point_size) * 1.5):.2f}, shape=23, colour="black", stroke=0.4, show.legend=FALSE'
 
     if faceted:
+        n_panels = len([g for g in body.gene_order if g in set(pts["Gene"])])
+        # How high the brackets stack (before star widths are known), so the
+        # layout leaves panels tall enough for them.
+        est = [(cg, sample_idx[s1], sample_idx[s2]) for (cg, s1, s2, _p, _st) in comps
+               if cg in gene_idx and s1 in sample_idx and s2 in sample_idx]
+        fl = _facet_layout(max(1, n_panels), labels, body, max(_bracket_levels(est), default=0))
+        fs = fl["fs"]
+        leg = fl["legend"]
+        legend_labels = leg["wrapped"]
+        star_pt = fs * 1.15
+        panel_h = fl["panel_h"]
         # One panel per gene; the x-axis inside each panel is Sample. drop=FALSE
         # keeps every sample's slot so bracket positions (sample index) hold.
         if ptype == "bar":
             geom = (f'p <- p + ggplot2::geom_col(data=summ, ggplot2::aes(Sample, mean, fill=Sample), width={bw}, colour="black", linewidth=0.3) + '
                     'ggplot2::geom_errorbar(data=summ, ggplot2::aes(Sample, ymin=pmax(0, mean-err), ymax=mean+err), width=0.25, linewidth=0.4)\n')
         elif ptype == "violin":
-            geom = 'p <- p + ggplot2::geom_violin(data=dat, ggplot2::aes(Sample, value, fill=Sample), trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
+            geom = (violin_single +
+                    f'p <- p + ggplot2::geom_violin(data=.vd, ggplot2::aes(Sample, value, fill=Sample), width={max(bw, 0.5)}, trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
+                    f'if (nrow(.v1) > 0) p <- p + ggplot2::geom_point(data=.v1, ggplot2::aes(Sample, value, fill=Sample), {single_pt})\n')
         elif ptype == "box":
-            geom = 'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(Sample, value, fill=Sample), outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
+            geom = f'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(Sample, value, fill=Sample), width={bw}, outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
         else:  # dot (flat crossbar at the mean)
-            geom = 'p <- p + ggplot2::geom_crossbar(data=summ, ggplot2::aes(Sample, y=mean, ymin=mean, ymax=mean, fill=Sample), width=0.5, linewidth=0.3, colour="black")\n'
+            geom = f'p <- p + ggplot2::geom_crossbar(data=summ, ggplot2::aes(Sample, y=mean, ymin=mean, ymax=mean), width={min(0.8, bw)}, linewidth=0.4, colour="black")\n'
+        # Dot plots colour the points by sample (they are the only thing that
+        # carries the colour); over bars/boxes/violins the points stay white.
+        pfill = "fill=Sample" if ptype == "dot" else ""
+        pconst = "" if ptype == "dot" else 'fill="white", '
         points_layer = (
-            f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(Sample, value), position=ggplot2::position_jitter(width=0.12, height=0, seed=1), size={body.point_size}, shape=21, fill="white", colour="black", stroke=0.4)\n'
+            f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(Sample, value{", " + pfill if pfill else ""}), position=ggplot2::position_jitter(width={0.18 * bw:.3f}, height=0, seed=1), size={body.point_size}, shape=21, {pconst}colour="black", stroke=0.4)\n'
             if show_pts else ""
         )
-        layout_layer = 'p <- p + ggplot2::facet_wrap(~Gene, scales="free_y") + ggplot2::scale_x_discrete(drop=FALSE)\n'
-        xangle_layer = angle
+        xl = fl["legend"]["xl"]
+        x_scale = (f'ggplot2::scale_x_discrete(drop=FALSE, labels={_r_vec(xl)})' if xl
+                   else 'ggplot2::scale_x_discrete(drop=FALSE)')
+        # Fold change is never negative: start the axis at 0 (flush for bars /
+        # dots); few, clean ticks per panel ("2.5", not "2.50").
+        # Violins and boxes show a distribution: their axis fits the data.
+        zero = ptype in ("bar", "dot")
+        lo = "0" if zero else "0.04"
+        # Gene titles wrapped / shrunk to the panel width (by index, like the data).
+        strip = _r_vec(fl["strip_labels"])
+        layout_layer = (
+            f'.strip <- {strip}; names(.strip) <- .genes\n'
+            f'p <- p + ggplot2::facet_wrap(~Gene, scales="free_y", ncol={fl["ncol"]}, labeller=ggplot2::as_labeller(.strip)) + {x_scale} + '
+            f'ggplot2::scale_y_continuous(expand=ggplot2::expansion(mult=c({lo}, 0.04)), breaks=scales::breaks_extended(n={fl["y_breaks"]}), labels=.num)'
+            + (' + ggplot2::expand_limits(y=0)\n' if zero else '\n')
+        )
+        if not xl:
+            x_text = 'axis.text.x=ggplot2::element_blank(), axis.ticks.x=ggplot2::element_blank()'
+        elif fl["legend"]["ang"]:
+            x_text = f'axis.text.x=ggplot2::element_text(size={fl["legend"]["tp"]:.2f}, angle=90, hjust=1, vjust=0.5, lineheight=0.9)'
+        else:
+            x_text = f'axis.text.x=ggplot2::element_text(size={fl["legend"]["tp"]:.2f}, lineheight=0.9)'
+        xangle_layer = (
+            'p <- p + ggplot2::theme('
+            f'plot.title=ggplot2::element_text(size={fs * 1.25:.2f}, face="bold", hjust=0.5), '
+            f'axis.title=ggplot2::element_text(size={fs:.2f}), '
+            f'axis.text.y=ggplot2::element_text(size={fl["tick_pt"]:.2f}), {x_text}, '
+            'strip.background=ggplot2::element_blank(), '
+            f'strip.text=ggplot2::element_text(size={fl["strip_pt"]:.2f}, face="bold", lineheight=0.9, margin=ggplot2::margin(b={0.35 * fs:.1f})), '
+            f'panel.spacing.x=ggplot2::unit({fl["spx"]:.1f}, "pt"), panel.spacing.y=ggplot2::unit({fl["spy"]:.1f}, "pt"))\n'
+        ) + _legend_layer(leg, fl["leg_pt"], fl["leg_pt"] * 1.15, key_override)
+        theme_fs = fs
     else:
+        star_pt = max(2, body.font_size // 3) * 2.845
+        gl = _grouped_legend(labels, body)
+        legend_labels = gl["wrapped"]
         # Single graph: genes on the x-axis, one fixed lane per sample. Every
         # layer is drawn at the lane centre xp — the same position _dx() gives
         # the brackets — so a gene missing a sample leaves a gap rather than
@@ -591,27 +1194,39 @@ def plot(body: PlotRequest):
             geom = ('p <- p + ggplot2::geom_col(data=summ, ggplot2::aes(xp, mean, fill=Sample), position="identity", width=.w, colour="black", linewidth=0.3) + '
                     'ggplot2::geom_errorbar(data=summ, ggplot2::aes(xp, ymin=pmax(0, mean-err), ymax=mean+err), position="identity", width=.w * 0.35, linewidth=0.4)\n')
         elif ptype == "violin":
-            geom = 'p <- p + ggplot2::geom_violin(data=dat, ggplot2::aes(xp, value, fill=Sample, group=interaction(Gene, Sample)), position="identity", width=.w, trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
+            geom = (violin_single +
+                    'p <- p + ggplot2::geom_violin(data=.vd, ggplot2::aes(xp, value, fill=Sample, group=interaction(Gene, Sample)), position="identity", width=.w, trim=FALSE, colour="black", linewidth=0.3, alpha=0.85)\n'
+                    f'if (nrow(.v1) > 0) p <- p + ggplot2::geom_point(data=.v1, ggplot2::aes(xp, value, fill=Sample), {single_pt})\n')
         elif ptype == "box":
             geom = 'p <- p + ggplot2::geom_boxplot(data=dat, ggplot2::aes(xp, value, fill=Sample, group=interaction(Gene, Sample)), position="identity", width=.w, outlier.shape=NA, colour="black", linewidth=0.3, alpha=0.85)\n'
         else:  # dot (flat crossbar at the mean)
-            geom = 'p <- p + ggplot2::geom_crossbar(data=summ, ggplot2::aes(xp, y=mean, ymin=mean, ymax=mean, fill=Sample), position="identity", width=.w * 0.9, linewidth=0.3, colour="black")\n'
+            geom = 'p <- p + ggplot2::geom_crossbar(data=summ, ggplot2::aes(xp, y=mean, ymin=mean, ymax=mean), position="identity", width=.w * 0.9, linewidth=0.4, colour="black")\n'
+        pfill = ", fill=Sample" if ptype == "dot" else ""
+        pconst = "" if ptype == "dot" else 'fill="white", '
         points_layer = (
-            f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(xp, value), position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=1), size={body.point_size}, shape=21, fill="white", colour="black", stroke=0.4)\n'
+            f'p <- p + ggplot2::geom_point(data=dat, ggplot2::aes(xp, value{pfill}), position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=1), size={body.point_size}, shape=21, {pconst}colour="black", stroke=0.4)\n'
             if show_pts else ""
         )
         layout_layer = ('p <- p + ggplot2::scale_x_continuous(breaks=seq_along(.genes), labels=.genes, expand=c(0, 0)) + '
                         'ggplot2::coord_cartesian(xlim=c(0.5, length(.genes) + 0.5))\n')
-        xangle_layer = angle if len(body.gene_order) > 8 else ""
+        # The legend keeps the theme's look; only wrapped / moved legends change.
+        restyle = gl["pos"] != "right" or any("\n" in w for w in legend_labels)
+        xangle_layer = (angle if len(body.gene_order) > 8 else "") + (
+            _legend_layer(gl, None, None, key_override, base_pt=body.font_size * 0.9) if restyle else
+            f'p <- p + ggplot2::guides(fill=ggplot2::guide_legend({key_override.lstrip(", ")}))\n' if key_override else "")
+        # The plotting area, roughly: what's left of the figure after the
+        # title, the gene labels and a bottom legend.
+        panel_h = float(body.height) * (0.62 if len(body.gene_order) > 8 else 0.72)
+        theme_fs = body.font_size
 
-    theme_layer = _theme_layer(body.theme, body.font_size)
+    theme_layer = _theme_layer(body.theme, theme_fs)
     transparent_theme = _transparent_layer(body.transparent)
 
     # Significance brackets. Faceted layout uses integer Sample positions within
     # each panel; grouped layout uses the lane centres: gene g (1-based) with S
     # samples places sample j (1-based) at g + bw*((2j-1-S)/(2S)), exactly the
     # xp computed in R.
-    comps = _build_comparisons(body)
+    notes: List[str] = []
     if faceted:
         brackets = [(cg, sample_idx[s1], sample_idx[s2], star)
                     for (cg, s1, s2, _p, star) in comps
@@ -624,30 +1239,92 @@ def plot(body: PlotRequest):
                     if cg in gene_idx and s1 in sample_idx and s2 in sample_idx]
 
     if brackets:
+        # Star widths in x units (faceted: S slots plus the discrete scale's
+        # 0.6 padding each side; grouped: one unit per gene).
+        if faceted:
+            unit_px = max(1.0, fl["panel_w"]) / (n_samples + 0.2)
+        else:
+            unit_px = float(body.width) * (0.62 if gl["pos"] == "right" else 0.85) / max(1, len(body.gene_order))
+        half = [0.5 * (len(b[3]) * 0.5 + 0.3) * star_pt * px.ppt / unit_px for b in brackets]
+        levels = _bracket_levels(brackets, half)
+        # Vertical geometry as fractions of the panel height, so a bracket
+        # level is always a little taller than its star whatever the panel's
+        # y range: R puts the top of the axis at D = top / (1 - space needed).
+        # Too many levels for the panel height: smaller stars (down to
+        # _STAR_MIN) first; brackets that still don't fit are left out (and
+        # the figure says so) rather than squeezed until the stars overlap.
+        n_lv = max(levels)
+        room = _BRACKET_FMAX * panel_h
+        need = _bracket_need(n_lv, star_pt * px.ppt)
+        if need > room:
+            floor_pt = min(star_pt, max(_STAR_MIN_PT, _STAR_MIN * star_pt))
+            star_pt = max(floor_pt, star_pt * room / need)
+        star_px = star_pt * px.ppt
+        cap = max(1, int((room - _bracket_need(1, star_px)) / (0.85 * star_px) + 1e-9) + 1)
+        if n_lv > cap:
+            keep = [lv <= cap for lv in levels]
+            dropped = sorted({b[0] for b, k in zip(brackets, keep) if not k}, key=lambda g: gene_idx[g])
+            n_drop = keep.count(False)
+            brackets = [b for b, k in zip(brackets, keep) if k]
+            levels = [lv for lv, k in zip(levels, keep) if k]
+            more = (" Choose “Vs control only”, or make the figure taller." if body.brackets != "control"
+                    else " Make the figure taller, or use fewer panels.")
+            notes.append(f"{n_drop} significance bracket{'s' if n_drop != 1 else ''} didn't fit and "
+                         f"{'are' if n_drop != 1 else 'is'} not drawn ({', '.join(map(str, dropped))}).{more} "
+                         "All results are in the Results tab.")
+        frac = lambda v: max(0.0, v / max(20.0, panel_h))  # noqa: E731
+        gap_f, step_f, txt_f, tick_f = frac(0.4 * star_px), frac(0.85 * star_px), frac(0.75 * star_px), frac(0.2 * star_px)
         bgi = "c(" + ", ".join(str(gene_idx[b[0]]) for b in brackets) + ")"
         bx1 = "c(" + ", ".join(str(b[1]) for b in brackets) + ")"
         bx2 = "c(" + ", ".join(str(b[2]) for b in brackets) + ")"
+        blv = "c(" + ", ".join(str(lv) for lv in levels) + ")"
         blabels = _r_vec([b[3] for b in brackets])
-        top_expr = ('summ %>% dplyr::group_by(Gene) %>% dplyr::summarise(top=max(mean+err, na.rm=TRUE), .groups="drop")'
-                    if ptype == "bar" else
-                    'dat %>% dplyr::group_by(Gene) %>% dplyr::summarise(top=max(value, na.rm=TRUE), .groups="drop")')
+        # The highest thing drawn for a gene: error bar tops, and the points
+        # when they are shown (a replicate can sit above the error bar).
+        if ptype == "bar":
+            top_expr = ('dplyr::full_join(summ %>% dplyr::group_by(Gene) %>% dplyr::summarise(t1=max(mean+err, na.rm=TRUE), .groups="drop"), '
+                        f'dat %>% dplyr::group_by(Gene) %>% dplyr::summarise(t2={"max(value, na.rm=TRUE)" if show_pts else "-Inf"}, .groups="drop"), by="Gene") %>% '
+                        'dplyr::mutate(top=pmax(t1, t2, na.rm=TRUE)) %>% dplyr::select(Gene, top)')
+        elif ptype == "violin":
+            top_expr = ('dat %>% dplyr::group_by(Gene, Sample) %>% dplyr::summarise(t=max(value, na.rm=TRUE) + '
+                        'if (dplyr::n() >= 2) 3 * stats::bw.nrd0(value) else 0, .groups="drop") %>% '
+                        'dplyr::group_by(Gene) %>% dplyr::summarise(top=max(t, na.rm=TRUE), .groups="drop")')
+        else:
+            top_expr = 'dat %>% dplyr::group_by(Gene) %>% dplyr::summarise(top=max(value, na.rm=TRUE), .groups="drop")'
+        shared_d = "" if faceted else 'bdf$D <- max(c(bdf$D, topdf$top), na.rm=TRUE)\n  '
+        blank = ('p <- p + ggplot2::geom_blank(data=unique(bdf[c("Gene", "D")]), ggplot2::aes(y=D), inherit.aes=FALSE)'
+                 if faceted else 'p <- p + ggplot2::expand_limits(y=max(bdf$D))')
         bracket_block = (
-            f'bdf <- data.frame(Gene=factor(.genes[{bgi}], levels=.genes), x1={bx1}, x2={bx2}, label={blabels}, stringsAsFactors=FALSE)\n'
+            f'bdf <- data.frame(Gene=factor(.genes[{bgi}], levels=.genes), x1={bx1}, x2={bx2}, lv={blv}, label={blabels}, stringsAsFactors=FALSE)\n'
             f'topdf <- as.data.frame({top_expr})\n'
             # left-join + drop brackets whose gene has no plotted data (else a
             # 0-row bdf would crash geom_segment with "x1 not found").
             'bdf <- merge(bdf, topdf, by="Gene", all.x=TRUE)\n'
-            'bdf <- bdf[!is.na(bdf$top), , drop=FALSE]\n'
+            'bdf <- bdf[is.finite(bdf$top), , drop=FALSE]\n'
             'if (nrow(bdf) > 0) {\n'
-            '  bdf <- do.call(rbind, by(bdf, bdf$Gene, function(d) { d$rank <- seq_len(nrow(d)); d }))\n'
-            '  bdf$y <- bdf$top * 1.06 + (bdf$rank - 1) * bdf$top * 0.12\n'
+            f'  .gap <- {gap_f:.5f}; .step <- {step_f:.5f}; .txt <- {txt_f:.5f}; .tick <- {tick_f:.5f}; .fmax <- 0.72\n'
+            '  bdf$top <- pmax(bdf$top, 0)\n'
+            '  .L <- ave(bdf$lv, bdf$Gene, FUN=max)\n'
+            # Too many levels for the panel: squeeze the step rather than push
+            # the data into a sliver at the bottom.
+            '  .stp <- ifelse(.L > 1, pmin(.step, (.fmax - .gap - .txt) / pmax(.L - 1, 1)), .step)\n'
+            '  .fr <- pmin(.gap + (.L - 1) * .stp + .txt, .fmax)\n'
+            '  bdf$D <- ifelse(bdf$top > 0, bdf$top / (1 - .fr), 1)\n'
+            f'  {shared_d}bdf$y <- bdf$top + (.gap + (bdf$lv - 1) * .stp) * bdf$D\n'
+            '  bdf$yt <- bdf$y - .tick * bdf$D\n'
+            '  bdf$vj <- ifelse(bdf$label == "ns", -0.25, 0.15)\n'
             '  p <- p + ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x2, y=y, yend=y), inherit.aes=FALSE, linewidth=0.4) + '
-            f'ggplot2::geom_text(data=bdf, ggplot2::aes(x=(x1+x2)/2, y=y, label=label), inherit.aes=FALSE, vjust=-0.2, size={star_size})\n'
+            'ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x1, xend=x1, y=y, yend=yt), inherit.aes=FALSE, linewidth=0.4) + '
+            'ggplot2::geom_segment(data=bdf, ggplot2::aes(x=x2, xend=x2, y=y, yend=yt), inherit.aes=FALSE, linewidth=0.4) + '
+            f'ggplot2::geom_text(data=bdf, ggplot2::aes(x=(x1+x2)/2, y=y, label=label, vjust=vj), inherit.aes=FALSE, size={star_pt / 2.845:.2f})\n'
+            f'  {blank}\n'
             '}\n'
         )
     else:
         bracket_block = ""
 
+    xlab = f'"{_resc(body.xlabel)}"' if body.xlabel.strip() else "NULL"
+    ylab = f'"{_resc(body.ylabel)}"' if body.ylabel.strip() else "NULL"
     code = f"""
 suppressMessages({{ library(ggplot2); library(dplyr) }})
 .genes <- {_r_vec(body.gene_order)}
@@ -656,7 +1333,8 @@ dat <- data
 dat$Gene <- factor(.genes[dat$gi], levels=.genes)
 dat$Sample <- factor(.samples[dat$si], levels=.samples)
 .cols <- {_r_vec(colors)}; names(.cols) <- .samples
-.labs <- {_r_vec(labels)}
+.labs <- {_r_vec(legend_labels)}
+.num <- function(x) {{ out <- format(x, trim=TRUE, scientific=FALSE, drop0trailing=TRUE); out[is.na(x)] <- NA; out }}
 .S <- length(.samples); .bw <- {bw}; .w <- .bw / .S
 .lane <- function(g, s) as.integer(g) + .bw * ((2 * as.integer(s) - 1 - .S) / (2 * .S))
 summ <- dat %>% dplyr::group_by(Gene, Sample) %>% dplyr::summarise(mean=mean(value), sd=sd(value), sem=sd(value)/sqrt(dplyr::n()), .groups="drop")
@@ -665,12 +1343,14 @@ summ$err[is.na(summ$err)] <- 0
 summ$xp <- .lane(summ$Gene, summ$Sample)
 dat$xp <- .lane(dat$Gene, dat$Sample)
 p <- ggplot2::ggplot()
-{geom}{points_layer}{layout_layer}p <- p + ggplot2::scale_fill_manual(values=.cols, labels=.labs, drop=FALSE) + ggplot2::labs(title="{_resc(body.title)}", x="{_resc(body.xlabel)}", y="{_resc(body.ylabel)}", fill=NULL)
+{geom}{points_layer}{layout_layer}p <- p + ggplot2::scale_fill_manual(values=.cols, labels=.labs, drop=FALSE) + ggplot2::labs(title="{_resc(body.title)}", x={xlab}, y={ylab}, fill=NULL)
 {theme_layer}{xangle_layer}{bracket_block}{transparent_theme}mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
 mpfig_data(dplyr::select(summ, -xp), "qpcr_summary")
 """
     data = _indexed(pts, body.gene_order, body.sample_order)
     res = r_bridge.run_r(r_bridge.RunRRequest(code=code, data_csv=data.to_csv(index=False), timeout_sec=120))
+    if notes and isinstance(res, dict):
+        res["notes"] = notes
     return res
 
 
@@ -694,6 +1374,32 @@ class CpPlotRequest(BaseModel):
     dpi: int = 150
     export_format: str = "png"
     transparent: bool = False
+    # Wells best of three left out of the analysis ({Run, Well, Gene, Sample,
+    # Cp} as /analyze returned them): drawn hollow and grey, not in the mean.
+    excluded_wells: List[dict] = []
+
+
+def _mark_excluded(df: pd.DataFrame, excluded: List[dict]) -> pd.Series:
+    """1 for the rows of `df` (Run, Well, Gene, Sample, Cp) that are in
+    `excluded`, else 0. Each listed well marks one row, so two wells with the
+    same identity and Cp are counted right."""
+    def key(run, well, gene, sample, cp):
+        cp = None if cp is None or (isinstance(cp, float) and math.isnan(cp)) else round(float(cp), 4)
+        well = None if well is None or (isinstance(well, float) and math.isnan(well)) else str(well)
+        return (str(run), well, str(gene), str(sample), cp)
+    want: Dict[tuple, int] = {}
+    for e in excluded:
+        k = key(e.get("Run"), e.get("Well"), e.get("Gene"), e.get("Sample"), e.get("Cp"))
+        want[k] = want.get(k, 0) + 1
+    out = []
+    for run, well, gene, sample, cp in df[["Run", "Well", "Gene", "Sample", "Cp"]].itertuples(index=False):
+        k = key(run, well, gene, sample, cp)
+        if want.get(k, 0) > 0:
+            want[k] -= 1
+            out.append(1)
+        else:
+            out.append(0)
+    return pd.Series(out, index=df.index, dtype=int)
 
 
 @router.post("/api/qpcr/plot-cp")
@@ -701,12 +1407,16 @@ def plot_cp(body: CpPlotRequest):
     """Raw Cp per gene x sample, reference genes included, with a dotted line at
     the Cp limit so genes near or past detection are easy to spot and exclude.
     Undetermined wells (no Cp) are drawn at the limit as crosses."""
-    rows = [(r.get("Gene"), r.get("Sample"), r.get("Cp"))
+    rows = [(r.get("Gene"), r.get("Sample"), r.get("Cp"), p.get("name", ""), r.get("Well"))
             for p in body.pairs or qpcr_library.load_records(body.run_ids)
             for r in p.get("records") or []]
-    df = pd.DataFrame(rows, columns=["Gene", "Sample", "Cp"])
+    df = pd.DataFrame(rows, columns=["Gene", "Sample", "Cp", "Run", "Well"])
     df["Cp"] = pd.to_numeric(df["Cp"], errors="coerce")
     df = df[df["Gene"].isin(body.gene_order) & df["Sample"].isin(body.sample_order)].copy()
+    marked = bool(body.excluded_wells)
+    if marked:
+        df["bo"] = _mark_excluded(df, body.excluded_wells)
+    df = df.drop(columns=["Run", "Well"])
     if df.empty:
         return {"success": False, "stderr": "No wells for the selected genes and samples.", "plots": []}
 
@@ -729,6 +1439,21 @@ def plot_cp(body: CpPlotRequest):
               if angled else "")
     df["nd"] = df["Cp"].isna().astype(int)
     df["Cp"] = df["Cp"].fillna(lim)
+    # Best of three: left-out wells are drawn hollow and grey and kept out of
+    # the mean, so the bar shows what the analysis used.
+    if marked:
+        bo_split = 'dat$bo[is.na(dat$bo)] <- 0\nbo <- dat[dat$bo == 1, , drop=FALSE]\ndet <- dat[dat$nd == 0 & dat$bo == 0, , drop=FALSE]\n'
+        bo_layer = (f'if (nrow(bo) > 0) p <- p + ggplot2::geom_point(data=bo, ggplot2::aes(x, Cp), shape=21, fill="white", colour="grey55", '
+                    f'stroke=0.7, size={body.point_size}, position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=3))\n')
+        caption = ('.cap <- c(if (nrow(und) > 0) "× undetermined well (no Cp), drawn at the limit", '
+                   'if (nrow(bo) > 0) "Hollow grey dots: wells left out by best of three (not in the mean)")\n'
+                   '.cap <- if (length(.cap)) paste(.cap, collapse="\\n") else NULL\n')
+        bo_summ = ", n_left_out=sum(bo)"
+        used = "nd == 0 & bo == 0"
+    else:
+        bo_split = bo_layer = bo_summ = ""
+        used = "nd == 0"
+        caption = '.cap <- if (nrow(und) > 0) "× undetermined well (no Cp), drawn at the limit" else NULL\n'
 
     # One fixed lane per sample (as in the grouped fold-change plot), so the
     # mean bars always sit on their own wells even when a gene lacks a sample.
@@ -744,23 +1469,23 @@ dat$Sample <- factor(.samples[dat$si], levels=.samples)
 .S <- length(.samples); dw <- 0.8; .w <- dw / .S
 dat$x <- as.integer(dat$Gene) + dw * ((2 * as.integer(dat$Sample) - 1 - .S) / (2 * .S))
 det <- dat[dat$nd == 0, , drop=FALSE]
-und <- dat[dat$nd == 1, , drop=FALSE]
-mn <- det %>% dplyr::group_by(Gene, Sample, x) %>% dplyr::summarise(m=mean(Cp), .groups="drop")
+{bo_split}und <- dat[dat$nd == 1, , drop=FALSE]
+{caption}mn <- det %>% dplyr::group_by(Gene, Sample, x) %>% dplyr::summarise(m=mean(Cp), .groups="drop")
 p <- ggplot2::ggplot()
 p <- p + ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin=.lim, ymax=Inf, fill="#c1666b", alpha=0.08)
 {divider}p <- p + ggplot2::geom_crossbar(data=mn, ggplot2::aes(x=x, y=m, ymin=m, ymax=m), width=.w * 0.9, linewidth=0.3, colour="black")
 p <- p + ggplot2::geom_point(data=det, ggplot2::aes(x, Cp, fill=Sample), shape=21, colour="black", stroke=0.3, size={body.point_size}, position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=1))
 if (nrow(und) > 0) p <- p + ggplot2::geom_point(data=und, ggplot2::aes(x, Cp), shape=4, colour="#c1666b", stroke=0.9, size={body.point_size * 1.1:.2f}, position=ggplot2::position_jitter(width=.w * 0.22, height=0, seed=2))
-p <- p + ggplot2::geom_hline(yintercept=.lim, linetype="dotted", colour="#c1666b", linewidth=0.8)
+{bo_layer}p <- p + ggplot2::geom_hline(yintercept=.lim, linetype="dotted", colour="#c1666b", linewidth=0.8)
 p <- p + ggplot2::annotate("text", x=Inf, y=.lim, label=sprintf("Cp %g", .lim), hjust=1.05, vjust=-0.6, colour="#c1666b", size={max(3, body.font_size / 3.5):.2f})
 p <- p + ggplot2::expand_limits(y=.lim + 1)
 p <- p + ggplot2::scale_fill_manual(values=.cols, labels={_r_vec(labels)}, drop=FALSE)
 p <- p + ggplot2::scale_x_continuous(breaks=seq_along(.genes), labels={_r_vec(xlabels)}, expand=c(0, 0)) + ggplot2::coord_cartesian(xlim=c(0.5, length(.genes) + 0.5))
-p <- p + ggplot2::labs(title="{_resc(body.title)}", x=NULL, y="Cp", fill=NULL, caption=if (nrow(und) > 0) "× undetermined well (no Cp), drawn at the limit" else NULL)
+p <- p + ggplot2::labs(title="{_resc(body.title)}", x=NULL, y="Cp", fill=NULL, caption=.cap)
 {_theme_layer(body.theme, body.font_size)}{xangle}{_transparent_layer(body.transparent)}mpfig_render(p, width={int(body.width)}, height={int(body.height)}, res={int(body.dpi)}, format="{export_fmt}", bg="{bg}")
 summ <- dat %>% dplyr::group_by(Gene, Sample) %>% dplyr::summarise(
-  mean_Cp=if (any(nd == 0)) mean(Cp[nd == 0]) else NA_real_, sd=sd(Cp[nd == 0]), n_wells=dplyr::n(),
-  n_undetermined=sum(nd), n_at_or_above_limit=sum(nd == 0 & Cp >= .lim), .groups="drop")
+  mean_Cp=if (any({used})) mean(Cp[{used}]) else NA_real_, sd=sd(Cp[{used}]), n_wells=dplyr::n(),
+  n_undetermined=sum(nd), n_at_or_above_limit=sum(nd == 0 & Cp >= .lim){bo_summ}, .groups="drop")
 mpfig_data(summ, "qpcr_cp_summary")
 """
     data = _indexed(df, genes, samples)

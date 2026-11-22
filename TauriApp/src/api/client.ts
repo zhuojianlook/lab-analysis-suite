@@ -296,6 +296,17 @@ export interface QpcrAnalyzeResult {
   /** e.g. samples left out because a reference gene wasn't measured for them. */
   warnings?: string[];
   error?: string;
+  /** Best of three only: the wells it left out, and a one-line note. */
+  excluded_wells?: QpcrExcludedWell[];
+  best_of_three_note?: string;
+}
+
+/** A well best of three left out. Step "reference": a reference gene, trimmed
+ *  within its run before normalising; "replicates": a target gene, trimmed on
+ *  ΔCp across all runs. */
+export interface QpcrExcludedWell {
+  Gene: string; Sample: string; Run: string; Well: string | null;
+  Cp: number | null; dCp: number | null; Step: "reference" | "replicates";
 }
 
 export async function getQpcrLibrary(): Promise<QpcrLibrary> {
