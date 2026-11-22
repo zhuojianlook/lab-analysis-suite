@@ -427,3 +427,62 @@ describe("save details (plan §7)", () => {
     expect(await a.readExportMap()).toEqual(m);
   });
 });
+
+describe("phase 2 (§4 on the simulated disk)", () => {
+  const C = `${DIR}/Dose response (old copy).lag`;
+
+  it("peek: the manifest without parts, never journals", async () => {
+    const { a } = world();
+    await a.save(req(P, null, r2));
+    const before = (await a.journalHeads(AID)).length;
+    const pk = await a.peek(P);
+    expect(pk.ok && pk.manifest).toEqual(r2.manifest);
+    expect(pk.ok && "parts" in pk).toBe(false);
+    expect((await a.journalHeads(AID)).length).toBe(before);
+    expect(await a.peek(`${DIR}/none.lag`)).toMatchObject({ ok: false, code: "NotFound" });
+  });
+
+  it("removeCopy: moves an older or equal copy aside, refuses everything else; entries expire after 30 days", async () => {
+    const { w, a } = world();
+    await a.save(req(P, null, r2));
+    a.place(C, r1);
+    const r = await a.removeCopy({ path: C, keeper: P, analysisId: AID });
+    expect(r).toMatchObject({ ok: true, kind: "removed", head: "r-1" });
+    expect(a.localPaths()).toEqual([P]);
+    expect((await a.listDisplaced()).find((x) => x.original === C)).toMatchObject({ reason: "removedCopy", head: "r-1", analysis_id: AID });
+    expect(a.removedCopies()).toHaveLength(1);
+    // Equal heads: removed.
+    a.place(C, r2);
+    expect((await a.removeCopy({ path: C, keeper: P, analysisId: AID })).ok).toBe(true);
+    // Diverged, newer, other analysis, same file, open: refused, nothing moved.
+    a.place(C, r2b);
+    expect(await a.removeCopy({ path: C, keeper: P, analysisId: AID })).toMatchObject({ ok: false, kind: "refused", reason: "notOlder", head: "r-2b", keeperHead: "r-2" });
+    const r3 = makeFile([["r-1", []], ["r-2", ["r-1"]], ["r-3", ["r-2"]]]);
+    a.place(C, r3);
+    expect(await a.removeCopy({ path: C, keeper: P, analysisId: AID })).toMatchObject({ reason: "notOlder" });
+    a.place(C, makeFile([["r-1", []]], "a-other"));
+    expect(await a.removeCopy({ path: C, keeper: P, analysisId: AID })).toMatchObject({ reason: "otherAnalysis" });
+    expect(await a.removeCopy({ path: P, keeper: P, analysisId: AID })).toMatchObject({ reason: "sameFile" });
+    a.place(C, r1);
+    a.track(C);
+    expect(await a.removeCopy({ path: C, keeper: P, analysisId: AID })).toMatchObject({ reason: "open" });
+    a.untrack(C);
+    expect(await a.removeCopy({ path: `${DIR}/gone.lag`, keeper: P, analysisId: AID })).toMatchObject({ ok: false, kind: "error", code: "NotFound" });
+    expect(a.localPaths()).toEqual([C, P]);
+    w.clock.advance(31 * 24 * 3600_000);
+    expect(a.removedCopies()).toEqual([]);
+  });
+
+  it("the first-seen record round-trips and survives exportState / importState", async () => {
+    const { w, a } = world();
+    expect(await a.readSeen()).toEqual({ v: 1, analyses: {} });
+    await a.writeSeen({ v: 1, analyses: { [AID]: { "r-1": 5 } } });
+    expect(await a.readSeen()).toEqual({ v: 1, analyses: { [AID]: { "r-1": 5 } } });
+    await expect(a.writeSeen({ v: 1, analyses: null } as never)).rejects.toThrow();
+    const st = w.exportState();
+    const w2 = new MemoryWorld({ clock: new ManualClock() });
+    const a2 = w2.addDevice({ device_id: "d-a", device_name: "Mac mini" });
+    w2.importState(st);
+    expect(await a2.readSeen()).toEqual({ v: 1, analyses: { [AID]: { "r-1": 5 } } });
+  });
+});

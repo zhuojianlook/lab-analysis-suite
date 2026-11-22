@@ -4,18 +4,32 @@
    events. Also on window.__lasSim for verifiers. */
 
 import type { DocContent } from "../../../store/graphStore";
-import type { DevSimApi, SimFile } from "./contract";
+import type { DevSimApiP2, SimFile } from "./contract";
 import { buildNewFile, buildNextFile, fileAt, newAnalysisId, newDocKey, openFile, revisionOf } from "./docCodec";
-import { GRAPH_EXT, fileStem, parentDir, type GraphFileData } from "./format";
+import { GRAPH_EXT, fileStem, parentDir, type GraphFileData, type SectionName } from "./format";
+import { applyRetention } from "./retention";
+import { canonScratch, parseScratch } from "../scratchpad/scratchModel";
 import { sampleDoc } from "../graphModel";
 import { openContent } from "../../../store/graphStore";
 import { PREVIEW_STORAGE_KEY, authorOf, previewBackend, type PreviewWorld } from "./previewBackend";
 
-/** One visible change: the first table value goes up by one, or the graph title changes. */
-export function editContent(c: DocContent, section: "table" | "figure" = "table"): DocContent {
+/** One visible change: the first table value goes up by one, the graph title changes, the significance
+ *  level switches (analysis settings) or Scratchpad cell A1 gets a new value. */
+export function editContent(c: DocContent, section: SectionName = "table"): DocContent {
   if (section === "figure") {
     const title = c.figure.title ? `${c.figure.title} (edited)` : "Edited";
     return { ...c, figure: { ...c.figure, title } };
+  }
+  if (section === "analysis") {
+    return { ...c, analysis: { ...c.analysis, alpha: c.analysis.alpha === 0.05 ? 0.01 : 0.05 } };
+  }
+  if (section === "scratchpad") {
+    const doc = parseScratch(c.scratch);
+    const a1 = doc.cells.find((x) => x[0] === 1 && x[1] === 1);
+    const n = Number(a1?.[2] ?? "");
+    const value = a1 && Number.isFinite(n) && a1[2].trim() !== "" ? String(n + 1) : "1";
+    const cells = [...doc.cells.filter((x) => !(x[0] === 1 && x[1] === 1)), [1, 1, value] as [number, number, string]];
+    return { ...c, scratch: canonScratch({ ...doc, cells }) };
   }
   const cells = c.doc.cells.map((row) => row.map((reps) => [...reps]));
   if (!cells.length) return c;
@@ -27,7 +41,7 @@ export function editContent(c: DocContent, section: "table" | "figure" = "table"
 
 const withExt = (name: string) => (name.toLowerCase().endsWith(`.${GRAPH_EXT}`) ? name : `${name}.${GRAPH_EXT}`);
 
-export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {}): DevSimApi {
+export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {}): DevSimApiP2 {
   const { world, clock, device, other } = pw;
   const settle = () => clock.advance(0);
   const synced = (path: string) => world.synced(path);
@@ -41,7 +55,7 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
   };
 
   /** Edited content of a file's head (or of the given revision). */
-  const edited = (f: GraphFileData, section: "table" | "figure" = "table", rev?: string): DocContent => {
+  const edited = (f: GraphFileData, section: SectionName = "table", rev?: string): DocContent => {
     const c = openFile(f, rev);
     if (!c) throw new Error("The file can't be read");
     return editContent(c, section);
@@ -68,7 +82,25 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
     return p;
   };
 
-  const api: DevSimApi = {
+  /** The other computer's next version of `f`, kept to the newest versions as its app would (retention). */
+  async function nextVersion(f: GraphFileData, section: SectionName, userName?: string): Promise<GraphFileData> {
+    const next = await buildNextFile(f, edited(f, section), { time: clock.now(), author: otherAuthor(userName) });
+    const m = applyRetention(next.manifest, { now: clock.now(), firstSeen: {}, unconfirmedHeads: [], beaconHeads: [] });
+    if (m === next.manifest) return next;
+    const used = new Set<string>();
+    for (const r of m.revisions) if (r.sections) for (const ref of Object.values(r.sections)) used.add(ref.part);
+    return { manifest: m, parts: Object.fromEntries(Object.entries(next.parts).filter(([k]) => used.has(k))) };
+  }
+
+  /** Make sure the file has a previous version (the other computer saves one first). */
+  async function withPrevious(path: string): Promise<GraphFileData> {
+    const f = fileHere(path);
+    if (revisionOf(f.manifest, f.manifest.head)?.parents.length) return f;
+    await api.remoteEdit(path, { section: "table" });
+    return fileHere(path);
+  }
+
+  const api: DevSimApiP2 = {
     thisDevice: device.name,
     otherDevice: other.name,
     folders: () => device.folderList(),
@@ -81,10 +113,47 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
     async remoteEdit(path, o = {}) {
       settle();
       const f = (synced(path) ? other.localFile(path) : null) ?? fileHere(path);
-      const next = await buildNextFile(f, edited(f, o.section), { time: clock.now(), author: otherAuthor(o.userName) });
+      const next = await nextVersion(f, o.section ?? "table", o.userName);
       await otherWrites(path, next, f.manifest.head);
       return next.manifest.head;
     },
+
+    async remoteDiverge(path, o) {
+      const f = await withPrevious(path);
+      const parent = revisionOf(f.manifest, f.manifest.head)!.parents[0];
+      const base = fileAt(f, parent) ?? f;
+      const next = await buildNextFile(base, edited(base, o.section), { time: clock.now(), author: otherAuthor(o.userName) });
+      if (o.how === "copy") {
+        const copy = world.conflictName(path, other.name);
+        if (synced(path)) world.forceReplace(copy, next); else device.place(copy, next);
+        settle();
+        return copy;
+      }
+      if (synced(path)) world.forceReplace(path, next); else device.place(path, next);
+      settle();
+      return path;
+    },
+
+    async olderCopy(path) {
+      const f = await withPrevious(path);
+      const parent = revisionOf(f.manifest, f.manifest.head)!.parents[0];
+      const prev = fileAt(f, parent) ?? f;
+      const to = freePath(parentDir(path), `${fileStem(path)} (old copy)`);
+      if (synced(to)) world.forceReplace(to, prev); else device.place(to, prev);
+      settle();
+      return to;
+    },
+
+    async remoteEditMany(path, count) {
+      let last = "";
+      for (let k = 0; k < count; k++) {
+        last = await api.remoteEdit(path, { section: k % 2 === 0 ? "table" : "figure" });
+        clock.advance(10);
+      }
+      return last;
+    },
+
+    removed: () => device.removedCopies(),
 
     async remoteConflictCopy(path) {
       const f = fileHere(path);
@@ -184,16 +253,16 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
   return api;
 }
 
-let api: DevSimApi | null = null;
+let api: DevSimApiP2 | null = null;
 
 const inTauri = () => typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
 
 /** The simulator in the browser preview (dev builds only), else null. */
-export function devSim(): DevSimApi | null {
+export function devSim(): DevSimApiP2 | null {
   if (!import.meta.env.DEV || inTauri()) return null;
   if (!api) {
     api = makeDevSim(previewBackend());
-    if (typeof window !== "undefined") (window as unknown as { __lasSim?: DevSimApi }).__lasSim = api;
+    if (typeof window !== "undefined") (window as unknown as { __lasSim?: DevSimApiP2 }).__lasSim = api;
   }
   return api;
 }

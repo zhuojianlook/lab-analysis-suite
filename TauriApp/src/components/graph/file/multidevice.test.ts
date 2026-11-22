@@ -4,7 +4,7 @@
 // the multi-device scenarios. Assertions throughout: no saved version is ever
 // lost; opening never makes a tab dirty; an edit made between read and apply
 // is not lost; undo after a reload doesn't undo the other computer's changes.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { isDirty } from "../../../store/graphStore";
 import { buildNextFile, fileAt, openFile, revisionOf } from "./docCodec";
 import { isAncestorOrSelf } from "./format";
@@ -15,6 +15,15 @@ import {
 } from "./testkit";
 
 const last = <T>(a: readonly T[]): T | undefined => a[a.length - 1];
+
+// Phase 2: a save conflict combines; the phase 1 conflict sheet is reached only when combining is not
+// possible (a side that is not a readable document). These tests force that fallback.
+const flags = vi.hoisted(() => ({ fallback: false }));
+vi.mock("./graphMerge", async (importOriginal) => {
+  const m = await importOriginal<typeof import("./graphMerge")>();
+  return { ...m, combine: async (input: Parameters<typeof m.combine>[0]) => (flags.fallback ? { ok: false as const, reason: "unreadable" as const, side: "theirs" as const } : m.combine(input)) };
+});
+afterEach(() => { flags.fallback = false; });
 
 const P = `${DBX}/Dose response.lag`;
 
@@ -81,11 +90,13 @@ describe("the other computer saved", () => {
     await sync(s);
     expect(b.graph.getState().doc!.cells[0][0][0]).toBe("mine");
     const banner = b.ses.getState().tabs[0].banner!;
-    expect(banner).toMatchObject({ kind: "newerOnDisk", actions: ["choose", "later"], version: { deviceName: "Mac mini" } });
-    // "Choose…" opens the sheet without saving.
-    await b.ses.getState().bannerAction(b.ses.getState().tabs[0].key, banner.id, "choose");
+    // Phase 2: "Combine my changes with it" (both changed the same cell here: the combine dialog, nothing saved).
+    expect(banner).toMatchObject({ kind: "newerOnDisk", actions: ["combine", "later"], version: { deviceName: "Mac mini" } });
+    const saves = b.dev.saves.length;
+    await b.ses.getState().bannerAction(b.ses.getState().tabs[0].key, banner.id, "combine");
     const d = b.ses.getState().dialog;
-    expect(d?.kind === "conflict" && d.info.origin).toBe("banner");
+    expect(d?.kind === "combine" && d.state.origin).toBe("banner");
+    expect(b.dev.saves.length).toBe(saves);
   });
 
   it("an edit made while the new version is being read is not lost", async () => {
@@ -104,8 +115,9 @@ describe("the other computer saved", () => {
   });
 });
 
-describe("the conflict sheet: every choice keeps every version", () => {
+describe("the conflict sheet (phase 2: the fallback when combining is not possible): every choice keeps every version", () => {
   async function conflict(): Promise<Setup & { theirs: string }> {
+    flags.fallback = true;
     const s = await twoComputers();
     await edit(s.b, "B!");
     await edit(s.a, "A!");
@@ -267,7 +279,8 @@ describe("the journal check", () => {
     expect(s.b.dev.localHead(P)).toBe(r3);
   });
 
-  it("another computer's save replaced mine (last writer wins): mine is saved as a copy, nothing is lost", async () => {
+  it("another computer's save replaced mine (last writer wins), combining not possible: mine is saved as a copy, nothing is lost", async () => {
+    flags.fallback = true;
     const s = await twoComputers(2000, "lww");
     const { a, w } = s;
     await edit(a, "my save");
@@ -300,7 +313,7 @@ describe("the journal check", () => {
 });
 
 describe("save outcomes", () => {
-  it("a save that replaced another computer's save in the gap: saved, theirs kept as a copy", async () => {
+  it("a save that replaced another computer's save in the gap: saved, then combined with it (phase 2; no copy)", async () => {
     const s = await twoComputers();
     const { a, w } = s;
     const f = a.dev.localFile(P)!;
@@ -309,10 +322,15 @@ describe("save outcomes", () => {
     a.dev.armDisplace(P, theirs);
     await edit(a, "mine");
     expect((await a.ses.getState().save()).ok).toBe(true);
-    const copy = `${DBX}/Dose response (version from MacBook).lag`;
-    expect(a.ses.getState().tabs[0].banner).toMatchObject({ kind: "savedDisplaced", name: "Dose response (version from MacBook)", path: copy });
-    expect(a.dev.localHead(copy)).toBe(theirs.manifest.head);
+    expect(a.ses.getState().tabs[0].banner).toMatchObject({ kind: "savedOver", state: "combining" });
     expect(a.ses.getState().tabs[0].dirty).toBe(false);
+    await tick(w, 11_000);
+    const m = a.dev.localFile(P)!.manifest;
+    expect(revisionOf(m, m.head)!.parents).toContain(theirs.manifest.head);
+    expect(a.graph.getState().figure.title).toBe("race");
+    expect(a.graph.getState().doc!.cells[0][0][0]).toBe("mine");
+    expect(a.dev.localPaths()).toEqual([P]);
+    expectNothingLost(w);
   });
 
   it("when the file on disk can't be checked, the save goes beside it and the tab stays unsaved", async () => {
@@ -486,9 +504,12 @@ describe("multi-device scenarios (plan §13)", () => {
     await a.ses.getState().save();
     await sync(s);
     expect(await b.ses.getState().save()).toEqual({ ok: false, reason: "conflict" });
-    await b.ses.getState().resolveConflict("keepMine");
+    expect(b.ses.getState().dialog?.kind).toBe("combine");
+    await b.ses.getState().setSectionChoice("table", "mine");
+    expect((await b.ses.getState().applyCombine()).ok).toBe(true);
     await sync(s);
     expect(a.dev.localHead(P)).toBe(b.dev.localHead(P));
+    expect(a.graph.getState().doc!.cells[0][0][0]).toBe("B!");
     expectNothingLost(s.w);
   });
 
@@ -500,7 +521,8 @@ describe("multi-device scenarios (plan §13)", () => {
     await a.ses.getState().save();
     await sync(s);
     await b.ses.getState().save();
-    await b.ses.getState().resolveConflict("keepMine");
+    await b.ses.getState().setSectionChoice("table", "mine");
+    await b.ses.getState().applyCombine();
     const f = b.dev.localFile(P)!;
     const k = revisionOf(f.manifest, f.manifest.head)!;
     const { mergeRevisionId } = await import("./docCodec");

@@ -19,6 +19,10 @@ interface Snapshot {
   palette: Pick<GraphFigure, (typeof M.PALETTE_KEYS)[number]>;
   control: number | null;
   pairs: [number, number][];
+  /** Phase 2: a "whole content" step (after a combine): undo puts back all four parts. */
+  whole?: { analysis: GraphAnalysis; figure: GraphFigure; scratch: string };
+  /** Phase 2: the step's label ("Undo: combine with Alice's changes"); absent for ordinary steps. */
+  label?: string;
 }
 
 const UNDO_LIMIT = 20;
@@ -132,6 +136,26 @@ export interface GraphState {
   markFileSaved: (file: FileRef, name: string, sent: DocContent, editSerialAtBuild?: number) => void;
   /** Path / base / id change without touching the content (rename follow, Save As). */
   setFileRef: (patch: Partial<FileRef>, name?: string) => void;
+
+  // ── phase 2: reload in place ──
+  /** Replace the open document's content with a version from the file (phase 2 contract §5.7). Applies
+   *  only when the document, its base and its editSerial are still what the caller saw; else false and
+   *  nothing changes. The baseline is taken after the load pipeline; docSerial is kept; the undo stack is
+   *  emptied, or — with `undo` — holds exactly one step that puts the whole previous content back.
+   *  `working` (optional): content shown on top of the new baseline (unsaved changes carried over). */
+  replaceContent: (p: ReplaceContentArgs) => boolean;
+  /** Label of the top undo step (null for ordinary steps or an empty stack). */
+  undoLabel: () => string | null;
+}
+
+export interface ReplaceContentArgs {
+  docKey: string; expectedBase: string | null; expectedEditSerial: number;
+  file: FileRef; name: string;
+  doc: GraphDoc; analysis?: Partial<GraphAnalysis>; figure?: Partial<GraphFigure>; scratch?: unknown;
+  /** After a combine: one undo step that puts back what was there, with this label. */
+  undo?: { label: string };
+  /** Unsaved changes to show on top of the new version (the baseline stays the version). */
+  working?: { doc: GraphDoc; analysis?: Partial<GraphAnalysis>; figure?: Partial<GraphFigure>; scratch?: unknown };
 }
 
 /** The saved content (table incl. row/column ids, analysis, figure); compared to
@@ -414,6 +438,13 @@ export function createGraphStore(): GraphStoreApi {
         if (!prev || !s.doc) return false;
         // An axis label still following the X title goes back with the title.
         const following = M.followXLabel(s.figure, s.doc.x_title, prev.doc.x_title);
+        if (prev.whole) {
+          set({
+            doc: prev.doc, analysis: prev.whole.analysis, figure: prev.whole.figure, scratch: prev.whole.scratch,
+            undoStack: s.undoStack.slice(0, -1), lastEditKey: null,
+          });
+          return true;
+        }
         set({
           doc: prev.doc,
           ...(prev.structural ? {
@@ -461,6 +492,33 @@ export function createGraphStore(): GraphStoreApi {
         file: { ...(s.file ?? { docKey: "", analysisId: null, baseRevision: null, path: null }), ...patch },
         ...(name !== undefined ? { name, savedName: s.savedName === null ? null : name } : {}),
       })),
+
+      replaceContent: (p) => {
+        const s0 = get();
+        if (!s0.doc || s0.file?.docKey !== p.docKey || s0.file.baseRevision !== p.expectedBase || s0.editSerial !== p.expectedEditSerial) return false;
+        const c = openContent({ doc: p.doc, analysis: p.analysis, figure: p.figure, scratch: p.scratch });
+        const w = p.working ? openContent(p.working) : null;
+        const shown = w ?? c;
+        set((s) => {
+          // An unchanged scratchpad keeps its identical text, so the Scratchpad's sheet session survives.
+          const scratch = shown.scratch === s.scratch ? s.scratch : shown.scratch;
+          const undoStack: Snapshot[] = p.undo
+            ? [{ ...snap(s, true), whole: { analysis: s.analysis, figure: s.figure, scratch: s.scratch }, label: p.undo.label }]
+            : [];
+          return {
+            doc: shown.doc, analysis: shown.analysis, figure: shown.figure, scratch,
+            name: p.name, savedName: p.name, currentId: null, file: { ...p.file },
+            savedSnapshot: snapshotKey(c), savedScratch: c.scratch,
+            undoStack, lastEditKey: null, openedAs: "saved",
+          };
+        });
+        return true;
+      },
+
+      undoLabel: () => {
+        const st = get().undoStack;
+        return st.length ? st[st.length - 1].label ?? null : null;
+      },
     };
   });
 }

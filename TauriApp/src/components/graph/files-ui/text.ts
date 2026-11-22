@@ -4,8 +4,10 @@
    "draft", "sibling", "displaced" or "analysis id" (contract §5.5, checklist 46). */
 
 import type {
-  BannerAction, BannerKind, FileSettings, RestoreCard, SessionToast, TabBanner, VersionInfo,
+  BannerAction, BannerKind, FileSettings, RestoreCard, SessionToast, TabBanner, VersionChip, VersionInfo,
 } from "../file/contract";
+import { SECTION_PHRASE } from "../file/contract";
+import { SECTION_NAMES, type SectionName } from "../file/format";
 
 // ── platform ───────────────────────────────────────────────────────────────
 
@@ -39,8 +41,8 @@ export function whenText(iso: string | null | undefined, now: number = Date.now(
   const y = new Date(now);
   y.setDate(y.getDate() - 1);
   if (d.toDateString() === y.toDateString()) return "yesterday";
-  const base = `${d.getDate()} ${MONTHS[d.getMonth()]}`;
-  return d.getFullYear() === today.getFullYear() ? base : `${base} ${d.getFullYear()}`;
+  const day = `${d.getDate()} ${MONTHS[d.getMonth()]}`;
+  return d.getFullYear() === today.getFullYear() ? day : `${day} ${d.getFullYear()}`;
 }
 
 /** Who saved a version: "Alice (Office iMac)"; "you on Office iMac" for my own
@@ -60,6 +62,12 @@ export function whoText(v: VersionInfo | null | undefined, settings: FileSetting
 /** Capital first letter, for "who" at the start of a sentence. */
 export const cap = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 
+/** "Alice (Office iMac)" → "Alice (Office iMac)'s"; "you" → "your". */
+export function possessive(who: string): string {
+  if (who === "you") return "your";
+  return who.endsWith("s") && !who.endsWith(")") ? `${who}'` : `${who}'s`;
+}
+
 /** File name without folder; the stem without the .lag extension. */
 export function baseName(path: string): string {
   const i = path.lastIndexOf("/");
@@ -76,12 +84,13 @@ export type Severity = "success" | "info" | "warning" | "error";
 const SEVERITY: Record<BannerKind, Severity> = {
   permission: "error", downloading: "info", missing: "warning", replaced: "warning", tooNew: "info",
   saveFailed: "error", notSaved: "warning", savedAside: "warning", savedOver: "warning", savedDisplaced: "warning",
-  tookTheirs: "info", draftMismatch: "warning", copyQuestion: "info", extraCopy: "info", tempLocation: "info",
+  tookTheirs: "info", combined: "success", draftMismatch: "warning", copyQuestion: "info", extraCopy: "info", tempLocation: "info",
   rolledBack: "warning", newerOnDisk: "info", newerCopy: "info", olderCopy: "info", recovered: "success",
 };
 
 export function bannerSeverity(b: TabBanner): Severity {
   if (b.kind === "extraCopy") return b.relation === "newer" || b.relation === "diverged" ? "warning" : "info";
+  if (b.kind === "savedOver" && b.state === "combining") return "info";
   return SEVERITY[b.kind];
 }
 
@@ -99,9 +108,18 @@ export function bannerText(b: TabBanner, settings: FileSettings | null): string 
     case "saveFailed": return `Not saved. ${b.message ?? "The file couldn't be written."}`;
     case "notSaved": return `Not saved yet — ${who} also changed this file. Choose what to keep.`;
     case "savedAside": return `The file couldn't be checked yet, so your changes were saved beside it as '${name}'.`;
-    case "savedOver": return `Another computer saved over your last save. Nothing is lost — your version was saved as a copy: '${name}'.`;
+    case "savedOver":
+      if (b.state === "combining") return "Another computer saved over your last save. Nothing is lost — combining both now.";
+      if (b.state === "choose") return "Another computer saved over your last save. Nothing is lost. Choose what to keep.";
+      return `Another computer saved over your last save. Nothing is lost — your version was saved as a copy: '${name}'.`;
     case "savedDisplaced": return `Saved. ${cap(who)} saved at the same moment; that version was kept as a copy: '${name}'.`;
     case "tookTheirs": return `Now showing the version saved by ${who}. Your version was saved as a copy: '${name}'.`;
+    case "combined": {
+      const list = sectionPhrases(b.sections ?? []);
+      // Combined with my own save that another computer's save had replaced.
+      if (b.version?.mine) return `Combined with your earlier save.${list ? ` Taken from it: ${list}.` : ""}`;
+      return `Combined with the version saved by ${whoLine(b.version, settings)}.${list ? ` Taken from it: ${list}.` : ""}`;
+    }
     case "draftMismatch": return `You have unsaved changes from ${whenText(b.when) || "earlier"} that don't match this file.`;
     case "copyQuestion": {
       const other = b.path ? stemOf(b.path) : "Another file";
@@ -155,6 +173,12 @@ export function bannerActionLabel(kind: BannerKind, action: BannerAction): strin
     case "openAsNew": return "Open them as a new analysis";
     case "discardDraft": return "Discard";
     case "chooseLocation": return "Choose where to keep it…";
+    case "combine":
+      return kind === "newerOnDisk" ? "Combine my changes with it" : kind === "extraCopy" ? "Combine…" : "Choose…";
+    case "remove": return "Remove it";
+    case "keep": return "Keep";
+    case "whatChanged": return "What changed";
+    case "undo": return "Undo";
   }
   return action;
 }
@@ -197,6 +221,10 @@ export function toastText(t: SessionToast, settings: FileSettings | null): strin
     case "alreadyOpen": return `'${t.name ?? ""}' is already open.`;
     case "restoredDrafts": return "Unsaved changes restored.";
     case "error": return t.message ?? "Something went wrong.";
+    case "combined": return t.version?.mine ? "Combined with your earlier save" : `Combined with ${possessive(whoLine(t.version, settings))} changes`;
+    case "broughtBack": return `Brought back the version from ${whenText(t.version?.time) || "earlier"}`;
+    case "copyRemoved": return `Removed '${t.name ?? ""}'. The app keeps it for 30 days.`;
+    case "savedAsNew": return `Saved as a new analysis: '${t.name ?? ""}'`;
   }
   return t.message ?? "";
 }
@@ -297,8 +325,144 @@ export const MENU_TEXT = {
   saveAs: "Save As…",
   duplicate: "Duplicate as a New Analysis…",
   closeTab: "Close Tab",
+  versions: "Versions",
   recover: "Recover Unsaved Work…",
   oldLibrary: "Old Library…",
   exportLibrary: "Export Library to Files…",
   settings: "Settings…",
 } as const;
+
+// ── phase 2: sections, versions, combining (phase 2 contract §6) ────────────
+
+/** A section as a title ("Data table"), contract §2.1. */
+export const SECTION_TITLE: Record<SectionName, string> = {
+  table: "Data table",
+  analysis: "Analysis settings",
+  figure: "Graph",
+  scratchpad: "Scratchpad",
+};
+
+/** "the table" · "the table and the graph" · "the table, the analysis settings and the graph" (SECTION_NAMES order). */
+export function sectionPhrases(keys: readonly SectionName[]): string {
+  const p = SECTION_NAMES.filter((k) => keys.includes(k)).map((k) => SECTION_PHRASE[k]);
+  if (p.length <= 1) return p[0] ?? "";
+  return `${p.slice(0, -1).join(", ")} and ${p[p.length - 1]}`;
+}
+
+/** Who saved a version, for a list line: "you" stays lower case, a blank author is "another computer". */
+export function whoLine(v: VersionInfo | null | undefined, settings: FileSettings | null): string {
+  if (v && !v.mine && !v.userName.trim() && !v.deviceName.trim()) return "another computer";
+  return whoText(v, settings);
+}
+
+/** "Alice's" for the Theirs button when a user name is known, else "Theirs". */
+export function theirsLabel(v: VersionInfo | null | undefined, settings: FileSettings | null): string {
+  const u = v?.userName.trim() ?? "";
+  if (!v || v.mine || !u) return "Theirs";
+  if (settings && u === settings.userName.trim()) return "Theirs";
+  return u.endsWith("s") ? `${u}'` : `${u}'s`;
+}
+
+export const CHIP_TEXT: Record<VersionChip, string> = {
+  current: "Current",
+  combined: "Combined",
+  broughtBack: "Brought back",
+  fromOldLibrary: "From old library",
+  tooOld: "Too old to open",
+  unsaved: "Not saved yet",
+};
+
+/** The Versions panel and the read-only preview (§6.2). */
+export const V = {
+  title: "Versions",
+  loading: "Loading versions…",
+  close: "Close",
+  workingSummary: "Unsaved changes",
+  workingLine: (computer: string) => `you · ${computer || "this computer"} · now`,
+  autoLine: (when: string) => `Combined automatically · ${when}`,
+  rowLine: (name: string, computer: string, when: string) => [name, computer, when].filter(Boolean).join(" · "),
+  copyLabel: (copyName: string) => `In '${copyName}'`,
+  stubLabel: (name: string) => `Separate analysis: '${name}'`,
+  legend: "Computers",
+  thisComputer: "this computer",
+  autoDevice: "Combined automatically",
+  tooOldFooter: "Older versions are listed but can no longer be opened.",
+  readOnly: "Read only",
+  previewTitle: (summary: string, who: string, when: string) => `${summary} — ${[who, when].filter(Boolean).join(", ")}`,
+  tooOldBody: "This version is too old to open. Its entry is kept so you can see who saved it and when.",
+  loadingVersion: "Opening this version…",
+  compare: "Compare with current",
+  bringBack: "Bring this version back",
+  saveAsNew: "Save this version as a new analysis…",
+  closePreview: "Close",
+  tabGraph: "Graph",
+  tabTable: "Table",
+  tabScratch: "Scratchpad",
+  graphUnavailable: "The graph can't be shown right now.",
+  graphRendering: "Drawing the graph…",
+  noData: "This version has no values in its table.",
+  scratchEmpty: "The scratchpad of this version is empty.",
+  same: "Same",
+  different: "Different",
+  thisVersion: "This version",
+  graphsSideBySide: "Graphs side by side",
+  current: "Current",
+  cellsDiffer: (n: number) => `${n} cell${n === 1 ? "" : "s"} differ${n === 1 ? "s" : ""}`,
+  andMore: (n: number) => `and ${n} more`,
+  rowsAdded: (n: number) => `${n} row${n === 1 ? "" : "s"} added`,
+  rowsRemoved: (n: number) => `${n} row${n === 1 ? "" : "s"} removed`,
+  colsAdded: (n: number) => `${n} column${n === 1 ? "" : "s"} added`,
+  colsRemoved: (n: number) => `${n} column${n === 1 ? "" : "s"} removed`,
+  titlesChanged: (n: number) => `${n} title${n === 1 ? "" : "s"} changed`,
+  settingLine: (field: string, a: string, b: string) => `${field}: ${a} → ${b}`,
+  bringBackTitle: (when: string) => `Bring back the version from ${when}?`,
+  bringBackBody: "You have unsaved changes. They are saved as a version first, so nothing is lost.",
+  bringBackSave: "Save, then bring it back",
+  cancel: "Cancel",
+  versionsButton: "Versions",
+  updating: "Updating…",
+} as const;
+
+/** The combine dialog (§6.4). */
+export const C = {
+  /** Combining with my own save that another computer's save replaced: the sides are named by what they are. */
+  nowInFile: (who: string, unsaved: boolean) => `In the file now: saved by ${who}${unsaved ? ", with your unsaved changes" : ""}`,
+  replacedSave: (when: string) => `Your save that was replaced${when ? ` (${when})` : ""}`,
+  nowInFileButton: "In the file now",
+  replacedSaveButton: "Your save",
+  sideNowInFile: "In the file now",
+  sideReplaced: "Your replaced save",
+  title: (name: string, since: string) => `Two versions of '${name}' changed since ${since}`,
+  titleTwoWay: (name: string) => `Two versions of '${name}'`,
+  mine: (computer: string, unsaved: boolean) => `Mine: ${computer || "this computer"}${unsaved ? ", with unsaved changes" : ""}`,
+  theirs: (who: string) => `Theirs: ${who}`,
+  theirsCopy: (copyName: string, who: string) => `Theirs: '${copyName}', saved by ${who}`,
+  queue: (i: number, n: number) => `Copy ${i} of ${n}`,
+  twoWay: "These two copies were last the same too long ago to compare part by part. Choose which to keep for each part that differs.",
+  toChoose: (n: number) => `${n} to choose`,
+  unchanged: "Unchanged",
+  combinedChip: "Combined",
+  chooseChip: "Choose",
+  fromMine: "from mine",
+  fromTheirs: (who: string) => `from ${who}`,
+  notChanged: (n: number) => `Not changed (${n})`,
+  combinedAuto: (n: number) => `Combined automatically (${n})`,
+  mineButton: "Mine",
+  adjusted: (list: string) => `Adjusted automatically: ${list}. Some settings pointed at rows or columns that are no longer in the table. Check the result after applying.`,
+  cancel: "Cancel",
+  keepBoth: "Keep both as separate files",
+  apply: "Apply",
+  footnote: "Nothing is saved until you press Apply. Both versions stay in the file's history.",
+  sideMine: "Mine",
+  sideTheirs: "Theirs",
+  sideLabel: (side: string, who: string) => `${side}: ${who}`,
+  sectionSame: "Both versions have the same content here.",
+  notAvailable: "Nothing to show for this part.",
+  scratchCells: (n: number) => `${n} cell${n === 1 ? "" : "s"} differ${n === 1 ? "s" : ""}`,
+  noTableChange: "No cells differ.",
+  noSettingsChange: "No settings differ.",
+  willKeep: (side: string) => `Keeping ${side}`,
+} as const;
+
+/** The labelled undo step after a combine ("Undo: combine with Alice's changes"), as the store gives it. */
+export const undoTooltip = (label: string | null) => label ?? "Undo";

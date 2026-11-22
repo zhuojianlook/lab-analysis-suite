@@ -12,7 +12,8 @@ import type {
 } from "./backend";
 import {
   CMD, EVT, RUST_ERROR_KINDS,
-  type AppInfo, type Commands, type DevicePatch, type FileBackendP1, type HeaderReply, type LocateProgress, type LocateReply,
+  type AppInfo, type Commands, type DevicePatch, type FileBackendP2, type HeaderReply, type PeekResult, type RemoveCopyArgs,
+  type RemoveCopyResult, type SeenMap, type LocateProgress, type LocateReply,
   type LocateResult, type RawFile, type ReadReply, type RustError, type RustErrorKind, type SaveReply, type ScanReply,
 } from "./contract";
 import { canonicalJson, type GraphFileData, type Manifest } from "./format";
@@ -40,7 +41,7 @@ function parseRaw(raw: RawFile): GraphFileData {
   return { manifest: JSON.parse(raw.manifestText) as Manifest, parts: { ...raw.parts } };
 }
 
-export function createTauriBackend(io: { invoke: InvokeFn; listen: ListenFn }): FileBackendP1 {
+export function createTauriBackend(io: { invoke: InvokeFn; listen: ListenFn }): FileBackendP2 {
   const { invoke, listen } = io;
   /** Last head / id this backend saw at a path (sent with graphfile_track). */
   const known = new Map<string, { head: string | null; analysisId: string | null }>();
@@ -71,7 +72,7 @@ export function createTauriBackend(io: { invoke: InvokeFn; listen: ListenFn }): 
     try { return await invoke(cmd, args); } catch (e) { console.warn(`[files] ${cmd} failed:`, rustError(e).message); return undefined; }
   };
 
-  const backend: FileBackendP1 = {
+  const backend: FileBackendP2 = {
     async device(): Promise<DeviceIdentity> {
       return invoke(CMD.device, {});
     },
@@ -235,12 +236,36 @@ export function createTauriBackend(io: { invoke: InvokeFn; listen: ListenFn }): 
     async reveal(path: string): Promise<void> {
       await quiet(CMD.reveal, { path });
     },
+
+    // ── phase 2 ──
+    async peek(path: string): Promise<PeekResult> {
+      try {
+        const r = await invoke(CMD.peek, { path });
+        return { ok: true, manifest: JSON.parse(r.manifestText) as Manifest, stat: r.stat, readOnly: r.readOnly };
+      } catch (e) {
+        const { kind, message } = rustError(e);
+        return { ok: false, code: fileCode(kind), message };
+      }
+    },
+    async removeCopy(req: RemoveCopyArgs): Promise<RemoveCopyResult> {
+      try {
+        const r = await invoke(CMD.removeCopy, { req: { path: req.path, keeper: req.keeper, analysisId: req.analysisId } });
+        if (r.kind === "removed") return { ok: true, kind: "removed", displacedId: r.displacedId, head: r.head };
+        if (r.kind === "refused") return { ok: false, kind: "refused", reason: r.reason, head: r.head ?? null, keeperHead: r.keeperHead ?? null };
+        return { ok: false, kind: "error", code: "Io", message: "Unexpected reply." };
+      } catch (e) {
+        const { kind, message } = rustError(e);
+        return { ok: false, kind: "error", code: fileCode(kind), message };
+      }
+    },
+    readSeen: (): Promise<SeenMap> => invoke(CMD.readSeen, {}),
+    writeSeen: (seen: SeenMap) => inOrder("seen", async () => { await invoke(CMD.writeSeen, { seen }); }),
   };
   return backend;
 }
 
 /** The desktop backend, loading @tauri-apps/api on first use. */
-export function tauriBackend(): FileBackendP1 {
+export function tauriBackend(): FileBackendP2 {
   const invoke: InvokeFn = async (cmd, args) => {
     const core = await import("@tauri-apps/api/core");
     return core.invoke(cmd, args as Record<string, unknown>) as Promise<never>;

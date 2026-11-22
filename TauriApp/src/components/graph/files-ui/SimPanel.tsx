@@ -58,6 +58,7 @@ export function SimPanel() {
   };
 
   const isDenied = denied.includes(folder);
+  const removed = disk?.removed().length ?? 0;
 
   return (
     <Paper elevation={8} data-testid="sim-panel"
@@ -89,8 +90,20 @@ export function SimPanel() {
           )}
           <Box sx={{ mt: 1, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0.5, "& > .full": { gridColumn: "1 / -1" } }}>
             <Typography className="full" variant="overline" color="text.secondary" sx={{ lineHeight: 1.6 }}>Other computer</Typography>
-            <SimButton off={busy || !disk} id="sim-edit" disabled={!file} onClick={() => void run("Edit and save", () => disk!.remoteEdit(path))}>Edit and save</SimButton>
-            <SimButton off={busy || !disk} id="sim-edit-figure" disabled={!file} onClick={() => void run("Edit graph title and save", () => disk!.remoteEdit(path, { section: "figure" }))}>Edit graph title and save</SimButton>
+            <SimButton off={busy || !disk} id="sim-edit-table" disabled={!file} onClick={() => void run("Edit table and save", () => disk!.remoteEdit(path, { section: "table" }))}>Edit table and save</SimButton>
+            <SimButton off={busy || !disk} id="sim-edit-graph" disabled={!file} onClick={() => void run("Edit graph and save", () => disk!.remoteEdit(path, { section: "figure" }))}>Edit graph and save</SimButton>
+            <SimButton off={busy || !disk} id="sim-edit-analysis" disabled={!file} onClick={() => void run("Edit analysis settings and save", () => disk!.remoteEdit(path, { section: "analysis" }))}>Edit analysis settings and save</SimButton>
+            <SimButton off={busy || !disk} id="sim-edit-scratch" disabled={!file} onClick={() => void run("Edit scratchpad and save", () => disk!.remoteEdit(path, { section: "scratchpad" }))}>Edit scratchpad and save</SimButton>
+            <SimButton off={busy || !disk} id="sim-many" disabled={!file} onClick={() => void run("Save 25 more versions", () => disk!.remoteEditMany(path, 25))}>Save 25 more versions</SimButton>
+            <Divider className="full" sx={{ my: 0.25 }} />
+            <Typography className="full" variant="overline" color="text.secondary" sx={{ lineHeight: 1.6 }}>Worked separately</Typography>
+            <SimButton off={busy || !disk} id="sim-diverge-copy-table" disabled={!file} onClick={() => void run("Diverged copy (table)", () => disk!.remoteDiverge(path, { section: "table", how: "copy" }))}>Make a diverged copy (table)</SimButton>
+            <SimButton off={busy || !disk} id="sim-diverge-copy-graph" disabled={!file} onClick={() => void run("Diverged copy (graph)", () => disk!.remoteDiverge(path, { section: "figure", how: "copy" }))}>Make a diverged copy (graph)</SimButton>
+            <SimButton off={busy || !disk} id="sim-saveover-table" disabled={!file} onClick={() => void run("Save over my last save (table)", () => disk!.remoteDiverge(path, { section: "table", how: "saveOver" }))}>Save over my last save (table)</SimButton>
+            <SimButton off={busy || !disk} id="sim-saveover-graph" disabled={!file} onClick={() => void run("Save over my last save (graph)", () => disk!.remoteDiverge(path, { section: "figure", how: "saveOver" }))}>Save over my last save (graph)</SimButton>
+            <SimButton off={busy || !disk} id="sim-older-copy" disabled={!file} onClick={() => void run("Add an older copy", () => disk!.olderCopy(path))}>Add an older copy</SimButton>
+            <Divider className="full" sx={{ my: 0.25 }} />
+            <Typography className="full" variant="overline" color="text.secondary" sx={{ lineHeight: 1.6 }}>Phase 1</Typography>
             <SimButton off={busy || !disk} id="sim-conflict" disabled={!file} onClick={() => void run("Conflicted copy", () => disk!.remoteConflictCopy(path))}>Make a conflicted copy</SimButton>
             <SimButton off={busy || !disk} id="sim-replace" disabled={!file} onClick={() => void run("Save over it", () => disk!.remoteReplace(path))}>Save over it (replace my last save)</SimButton>
             <SimButton off={busy || !disk} id="sim-rollback" disabled={!file} onClick={() => void run("Put back earlier version", () => disk!.rollback(path))}>Put back earlier version</SimButton>
@@ -136,6 +149,9 @@ export function SimPanel() {
             </Stack>
           </Box>
           {note && <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 1 }} data-testid="sim-note">{note}</Typography>}
+          <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }} data-testid="sim-removed" data-count={removed}>
+            Copies removed on this computer: {removed}
+          </Typography>
         </Box>
       )}
     </Paper>

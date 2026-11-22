@@ -175,3 +175,30 @@ describe("tauriBackend mapping", () => {
     expect(rustError(new Error("boom"))).toEqual({ kind: "Io", message: "boom" });
   });
 });
+
+describe("tauriBackend mapping, phase 2", () => {
+  it("peek, removeCopy, the first-seen record", async () => {
+    const f = await file();
+    let removeReply: unknown = { kind: "removed", displacedId: "x-1", head: "r-1" };
+    const fk = fake((cmd, args) => {
+      if (cmd === "graphfile_peek" && args.path === "/d/a.lag") return { manifestText: canonicalJson(f.manifest), stat: STAT, readOnly: null };
+      if (cmd === "graphfile_peek") throw { kind: "Incomplete", message: "arriving", data: null };
+      if (cmd === "graphfile_remove_copy") { if (removeReply === "throw") throw { kind: "NotFound", message: "gone", data: null }; return removeReply; }
+      if (cmd === "appstate_read_seen") return { v: 1, analyses: { "a-1": { "r-1": 1 } } };
+      return null;
+    });
+    const be = createTauriBackend(fk);
+    expect(await be.peek("/d/a.lag")).toEqual({ ok: true, manifest: f.manifest, stat: STAT, readOnly: null });
+    expect(await be.peek("/d/b.lag")).toEqual({ ok: false, code: "Incomplete", message: "arriving" });
+    const args = { path: "/d/c.lag", keeper: "/d/a.lag", analysisId: "a-1" };
+    expect(await be.removeCopy(args)).toEqual({ ok: true, kind: "removed", displacedId: "x-1", head: "r-1" });
+    expect(last(fk.calls)).toEqual({ cmd: "graphfile_remove_copy", args: { req: args } });
+    removeReply = { kind: "refused", reason: "notOlder", head: "r-2", keeperHead: "r-1" };
+    expect(await be.removeCopy(args)).toEqual({ ok: false, kind: "refused", reason: "notOlder", head: "r-2", keeperHead: "r-1" });
+    removeReply = "throw";
+    expect(await be.removeCopy(args)).toEqual({ ok: false, kind: "error", code: "NotFound", message: "gone" });
+    expect(await be.readSeen()).toEqual({ v: 1, analyses: { "a-1": { "r-1": 1 } } });
+    await be.writeSeen({ v: 1, analyses: {} });
+    expect(last(fk.calls)).toEqual({ cmd: "appstate_write_seen", args: { seen: { v: 1, analyses: {} } } });
+  });
+});

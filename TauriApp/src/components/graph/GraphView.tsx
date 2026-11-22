@@ -9,6 +9,7 @@ import RefreshIcon from "@mui/icons-material/Refresh";
 import TableChartIcon from "@mui/icons-material/TableChart";
 import GridOnIcon from "@mui/icons-material/GridOn";
 import CalculateOutlinedIcon from "@mui/icons-material/CalculateOutlined";
+import UndoIcon from "@mui/icons-material/Undo";
 import { analyzeGraph, plotGraph, type AnalyzeResult, type GraphPlotResult } from "../../api/graph";
 import { useGraphStore } from "../../store/graphStore";
 import { PlotResult } from "../shared/PlotResult";
@@ -21,6 +22,9 @@ import { useFileSession } from "./file/session";
 import { FILE_TABS_HEIGHT, FileTabs } from "./files-ui/FileTabs";
 import { DOC_BAR_HEIGHT, DocBar } from "./files-ui/DocBar";
 import { RestoreCardView } from "./files-ui/RestoreCardView";
+import { VERSIONS_PANEL_WIDTH, VersionsPanel } from "./files-ui/VersionsPanel";
+import { VersionPreview } from "./files-ui/VersionPreview";
+import { V, undoTooltip } from "./files-ui/text";
 import { GraphAnalysisControls } from "./GraphAnalysisControls";
 import { GraphFigureControls, TitleFields } from "./GraphFigureControls";
 import { FigureTextPanel, readTextPanelOpen, writeTextPanelOpen } from "./FigureTextPanel";
@@ -61,13 +65,16 @@ class ScratchBoundary extends Component<{ children: ReactNode }, { error: string
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** Exports hold back newer content of the file until they finish (phase 2 contract §5.7). */
+const holdForExport = () => useFileSession.getState().holdReplace("export");
+
 /** A rendered figure that stays visible (dimmed) while a newer one renders. */
 function FigureView({ result, busy, baseName, fitHeight }: {
   result: GraphPlotResult; busy: boolean; baseName: string; fitHeight: string;
 }) {
   return (
     <Box sx={{ position: "relative", alignSelf: "flex-start", maxWidth: "100%" }}>
-      <PlotResult result={result} baseName={baseName} fitHeight={fitHeight} />
+      <PlotResult result={result} baseName={baseName} fitHeight={fitHeight} hold={holdForExport} />
       {busy && (
         <Box sx={{ position: "absolute", inset: 0, bgcolor: "rgba(28,28,30,0.35)", display: "grid", placeItems: "center", borderRadius: 1 }}>
           <CircularProgress size={28} />
@@ -201,6 +208,10 @@ function GraphEditor() {
   const store = useGraphStore;
 
   const name = useGraphStore((s) => s.name);
+  /** Newer content of the file waits until the cell editor / drag / menu / export is done (phase 2 §5.7). */
+  const updating = useFileSession((s) => !!s.tabs.find((t) => t.key === s.activeKey)?.updating);
+  /** Label of the top undo step when it is the one a combine left ("Undo: combine with Alice's changes"). */
+  const undoLabel = useGraphStore((s) => (s.undoStack.length ? s.undoStack[s.undoStack.length - 1].label ?? null : null));
   const [open, setOpen] = useState<Record<Step, boolean>>({ table: true, analysis: true, graph: false });
   const [canvasTab, setCanvasTab] = useState<CanvasTab>("data");
   const [graphSeen, setGraphSeen] = useState(false);
@@ -242,7 +253,10 @@ function GraphEditor() {
     setCanvasTab(showGraph ? "graph" : "data");
     setGraphSeen(showGraph);
     setOpen({ table: !showGraph, analysis: true, graph: showGraph });
-  }, [docSerial, openedAs]);
+    // Only a new document resets the view: a combine or a newer version put into this tab changes
+    // openedAs (draft → saved) but keeps docSerial, and must leave the person on the tab they were using.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [docSerial]);
 
   // ── derived data ──────────────────────────────────────────────────────────
   const table = useMemo(() => (doc ? toNumericTable(doc) : null), [doc]);
@@ -593,20 +607,36 @@ function GraphEditor() {
   return (
     <Workspace rail={<>{canvasTab === "scratch" && <ScratchRail />}{tableSection}{analysisSection}{graphSection}</>} railFooter={railFooter} onKeyDown={onKeyDown}>
       <Box sx={{ display: "flex", alignItems: "center", px: 2, borderBottom: 1, borderColor: "divider", flexShrink: 0, minHeight: 44 }}>
-        <Tabs value={canvasTab} onChange={(_, v) => setCanvasTab(v)} variant="scrollable" scrollButtons={false} sx={tabSx}>
+        <Tabs value={canvasTab} onChange={(_, v) => setCanvasTab(v)} variant="scrollable" scrollButtons={false} sx={{ ...tabSx, flexShrink: 0 }}>
           <Tab value="scratch" label="Scratchpad" icon={<CalculateOutlinedIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
           <Tab value="data" label="Data" icon={<GridOnIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
           <Tab value="graph" label="Graph" icon={<InsertChartOutlinedIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
           <Tab value="results" label="Results" icon={<TableChartIcon sx={{ fontSize: 18 }} />} iconPosition="start" sx={tabSx} />
         </Tabs>
-        <Box sx={{ flexGrow: 1 }} />
-        {canvasTab === "graph" && plotting ? (
+        <Box sx={{ flexGrow: 1, minWidth: 8 }} />
+        {undoLabel && (
+          // The canvas tabs keep their width; this button gives way (down to its icon) when there is no room.
+          <Tooltip title={`${undoTooltip(undoLabel)} (${MOD_KEY} + Z)`}>
+            <Button size="small" color="inherit" startIcon={<UndoIcon sx={{ fontSize: 16 }} />} data-testid="graph-undo-combine"
+              aria-label={undoLabel}
+              onClick={() => { store.getState().undo(); }}
+              sx={{ mr: 1.5, flexShrink: 1, minWidth: 32, maxWidth: 340, overflow: "hidden", color: "text.secondary", "& .MuiButton-startIcon": { mr: 0.5, ml: 0 } }}>
+              <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{undoLabel}</Box>
+            </Button>
+          </Tooltip>
+        )}
+        {updating ? (
+          <Stack direction="row" spacing={1} alignItems="center" data-testid="canvas-updating" sx={{ flexShrink: 0 }}>
+            <CircularProgress size={12} />
+            <Typography variant="caption" color="text.secondary">{V.updating}</Typography>
+          </Stack>
+        ) : canvasTab === "graph" && plotting ? (
           <Stack direction="row" spacing={1} alignItems="center">
             <CircularProgress size={12} />
             <Typography variant="caption" color="text.secondary">Rendering…</Typography>
           </Stack>
         ) : canvasTab === "graph" && plot?.success ? (
-          <Typography variant="caption" color="text.secondary" noWrap>
+          <Typography variant="caption" color="text.secondary" noWrap sx={{ minWidth: 0 }}>
             {figure.width} × {figure.height} px · {figure.dpi} dpi · {figure.export_format.toUpperCase()}
           </Typography>
         ) : canvasTab === "scratch" ? (
@@ -615,7 +645,20 @@ function GraphEditor() {
           <Chip size="small" variant="outlined" label={`${result.test.label}: P ${formatP(result.test.p)} ${result.test.star || "ns"}`} />
         ) : null}
       </Box>
-      <Box sx={{ p: 2, flexGrow: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>{body}</Box>
+      <Box sx={{ p: 2, flexGrow: 1, display: "flex", flexDirection: "column", minHeight: 0, position: "relative" }}>
+        {body}
+        {updating && canvasTab === "graph" && (
+          <Box data-testid="graph-updating" sx={{
+            position: "absolute", inset: 0, zIndex: 1, pointerEvents: "none", bgcolor: "rgba(28,28,30,0.35)",
+            display: "flex", alignItems: "flex-start", justifyContent: "center", pt: 6,
+          }}>
+            <Stack direction="row" spacing={1} alignItems="center" sx={{ bgcolor: "background.paper", px: 1.5, py: 0.75, borderRadius: 1, boxShadow: 3 }}>
+              <CircularProgress size={14} />
+              <Typography variant="body2">{V.updating}</Typography>
+            </Stack>
+          </Box>
+        )}
+      </Box>
     </Workspace>
   );
 }
@@ -642,6 +685,10 @@ export function GraphView() {
   const busy = useFileSession((s) => s.busy);
   const loadedKey = useGraphStore((s) => (s.doc ? s.file?.docKey ?? null : null));
   const loaded = !!activeKey && loadedKey === activeKey;
+  const versions = useFileSession((s) => (s.versions && s.versions.tabKey === s.activeKey ? s.versions : null));
+  // Narrow windows: the Versions panel lies over the workspace instead of squeezing it.
+  const [areaRef, areaWidth] = useElementWidth();
+  const overlay = areaWidth > 0 && areaWidth < VERSIONS_PANEL_WIDTH + 840;
 
   let main: ReactNode;
   if (!ready && !hasTabs) main = <CanvasSpinner />;
@@ -651,9 +698,23 @@ export function GraphView() {
     main = (
       <>
         <DocBar tab={tab} />
-        <Box sx={{ position: "relative", flexGrow: 1, minHeight: 0 }}>
-          {loaded && <Box sx={{ position: "absolute", inset: 0 }}><GraphEditor /></Box>}
-          {(!loaded || busy || tab.status === "opening") && <CanvasSpinner overlay={loaded} />}
+        <Box ref={areaRef} sx={{ position: "relative", flexGrow: 1, minHeight: 0, display: "flex" }}>
+          <Box sx={{ position: "relative", flexGrow: 1, minHeight: 0, minWidth: 0 }}>
+            {loaded && <Box sx={{ position: "absolute", inset: 0 }}><GraphEditor /></Box>}
+            {(!loaded || busy || tab.status === "opening") && <CanvasSpinner overlay={loaded} />}
+            {versions?.selectedId && (
+              <Box sx={{ position: "absolute", top: 0, bottom: 0, left: 0, right: overlay ? `${VERSIONS_PANEL_WIDTH}px` : 0, zIndex: 3 }}>
+                <VersionPreview v={versions} />
+              </Box>
+            )}
+          </Box>
+          {versions && (
+            <Box sx={overlay
+              ? { position: "absolute", top: 0, right: 0, bottom: 0, zIndex: 4, display: "flex", boxShadow: 8 }
+              : { display: "flex", minHeight: 0 }}>
+              <VersionsPanel v={versions} />
+            </Box>
+          )}
         </Box>
       </>
     );

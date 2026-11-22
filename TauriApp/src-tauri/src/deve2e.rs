@@ -76,10 +76,16 @@ pub fn dev_e2e_log(line: String) {
 }
 
 /// rename {path → to} · copyOver {path → to: written beside `to`, then renamed
-/// over it, like a sync client} · remove {path} · list {path: folder → every
-/// name, hidden ones too} · exists {path}.
+/// over it, like a sync client; `to` need not exist} · remove {path} · list
+/// {path: folder → every name, hidden ones too} · exists {path} · mkdir {path}
+/// · menu {path: a menu item id such as "file.versions" → `app://menu` is
+/// emitted exactly as a click on that item does; Quit is refused, use
+/// `dev_e2e_quit`}.
 #[tauri::command]
-pub fn dev_e2e_fs(op: String, path: String, to: Option<String>) -> Result<Value, String> {
+pub fn dev_e2e_fs(app: tauri::AppHandle, op: String, path: String, to: Option<String>) -> Result<Value, String> {
+    if op == "menu" {
+        return menu_click(&app, &path);
+    }
     let p = allowed(&path)?;
     let target = || -> Result<PathBuf, String> { allowed(to.as_deref().ok_or("e2e: `to` missing")?) };
     match op.as_str() {
@@ -118,6 +124,17 @@ pub fn dev_e2e_fs(op: String, path: String, to: Option<String>) -> Result<Value,
         }
         other => Err(format!("e2e: unknown op {other:?}")),
     }
+}
+
+/// The `menu` op: what `menu::on_click` emits for a click on `id`.
+fn menu_click(app: &tauri::AppHandle, id: &str) -> Result<Value, String> {
+    use tauri::Emitter;
+    if id == crate::menu::QUIT {
+        return Err("e2e: use dev_e2e_quit to quit".into());
+    }
+    let ev = crate::menu::resolve_click(id, &[]).ok_or_else(|| format!("e2e: unknown menu item {id:?}"))?;
+    app.emit(crate::menu::EVT_MENU, &ev).map_err(|e| e.to_string())?;
+    Ok(Value::Null)
 }
 
 fn rand32() -> u32 {

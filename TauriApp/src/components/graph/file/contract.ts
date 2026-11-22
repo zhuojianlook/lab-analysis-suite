@@ -8,14 +8,19 @@
    defined here are camelCase. The stored records of phase 0 (Manifest,
    FileHeader, GraphSession, DraftRecord, JournalHead, DisplacedEntry,
    RecentEntry, ExportMap, DeviceIdentity) keep their snake_case field names and
-   pass through Rust unchanged. */
+   pass through Rust unchanged.
+
+   Phase 2 ("Versions and combining", phase2-contract.md) is section 6 at the
+   end, plus the members marked "Phase 2" in the unions and constants above. */
 
 import type { Template } from "../../../api/graph";
 import type {
   DeviceIdentity, DirEntry, DisplacedEntry, DraftRecord, ExportMap, FileBackend, FileErrorCode, FileStat, GraphSession,
   JournalHead, RecentEntry,
 } from "./backend";
-import type { FileHeader } from "./format";
+import type { FileHeader, GraphFileData, Manifest, PartRef, Revision, RevisionKind, SectionName } from "./format";
+import type { DocContent } from "../../../store/graphStore";
+import type { FileError } from "./backend";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Constants
@@ -56,6 +61,12 @@ export const CMD = {
   writeRecent: "appstate_write_recent",
   readExportMap: "appstate_read_export_map",
   writeExportMap: "appstate_write_export_map",
+
+  // Phase 2 (versions and combining; phase2-contract.md §4)
+  peek: "graphfile_peek",
+  removeCopy: "graphfile_remove_copy",
+  readSeen: "appstate_read_seen",
+  writeSeen: "appstate_write_seen",
 } as const;
 export type CommandName = (typeof CMD)[keyof typeof CMD];
 
@@ -92,6 +103,8 @@ export const MENU = {
   recover: "file.recover",
   exportLibrary: "file.export_library",
   oldLibrary: "file.old_library",
+  /** Phase 2: open / close the Versions panel of the active tab. Enabled with MenuState.hasDoc. */
+  versions: "file.versions",
 } as const;
 export type MenuId = (typeof MENU)[keyof typeof MENU];
 
@@ -396,6 +409,12 @@ export interface Commands {
   appstate_write_recent: { args: { entries: RecentEntry[] }; result: null };
   appstate_read_export_map: { args: Record<string, never>; result: ExportMap };
   appstate_write_export_map: { args: { map: ExportMap }; result: null };
+
+  // Phase 2
+  graphfile_peek: { args: { path: string }; result: PeekReply };
+  graphfile_remove_copy: { args: { req: RemoveCopyArgs }; result: RemoveCopyReply };
+  appstate_read_seen: { args: Record<string, never>; result: SeenMap };
+  appstate_write_seen: { args: { seen: SeenMap }; result: null };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -439,7 +458,8 @@ export const BANNER_ORDER = [
   "permission", "downloading", "missing", "replaced", "tooNew",
   "saveFailed", "notSaved", "savedAside", "savedOver", "savedDisplaced", "tookTheirs", "draftMismatch",
   "copyQuestion", "extraCopy", "tempLocation",
-  "rolledBack", "newerOnDisk", "newerCopy", "olderCopy", "recovered",
+  // Phase 2: "combined" is a note with Undo; it ranks below every banner that asks for a choice.
+  "rolledBack", "newerOnDisk", "newerCopy", "combined", "olderCopy", "recovered",
 ] as const;
 export type BannerKind = (typeof BANNER_ORDER)[number];
 
@@ -447,7 +467,10 @@ export type BannerKind = (typeof BANNER_ORDER)[number];
 export type BannerAction =
   | "openPrivacy" | "retry" | "findIt" | "saveAs" | "choose" | "later" | "dismiss"
   | "openCopy" | "useEarlier" | "backToLatest" | "separate" | "same" | "notSame"
-  | "updateMine" | "openThatOne" | "openAsNew" | "discardDraft" | "chooseLocation";
+  | "updateMine" | "openThatOne" | "openAsNew" | "discardDraft" | "chooseLocation"
+  /** Phase 2. combine: start combining (newerOnDisk, savedOver, extraCopy). remove / keep: an older extra copy.
+   *  whatChanged / undo: on the "combined" banner. */
+  | "combine" | "remove" | "keep" | "whatChanged" | "undo";
 
 /** Who saved a version and when (from a revision). Times are shown as this
  *  computer sees them ("2 h ago", a date when older than a day). */
@@ -479,6 +502,12 @@ export interface TabBanner {
   candidates?: { path: string; name: string }[];
   when?: string;            // ISO time (drafts)
   message?: string;         // saveFailed: a plain sentence
+  /** Phase 2, savedOver only. "combining": both versions are being combined automatically (no buttons).
+   *  "choose": they could not be combined without a choice (button `combine`). Absent = the phase 1
+   *  meaning (my version was saved as a copy: `name` / `path`). */
+  state?: "combining" | "choose";
+  /** Phase 2, combined only: the sections taken from the other version. */
+  sections?: SectionName[];
 }
 
 export interface FileTab {
@@ -507,6 +536,11 @@ export interface FileTab {
   banners: TabBanner[];
   /** banners[0] ?? null. */
   banner: TabBanner | null;
+  /** Phase 2: an automatic combine is waiting or being written for this tab. */
+  combining?: boolean;
+  /** Phase 2: newer content is waiting to be shown (held back while a cell is being typed in, a
+   *  drag, a menu or an export is active). The UI veils the graph with "Updating…". */
+  updating?: boolean;
 }
 
 /** A session entry that could not be opened (startup or later). Shown in the
@@ -607,18 +641,27 @@ export type SessionDialog =
   | { kind: "find"; find: FindState }
   | { kind: "export"; state: ExportState }
   | { kind: "recover"; drafts: DraftListItem[] }
-  | { kind: "oldLibrary" };
+  | { kind: "oldLibrary" }
+  /** Phase 2: the combine dialog. Nothing is written until applyCombine(). */
+  | { kind: "combine"; state: CombineState }
+  /** Phase 2: "Bring this version back" / "Undo" on a tab with unsaved changes. */
+  | { kind: "bringBackDirty"; tabKey: string; title: string; version: VersionInfo };
 
 export type DialogAnswer =
   | { kind: "saveAsKind"; choice: "new" | "same" | "cancel" }
   | { kind: "closeDirty"; choice: "save" | "discard" | "cancel" }
-  | { kind: "quit"; choice: "saveAll" | "keep" | "cancel" };
+  | { kind: "quit"; choice: "saveAll" | "keep" | "cancel" }
+  /** Phase 2. saveFirst: save my changes as a version, then bring the chosen version back. */
+  | { kind: "bringBackDirty"; choice: "saveFirst" | "cancel" };
 
 export interface SessionToast {
   id: number;
   tone: "info" | "success" | "warning" | "error";
   /** Which fixed text to show (see the wording table). */
-  kind: "renamed" | "saved" | "reloaded" | "tabLimit" | "alreadyOpen" | "restoredDrafts" | "error";
+  kind: "renamed" | "saved" | "reloaded" | "tabLimit" | "alreadyOpen" | "restoredDrafts" | "error"
+    /** Phase 2. combined: `version` = the other side. broughtBack: `version` = the version brought back.
+     *  copyRemoved: `name` = the copy's file name without extension. savedAsNew: `name` = the new file. */
+    | "combined" | "broughtBack" | "copyRemoved" | "savedAsNew";
   name?: string;
   version?: VersionInfo;
   count?: number;
@@ -819,4 +862,562 @@ export interface DevSimApi {
   advance(ms: number): void;
   /** Forget every simulated file and record, then reload the page. */
   reset(): void;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. Phase 2 — versions and combining (docs/design/analysis-files-phase2-contract.md)
+//
+// Additive. Phase 1 names keep their meaning; the unions above gained members
+// that are marked "Phase 2". The controller's store becomes FileSessionStateP2
+// (a pure extension of FileSessionState), the backend FileBackendP2, the
+// simulator DevSimApiP2.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Numbers of phase 2. Times in ms. */
+export const LIMITS_P2 = {
+  /** The newest versions that keep their full content in the file (decision D4). */
+  snapshotsKept: 20,
+  /** A version where work passed to another computer keeps its content this long after this computer first saw it. */
+  handoverKeepMs: 180 * 24 * 3600 * 1000,
+  /** An automatic combine nobody asked for waits between these two, by device id, before it is written. */
+  combineDelayMinMs: 2000,
+  combineDelayMaxMs: 10000,
+  /** Removed extra copies are kept this long in the app's own folder. */
+  removedKeepMs: 30 * 24 * 3600 * 1000,
+  /** Newest saved copies of this computer that are read when looking for a common version. */
+  baseScanCopies: 10,
+  /** Files of the folder looked at for separated analyses when the Versions panel opens. */
+  branchScanFiles: 50,
+  /** The first-seen record is written this long after the last change. */
+  seenDebounceMs: 2000,
+  /** Version ids remembered per analysis in the first-seen record (oldest dropped first). */
+  seenPerAnalysis: 5000,
+  /** CompareResult: most changed cells / settings listed. */
+  compareCells: 200,
+  compareSettings: 50,
+  /** A held-back replaceContent is retried this often. */
+  replaceRetryMs: 500,
+} as const;
+
+/** Text stored in Revision.summary by phase 2 (display only, English, no full stop). */
+export const SUMMARY = {
+  first: "First version",
+  saved: "Saved",
+  noChanges: "No changes",
+  /** "Changed " + sectionList(changed sections). */
+  changedPrefix: "Changed ",
+  combinedAuto: "Combined changes from two computers",
+  combinedChosen: "Combined two versions",
+  broughtBack: "Brought back an earlier version",
+  imported: "From the old library",
+  separated: "Made a separate analysis",
+} as const;
+
+/** How a section is called inside a sentence ("Changed the table and the graph"). Fixed order: SECTION_NAMES. */
+export const SECTION_PHRASE: Record<SectionName, string> = {
+  table: "the table",
+  analysis: "the analysis settings",
+  figure: "the graph",
+  scratchpad: "the scratchpad",
+};
+
+// ── 6.1 What phase 2 adds to a stored version ───────────────────────────────
+
+/** A revision as phase 2 writes it. Every added field is optional, so phase 1
+ *  files and phase 1 apps are unaffected (phase 1 carries unknown fields of a
+ *  revision along unchanged). `kind`: "save" = saved; "merge" = combined (two
+ *  parents); "restore" = brought back; "import" = from the old library. */
+export interface RevisionP2 extends Revision {
+  /** kind "restore": the version whose content this one has again. */
+  restored_from?: string;
+  /** kind "merge": combined without anyone choosing. Such a revision carries no
+   *  device-specific content: user_name, device_id, device_name, session_id and
+   *  app_version are "", `time` is the later of its two parents' `time` strings,
+   *  `parents` are sorted, `summary` is SUMMARY.combinedAuto. */
+  auto?: true;
+  /** kind "merge": for every section that differed between the two parents, the
+   *  parent revision id whose section the result has. */
+  sections_from?: Partial<Record<SectionName, string>>;
+}
+
+/** graph-seen.json in the app's own folder: when THIS computer first saw each
+ *  version (its own clock, ms). Retention uses it; a version's own `time` is
+ *  never used. Stored by Rust as it is given. */
+export interface SeenMap {
+  v: 1;
+  /** analysis id → revision id → first seen. */
+  analyses: Record<string, Record<string, number>>;
+}
+export const emptySeenMap = (): SeenMap => ({ v: 1, analyses: {} });
+
+// ── 6.2 Rust commands added in phase 2 ──────────────────────────────────────
+
+/** graphfile_peek { path } → a file's manifest after the full validation of a
+ *  read, without its parts, without journaling and without touching any track. */
+export interface PeekReply {
+  manifestText: string;
+  stat: FileStat;
+  readOnly: "tooNew" | null;
+}
+
+/** graphfile_remove_copy { req } */
+export interface RemoveCopyArgs {
+  /** The extra copy to move into the app's own folder. */
+  path: string;
+  /** Another file of the same analysis that stays. */
+  keeper: string;
+  analysisId: string;
+}
+
+/** Why a copy was not removed. notOlder: its newest version is not in the keeper's
+ *  history (it has changes of its own). otherAnalysis: one of the two is not this
+ *  analysis. sameFile: both paths are one file. open: the copy is a tracked (open) file. */
+export type RemoveRefusal = "notOlder" | "otherAnalysis" | "sameFile" | "open";
+
+/** graphfile_remove_copy → (unreadable / missing files reject with RustError). */
+export type RemoveCopyReply =
+  | { kind: "removed"; displacedId: string; head: string }
+  | { kind: "refused"; reason: RemoveRefusal; head: string | null; keeperHead: string | null };
+
+// ── 6.3 FileBackend, phase 2 additions ──────────────────────────────────────
+
+export type PeekResult =
+  | { ok: true; manifest: Manifest; stat: FileStat; readOnly: "tooNew" | null }
+  | FileError;
+
+export type RemoveCopyResult =
+  | { ok: true; kind: "removed"; displacedId: string; head: string }
+  | { ok: false; kind: "refused"; reason: RemoveRefusal; head: string | null; keeperHead: string | null }
+  | (FileError & { kind: "error" });
+
+export interface FileBackendP2 extends FileBackendP1 {
+  /** A file's manifest, validated, without its parts. Never journals. */
+  peek(path: string): Promise<PeekResult>;
+  /** Move an extra copy into the app's own folder (kept LIMITS_P2.removedKeepMs). The backend re-reads
+   *  both files immediately before and refuses unless the copy's newest version is the keeper's newest
+   *  version or one of its ancestors. */
+  removeCopy(req: RemoveCopyArgs): Promise<RemoveCopyResult>;
+  readSeen(): Promise<SeenMap>;
+  writeSeen(seen: SeenMap): Promise<void>;
+}
+
+// ── 6.4 Pure modules (file/revisions.ts, retention.ts, graphMerge.ts, summaries.ts, laneGraph.ts) ──
+// Each module exports functions with exactly these names and types (checked in the
+// module with `satisfies`). No I/O, no clock, no randomness; async only for hashing.
+
+export type HeadRelation = "same" | "older" | "newer" | "diverged";
+
+/** Which common version a combine compares against.
+ *  lca: the one lowest common ancestor, and its content is available.
+ *  ambiguous: there are several lowest common ancestors (both sides combined before, differently); `id` = the smallest id among those with content.
+ *  nearest: the lowest common ancestor's content is gone; `id` = the lowest common ancestor that still has content.
+ *  none: no common version with content → two-way.
+ *  notDiverged: one head is the other or its ancestor; there is nothing to combine. */
+export type BaseChoice =
+  | { kind: "lca" | "ambiguous" | "nearest"; id: string }
+  | { kind: "none" }
+  | { kind: "notDiverged"; relation: "same" | "older" | "newer" };
+export type BaseKind = "lca" | "ambiguous" | "nearest" | "none";
+
+/** The four sections of one version, parsed, in file form. */
+export type SectionValues = Record<SectionName, unknown>;
+
+/** Every stored version content of some files, by revision id. */
+export interface SnapshotPool {
+  has(revisionId: string): boolean;
+  get(revisionId: string): SectionValues | null;
+}
+
+export interface RevisionsApi {
+  /** All revisions of the manifests by id. A revision with stored content wins over the same one without; order = first appearance. */
+  unionRevisions(...manifests: readonly Pick<Manifest, "revisions">[]): Revision[];
+  /** Strict: `ancestor` !== `rev` and reachable from `rev` through parents. Unknown ids → false. */
+  isAncestor(revs: readonly Revision[], ancestor: string, rev: string): boolean;
+  isAncestorOrSelf(revs: readonly Revision[], ancestor: string, rev: string): boolean;
+  /** How `other` relates to `mine`: "newer" = `mine` is a strict ancestor of `other`. */
+  relation(revs: readonly Revision[], mine: string, other: string): HeadRelation;
+  /** The lowest common ancestors of two revisions (common ancestors-or-self that are no ancestor of another one), sorted by id. */
+  lowestCommonAncestors(revs: readonly Revision[], a: string, b: string): string[];
+  /** The contract's base rule (§3.2). `stored(id)` says whether that version's content can be had. */
+  findBase(revs: readonly Revision[], mine: string, theirs: string, stored: (revisionId: string) => boolean): BaseChoice;
+  /** Revisions nobody names as a parent, sorted by id. */
+  tips(revs: readonly Revision[]): string[];
+  /** Every revision before its parents; among those that may come next, the larger `key` first, then the larger id. */
+  newestFirst(revs: readonly Revision[], key: (r: Revision) => number): Revision[];
+  /** Stored contents of the files (a revision counts when `sections` is set and all four parts are in that file and parse). */
+  snapshotPool(files: readonly GraphFileData[]): SnapshotPool;
+  /** Which of several files of one analysis stays: the shortest file name, ties by plain string order; the same on every computer. */
+  survivorPath(paths: readonly string[]): string;
+}
+
+export interface RetentionCtx {
+  /** This computer's clock. */
+  now: number;
+  /** SeenMap.analyses[analysis id] (a missing id counts as seen now). */
+  firstSeen: Readonly<Record<string, number>>;
+  /** Heads this computer's saved copies hold that no later version on disk confirmed yet. */
+  unconfirmedHeads: readonly string[];
+  /** Heads other computers say they have open. Always [] in phase 2. */
+  beaconHeads: readonly string[];
+  /** More versions to keep (the versions being combined, a version being brought back). */
+  pinned?: readonly string[];
+}
+
+export interface RetentionApi {
+  /** Ids of the versions whose content stays (§3.3). */
+  keptSnapshots(m: Manifest, ctx: RetentionCtx): Set<string>;
+  /** `m` with `sections: null` on every other version. Entries are never removed; a version without content never gets it back. Returns `m` itself when nothing changes. */
+  applyRetention(m: Manifest, ctx: RetentionCtx): Manifest;
+}
+
+/** One side of a combine after the load pipeline. */
+export interface NormalisedSide {
+  content: DocContent;
+  sections: import("./docCodec").FileSections4;
+  parts: import("./docCodec").BuiltParts;
+}
+
+/** same: both sides have the same section. mine / theirs: only that side changed it since the common version.
+ *  both: both changed it, differently (two-way: it differs). */
+export type SectionStatus = "same" | "mine" | "theirs" | "both";
+export type SidePick = "mine" | "theirs";
+
+export interface CombineSection {
+  key: SectionName;
+  status: SectionStatus;
+  /** What the result takes without a choice: "mine" for same / mine, "theirs" for theirs, null for both. */
+  pick: SidePick | null;
+  /** status !== "both". */
+  autoResolvable: boolean;
+}
+
+export interface CombineResult {
+  /** The combined document after the load pipeline. */
+  content: DocContent;
+  sections: import("./docCodec").FileSections4;
+  parts: import("./docCodec").BuiltParts;
+  /** Where each section came from. */
+  from: Record<SectionName, SidePick | "same">;
+  /** Sections the load pipeline changed after they were put together ("adjusted automatically"). */
+  repairs: SectionName[];
+}
+
+export interface CombinePlan {
+  ok: true;
+  /** No common version: every differing section is "both". */
+  twoWay: boolean;
+  baseKind: BaseKind;
+  /** In SECTION_NAMES order. */
+  sections: CombineSection[];
+  /** A section is "both". */
+  needsChoice: boolean;
+  /** May be applied without showing anything: baseKind "lca", no "both", no repairs. */
+  autoApplicable: boolean;
+  /** Set when needsChoice is false. */
+  result: CombineResult | null;
+  mine: NormalisedSide;
+  theirs: NormalisedSide;
+  base: NormalisedSide | null;
+}
+
+export type CombineOutcome = CombinePlan | { ok: false; reason: "unreadable"; side: "mine" | "theirs" };
+
+export interface GraphMergeApi {
+  /** migrate → defaults → normalise → id map, then back to file form and hashed. null: not a Graphs document. */
+  normaliseSections(raw: SectionValues): Promise<NormalisedSide | null>;
+  /** §3.4. A base that does not normalise counts as no base (two-way). */
+  combine(input: { base: SectionValues | null; baseKind: BaseKind; mine: SectionValues; theirs: SectionValues }): Promise<CombineOutcome>;
+  /** The result for these choices ("both" sections need one; choices for other sections override the pick). null: a choice is missing or the result is not a Graphs document. */
+  applyChoices(plan: CombinePlan, choices: Partial<Record<SectionName, SidePick>>): Promise<CombineResult | null>;
+  /** The two-parent revision of a combine. Its id is mergeRevisionId(parents, content hash) (docCodec.ts) either way.
+   *  auto: the deterministic form of RevisionP2.auto (author / time ignored). Else author and time as given, summary SUMMARY.combinedChosen. */
+  combineRevision(p: {
+    mine: Revision; theirs: Revision; result: CombineResult; auto: boolean;
+    author?: import("./docCodec").Author; time?: number;
+  }): Promise<RevisionP2>;
+  /** LIMITS_P2.combineDelayMinMs + (first 8 hex digits of sha256(device id) as a number) mod (max − min + 1). */
+  combineDelayMs(deviceId: string): Promise<number>;
+}
+
+/** What differs between two versions, for "Compare with current" and the combine dialog. */
+export interface CompareResult {
+  /** In SECTION_NAMES order. */
+  sections: { key: SectionName; same: boolean }[];
+  table: {
+    /** Cells (row id, column id, replicate) present in both whose text differs. */
+    changedCells: number;
+    addedRows: number; removedRows: number; addedCols: number; removedCols: number;
+    /** Row / column titles and X values that differ. */
+    changedTitles: number;
+    /** The first LIMITS_P2.compareCells changed cells, in table order of `b`. `a` / `b` = the cell text. */
+    cells: { rowId: string; colId: string; rep: number; a: string; b: string }[];
+  };
+  /** Analysis and graph settings that differ (top-level fields; values as short text), at most LIMITS_P2.compareSettings. */
+  settings: { section: "analysis" | "figure"; field: string; a: string; b: string }[];
+  /** Scratchpad cells that differ (0 when the scratchpad is the same). */
+  scratchpadCells: number;
+}
+
+export interface SummariesApi {
+  /** Sections whose stored hash differs, in SECTION_NAMES order. */
+  changedSections(prev: Record<SectionName, PartRef>, next: Record<SectionName, PartRef>): SectionName[];
+  /** "the table" · "the table and the graph" · "the table, the analysis settings and the graph". */
+  sectionList(keys: readonly SectionName[]): string;
+  /** The text to store in Revision.summary (§3.5). `prev` = the first parent's sections when known. */
+  summaryText(p: {
+    kind: RevisionKind; root: boolean; auto?: boolean;
+    prev: Record<SectionName, PartRef> | null | undefined; next: Record<SectionName, PartRef>;
+  }): string;
+  /** The text a Versions row shows: worked out from the two versions when both have content, else the stored summary without a trailing full stop, else SUMMARY.saved. */
+  displaySummary(rev: Revision, firstParent: Revision | null): string;
+  /** `a` = the older / other version, `b` = the current one. */
+  compareSections(a: import("./docCodec").FileSections4, b: import("./docCodec").FileSections4): CompareResult;
+}
+
+export interface LaneNode {
+  id: string;
+  parents: string[];
+  /** Revision.time (ISO); ordering of rows only. */
+  time: string;
+  /** "" for a version combined automatically. */
+  deviceId: string;
+  /** Only in an extra copy, not in this file's history: drawn dashed. */
+  foreign?: boolean;
+}
+
+export interface LaneRow {
+  id: string;
+  /** 0 = top (newest). */
+  row: number;
+  /** 0 = the line of the file's current version. */
+  lane: number;
+  /** Index into LaneLayout.devices, -1 for deviceId "". */
+  colorIndex: number;
+}
+
+/** A line from a version (`from`, the child, higher up) to one of its parents (`to`).
+ *  Same lane: straight. Different lanes: vertical in lane max(fromLane, toLane), with a bend at the end that is in the other lane. */
+export interface LaneEdge {
+  from: string;
+  to: string;
+  fromRow: number;
+  toRow: number;
+  fromLane: number;
+  toLane: number;
+  /** `from` is foreign. */
+  dashed: boolean;
+  /** The colour of `from`'s lane end: colorIndex of the row that is NOT in lane 0 when the lanes differ, else `from`'s. */
+  colorIndex: number;
+}
+
+export interface LaneLayout {
+  /** In row order. */
+  rows: LaneRow[];
+  edges: LaneEdge[];
+  laneCount: number;
+  /** Device ids in the order they first appear, oldest version first ("" left out). */
+  devices: string[];
+}
+
+export interface LaneGraphApi {
+  /** §3.6. `head` = the file's current version (its first-parent line is lane 0); null: the newest row's line. */
+  layoutLanes(nodes: readonly LaneNode[], head: string | null): LaneLayout;
+}
+
+// ── 6.5 The Versions panel (state the controller hands the UI) ──────────────
+
+export type VersionChip = "current" | "combined" | "broughtBack" | "fromOldLibrary" | "tooOld" | "unsaved";
+
+/** Id of the row for the tab's unsaved changes (shown only when there are any). */
+export const WORKING_ROW = "working";
+
+export interface VersionRow {
+  /** Revision id, or WORKING_ROW. */
+  id: string;
+  kind: RevisionKind | "working";
+  /** Ready to show ("Changed the table"; "Unsaved changes" for the working row). */
+  summary: string;
+  /** Who saved it; null for the working row and for a version combined automatically. */
+  who: VersionInfo | null;
+  /** In display order. */
+  chips: VersionChip[];
+  /** Its content can be shown, brought back and saved as a new analysis. */
+  openable: boolean;
+  /** Only in an extra copy of this analysis (not in this file's history). */
+  foreign: boolean;
+  /** Set on the newest version of an extra copy: that copy's file name without extension, and its path. */
+  copyName: string | null;
+  copyPath: string | null;
+  /** kind "restore": the id of the version it brought back (null when unknown). */
+  restoredFrom: string | null;
+}
+
+/** A separated analysis (its own file, made from this one): a dashed stub at the version it started from. */
+export interface VersionStub {
+  /** Row id it leaves from. */
+  from: string;
+  /** File name without extension. */
+  name: string;
+  path: string;
+}
+
+export interface VersionPreview {
+  id: string;
+  loading: boolean;
+  /** The version's document; null while loading or when it can't be opened. */
+  content: DocContent | null;
+  /** What differs from the tab's current content (set while "Compare with current" is on). */
+  compare: CompareResult | null;
+  /** The tab's current content, for the side-by-side view (set together with `compare`). */
+  current: DocContent | null;
+}
+
+export interface VersionsState {
+  tabKey: string;
+  /** File name without extension. */
+  name: string;
+  /** The list is being put together (rows may be empty). */
+  loading: boolean;
+  /** Newest first; rows[i] belongs to layout.rows[i]. */
+  rows: VersionRow[];
+  layout: LaneLayout;
+  /** layout.devices with names, for the legend. `mine`: this computer. */
+  devices: { deviceId: string; deviceName: string; mine: boolean }[];
+  stubs: VersionStub[];
+  /** Rows that can no longer be opened (> 0 → the footer line is shown). */
+  tooOld: number;
+  selectedId: string | null;
+  preview: VersionPreview | null;
+  /** "Compare with current" is on. */
+  comparing: boolean;
+  /** An action of the panel is running. */
+  busy: "bringBack" | "saveAsNew" | null;
+}
+
+// ── 6.6 Combining (state of the dialog) ─────────────────────────────────────
+
+/** What the tab's content is combined with. disk: the version now in the file.
+ *  copy: an extra copy in the folder. journal: a version this computer saved (or loaded) that another computer's save replaced. */
+export type CombineSource =
+  | { kind: "disk" }
+  | { kind: "copy"; path: string }
+  | { kind: "journal"; revisionId: string };
+
+export interface CombineSectionView {
+  key: SectionName;
+  status: SectionStatus;
+  /** What will be kept. Preset for same / mine / theirs; null for "both" until the person chooses. */
+  choice: SidePick | null;
+}
+
+export interface CombineState {
+  tabKey: string;
+  /** This file's name without extension. */
+  name: string;
+  /** How the dialog was reached. */
+  origin: "save" | "banner" | "poll";
+  source: CombineSource;
+  /** source "copy": the copy's file name without extension. */
+  copyName: string | null;
+  /** "Copy 2 of 3": 1-based position and total when several copies are combined one after another (total 1 otherwise). */
+  index: number;
+  total: number;
+  /** My side. `mineUnsaved`: it includes unsaved changes. */
+  mine: VersionInfo;
+  mineUnsaved: boolean;
+  theirs: VersionInfo;
+  /** The version both started from; null = none can be compared (two-way wording). */
+  since: VersionInfo | null;
+  twoWay: boolean;
+  /** In SECTION_NAMES order. */
+  sections: CombineSectionView[];
+  /** Sections that will be adjusted automatically with the current choices. */
+  adjusted: SectionName[];
+  /** Every "both" section has a choice. */
+  canApply: boolean;
+  applying: boolean;
+  /** Both documents, for the side-by-side pane. */
+  mineContent: DocContent;
+  theirsContent: DocContent;
+  /** theirs (a) against mine (b). */
+  compare: CompareResult;
+  /** A plain sentence when Apply failed (nothing was written), else null. */
+  error: string | null;
+}
+
+// ── 6.7 The session controller, phase 2 ─────────────────────────────────────
+
+export interface FileSessionStateP2 extends FileSessionState {
+  /** The Versions panel of the active tab; null = closed. Closed by a tab switch. */
+  versions: VersionsState | null;
+
+  // ── versions ──
+  /** Opens the panel for the active tab (or `key`, switching to it). No-op for an untitled document. */
+  openVersions(key?: string): Promise<void>;
+  closeVersions(): void;
+  /** Select a row (null = none): loads its read-only preview. */
+  selectVersion(id: string | null): Promise<void>;
+  /** Turn "Compare with current" on / off for the selected row (default: toggle). */
+  compareWithCurrent(on?: boolean): Promise<void>;
+  /** A new version with that version's content on top of the current one (history is never rewritten). */
+  bringBack(id: string): Promise<SaveOutcome>;
+  /** Asks for a place, writes that version as a new analysis there and opens it in a new tab. */
+  saveVersionAsNew(id: string): Promise<OpenOutcome>;
+
+  // ── combining ──
+  /** Combine the tab's content with `source`. Applies at once when nothing needs a choice, else opens the dialog. */
+  startCombine(key: string, source: CombineSource): Promise<void>;
+  /** In the dialog. */
+  setSectionChoice(section: SectionName, choice: SidePick): Promise<void>;
+  /** Writes the combined version; closes the dialog on success (then the next copy, if several). */
+  applyCombine(): Promise<SaveOutcome>;
+  /** Closes the dialog; nothing is written. */
+  cancelCombine(): void;
+  /** Leaves the other version where it is and saves mine as a separate analysis (a place is asked for when mine has no file of its own). */
+  keepBothAsSeparate(): Promise<void>;
+  /** "Undo" on the combined banner: bring my version from before the combine back. */
+  undoCombine(key: string): Promise<SaveOutcome>;
+  /** "What changed" on the combined banner: opens Versions with the combined version selected and compare on. */
+  showWhatChanged(key: string): Promise<void>;
+
+  // ── extra copies ──
+  /** "Remove it": moves an older copy into the app's own folder. false: it was not removed (a toast says why). */
+  removeExtraCopy(key: string, path: string): Promise<boolean>;
+  /** "This is a different analysis": the copy gets its own identity. */
+  markDifferentAnalysis(key: string, path: string): Promise<void>;
+
+  // ── a file put back to an earlier version ──
+  useEarlierVersion(key: string): Promise<void>;
+  goBackToMyLatest(key: string): Promise<void>;
+
+  // ── reload in place ──
+  /** The UI calls this while something must not be interrupted by newer content arriving (an export). Returns the release function. */
+  holdReplace(reason: string): () => void;
+}
+
+// ── 6.8 Browser preview: simulator additions ────────────────────────────────
+
+/** A removed extra copy, as the simulator lists them. */
+export interface SimRemoved {
+  id: string;
+  /** Where it was. */
+  original: string;
+  /** ms, simulated clock. */
+  at: number;
+}
+
+export interface DevSimApiP2 extends DevSimApi {
+  /** As phase 1, for any section: table = first value + 1; figure = graph title; analysis = the
+   *  centre / error-bar setting switches; scratchpad = cell A1 gets a new value. */
+  remoteEdit(path: string, opts?: { userName?: string; section?: SectionName }): Promise<string>;
+  /** The other computer works from the version BEFORE this computer's last save and changes `section`.
+   *  how "copy": the service keeps this computer's file and adds a conflicted copy → resolves with the copy's path.
+   *  how "saveOver": its save silently replaces this computer's last save → resolves with the file's path. */
+  remoteDiverge(path: string, opts: { section: SectionName; how: "copy" | "saveOver"; userName?: string }): Promise<string>;
+  /** An extra copy holding the file's PREVIOUS version appears beside it ("<name> (old copy).lag"). Resolves with its path. */
+  olderCopy(path: string): Promise<string>;
+  /** The other computer saves `count` more versions, alternating table and graph edits. Resolves with the last head. */
+  remoteEditMany(path: string, count: number): Promise<string>;
+  /** Extra copies removed on this computer (newest first). */
+  removed(): SimRemoved[];
 }

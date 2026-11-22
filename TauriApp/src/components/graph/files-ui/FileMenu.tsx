@@ -67,6 +67,7 @@ export function FileMenu({ variant = "text" }: { variant?: "text" | "outlined" }
         {item(MENU.duplicate, MENU_TEXT.duplicate, { disabled: !hasDoc })}
         <Divider />
         {item(MENU.closeTab, MENU_TEXT.closeTab, { key: "w", disabled: !hasDoc })}
+        {item(MENU.versions, MENU_TEXT.versions, { disabled: !hasDoc || !tab?.path })}
         <Divider />
         {item(MENU.recover, MENU_TEXT.recover)}
         {item(MENU.oldLibrary, MENU_TEXT.oldLibrary, { disabled: !hasOld })}

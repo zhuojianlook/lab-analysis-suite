@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Box, Button, IconButton, Popover, Stack, Tooltip, Typography, alpha, useTheme } from "@mui/material";
+import { Box, Button, CircularProgress, IconButton, Popover, Stack, Tooltip, Typography, alpha, useTheme } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
@@ -31,7 +31,9 @@ function BannerBody({ tab, banner, compact, more, onMore }: {
         minWidth: 0, flexGrow: 1, height: compact ? "100%" : "auto", px: 1.25, py: compact ? 0 : 1, borderRadius: 1,
         bgcolor: alpha(color, 0.12), border: 1, borderColor: alpha(color, 0.35),
       }}>
-      <Icon sx={{ fontSize: 18, color, flexShrink: 0 }} />
+      {banner.kind === "savedOver" && banner.state === "combining"
+        ? <CircularProgress size={15} sx={{ color, flexShrink: 0 }} data-testid="banner-combining" />
+        : <Icon sx={{ fontSize: 18, color, flexShrink: 0 }} />}
       <Tooltip title={compact ? text : ""} placement="bottom-start" enterDelay={600}>
         <Typography variant="body2" sx={{
           flexGrow: 1, minWidth: 0, fontSize: 12.5, lineHeight: 1.3,

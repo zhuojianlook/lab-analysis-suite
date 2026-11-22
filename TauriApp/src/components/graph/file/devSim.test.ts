@@ -106,8 +106,12 @@ describe("simulator actions", () => {
     expect(app.ses.getState().tabs[0].banners.find((b) => b.path === copy)).toMatchObject({ kind: "extraCopy", relation: "diverged" });
     await sim.remoteReplace(PREVIEW_SAMPLE);
     await flush();
-    expect(app.ses.getState().tabs[0].banners.some((b) => b.kind === "savedOver")).toBe(true);
-    expect(sim.files().some((f) => f.name === "Dose response (my version from This Mac).lag")).toBe(true);
+    // Phase 2: my save (table) and theirs (graph) are combined after the device-ordered delay; no copy is written.
+    expect(app.ses.getState().tabs[0].banners.find((b) => b.kind === "savedOver")).toMatchObject({ state: "combining" });
+    sim.advance(11_000);
+    await flush();
+    expect(app.ses.getState().tabs[0].banners.some((b) => b.kind === "combined")).toBe(true);
+    expect(sim.files().some((f) => f.name.includes("my version from"))).toBe(false);
     const back = await sim.rollback(PREVIEW_SAMPLE);
     await flush();
     expect(back).not.toBeNull();
@@ -124,7 +128,11 @@ describe("simulator actions", () => {
     await flush();
     app.graph.getState().setCell(0, 0, 0, "race");
     expect((await app.ses.getState().save()).ok).toBe(true);
-    expect(app.ses.getState().tabs[0].banner?.kind).toBe("savedDisplaced");
+    // Phase 2: combined with the version that landed in the gap (after the device-ordered delay).
+    expect(app.ses.getState().tabs[0].banner).toMatchObject({ kind: "savedOver", state: "combining" });
+    sim.advance(11_000);
+    await flush();
+    expect(app.ses.getState().tabs[0].banners.some((b) => b.kind === "combined")).toBe(true);
     sim.armOffline(PREVIEW_SAMPLE);
     app.graph.getState().setCell(0, 0, 0, "offline");
     await app.ses.getState().save();
@@ -136,5 +144,71 @@ describe("simulator actions", () => {
     await flush();
     const kinds = app.ses.getState().tabs.find((t) => t.path === sent)!.banners.map((b) => b.kind);
     expect(kinds).toEqual(expect.arrayContaining(["tempLocation", "newerCopy"]));
+  });
+});
+
+describe("simulator, phase 2 (§6.6)", () => {
+  it("edits each section; own table edit + their graph edit combines, + their table edit needs a choice", async () => {
+    const { sim, app } = await preview();
+    await app.ses.getState().open(PREVIEW_SAMPLE);
+    const f0 = app.graph.getState();
+    for (const section of ["analysis", "scratchpad", "figure"] as const) {
+      await sim.remoteEdit(PREVIEW_SAMPLE, { section });
+      await flush();
+    }
+    const g = app.graph.getState();
+    expect(g.analysis.alpha).not.toBe(f0.analysis.alpha);
+    expect(g.scratch).toContain('[1,1,"1"]');
+    expect(g.figure.title).not.toBe(f0.figure.title);
+    expect(isDirty(g)).toBe(false);
+    // Own unsaved table edit + "Edit graph and save" → the banner; Combine → one two-parent version.
+    app.graph.getState().setCell(0, 0, 0, "mine");
+    await flush();
+    await sim.remoteEdit(PREVIEW_SAMPLE, { section: "figure" });
+    await flush();
+    const t = app.ses.getState().tabs[0];
+    expect(t.banner).toMatchObject({ kind: "newerOnDisk", actions: ["combine", "later"] });
+    await app.ses.getState().bannerAction(t.key, t.banner!.id, "combine");
+    await flush();
+    expect(app.ses.getState().tabs[0].banners.some((b) => b.kind === "combined")).toBe(true);
+    // Own table edit + "Edit table and save" + Save → the dialog, file unchanged until Apply.
+    app.graph.getState().setCell(0, 0, 0, "mine again");
+    await flush();
+    const before = await sim.remoteEdit(PREVIEW_SAMPLE, { section: "table" });
+    await flush();
+    await app.ses.getState().save();
+    expect(app.ses.getState().dialog?.kind).toBe("combine");
+    expect(sim.files().find((f) => f.path === PREVIEW_SAMPLE)!.head).toBe(before);
+  });
+
+  it("diverged copy, save over my last save, an older copy, 25 more versions, removed copies", async () => {
+    const { sim, app } = await preview();
+    await app.ses.getState().open(PREVIEW_SAMPLE);
+    const copy = await sim.remoteDiverge(PREVIEW_SAMPLE, { section: "table", how: "copy" });
+    await flush();
+    expect(copy).toMatch(/conflicted copy/);
+    expect(app.ses.getState().tabs[0].banners.find((b) => b.path === copy)).toMatchObject({ kind: "extraCopy", relation: "diverged", actions: ["combine", "notSame", "later"] });
+    const old = await sim.olderCopy(PREVIEW_SAMPLE);
+    await flush();
+    expect(old).toBe("/Users/me/Dropbox/Lab/Dose response (old copy).lag");
+    const ob = app.ses.getState().tabs[0].banners.find((b) => b.path === old)!;
+    expect(ob).toMatchObject({ kind: "extraCopy", relation: "older", actions: ["remove", "keep"] });
+    await app.ses.getState().bannerAction(app.ses.getState().tabs[0].key, ob.id, "remove");
+    expect(sim.removed().map((r) => r.original)).toEqual([old]);
+    expect(sim.files().some((f) => f.path === old)).toBe(false);
+    // Save over my last save (graph) on a clean tab → combining.
+    app.graph.getState().setCell(0, 0, 0, "own");
+    await app.ses.getState().save();
+    await sim.remoteDiverge(PREVIEW_SAMPLE, { section: "figure", how: "saveOver" });
+    await flush();
+    expect(app.ses.getState().tabs[0].banners.find((b) => b.kind === "savedOver")).toMatchObject({ state: "combining" });
+    sim.advance(11_000);
+    await flush();
+    expect(app.ses.getState().tabs[0].banners.some((b) => b.kind === "combined")).toBe(true);
+    // 25 more versions: entries kept, only the newest contents.
+    await sim.remoteEditMany(PREVIEW_SAMPLE, 25);
+    await flush();
+    const f = sim.files().find((x) => x.path === PREVIEW_SAMPLE)!;
+    expect(f.head).toBe(app.ses.getState().tabs[0].baseRevision);
   });
 });

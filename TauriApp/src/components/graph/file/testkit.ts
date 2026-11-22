@@ -185,3 +185,74 @@ export function writtenHeads(world: MemoryWorld): Set<string> {
   for (const d of world.devices) for (const h of d.written) out.add(h);
   return out;
 }
+
+// ── phase 2 helpers ─────────────────────────────────────────────────────────
+
+export const PFILE = `${DBX}/Dose response.lag`;
+
+export interface Pair { w: MemoryWorld; a: Computer; b: Computer; delay: number }
+
+/** Two computers with the same file open (seeded on `a`, synced to `b`). */
+export async function pair(delay = 2000, mode: ConflictMode = "dropbox", extra: {
+  skewB?: number; sameId?: boolean; partialB?: number; depsA?: TestDeps; depsB?: TestDeps; path?: string;
+} = {}): Promise<Pair> {
+  const w = makeWorld(mode);
+  const path = extra.path ?? PFILE;
+  const a = await start(await computer(w, { device_id: "d-a", device_name: "Mac mini", uploadDelayMs: delay, downloadDelayMs: delay }, extra.depsA ?? {}));
+  const b = await start(await computer(w, {
+    device_id: extra.sameId ? "d-a" : "d-b", device_name: "MacBook", user_name: "Alice", uploadDelayMs: delay, downloadDelayMs: delay, partialDeliveryMs: extra.partialB,
+  }, { skewMs: extra.skewB, ...(extra.depsB ?? {}) }));
+  await seedFile(w, a.dev, path);
+  await tick(w, 2 * delay + (extra.partialB ?? 0) + 500);
+  const oa = await a.ses.getState().open(path);
+  const ob = await b.ses.getState().open(path);
+  if (!oa.ok || !ob.ok) throw new Error("pair: open failed");
+  return { w, a, b, delay };
+}
+
+export const syncPair = (s: Pair, extraMs = 1000) => tick(s.w, 2 * s.delay + extraMs);
+
+export async function editCell(c: Computer, value: string, r = 0, col = 0) {
+  c.graph.getState().setCell(r, col, 0, value);
+  await flush();
+}
+
+export async function editTitle(c: Computer, title: string) {
+  c.graph.getState().setFigure({ title });
+  await flush();
+}
+
+/** Every version any computer wrote is still in a file on some disk or in a journal. */
+export function lostVersions(w: MemoryWorld): string[] {
+  const { onDisk, journaled } = keptRevisions(w);
+  return [...writtenHeads(w)].filter((h) => !onDisk.has(h) && !journaled.has(h));
+}
+
+/** Every revision id in any file on any disk (content or not). */
+export function knownIds(w: MemoryWorld): Set<string> {
+  const out = new Set<string>();
+  for (const d of w.devices) for (const p of d.localPaths()) for (const r of d.localFile(p)?.manifest.revisions ?? []) out.add(r.id);
+  return out;
+}
+
+/** Two-parent versions with the same (sorted) parents but different ids, over every file of every disk. */
+export function duplicateCombines(w: MemoryWorld): string[] {
+  const byParents = new Map<string, Set<string>>();
+  for (const d of w.devices) for (const p of d.localPaths()) for (const r of d.localFile(p)?.manifest.revisions ?? []) {
+    if (r.parents.length < 2) continue;
+    const k = [...r.parents].sort().join("+");
+    if (!byParents.has(k)) byParents.set(k, new Set());
+    byParents.get(k)!.add(r.id);
+  }
+  return [...byParents.entries()].filter(([, ids]) => ids.size > 1).map(([k, ids]) => `${k}: ${[...ids].join(",")}`);
+}
+
+export const activeTab = (c: Computer) => c.ses.getState().tabs.find((t) => t.key === c.ses.getState().activeKey)!;
+export const bannerOf = (c: Computer, kind: string) => activeTab(c).banners.find((b) => b.kind === kind) ?? null;
+export async function pressBanner(c: Computer, kind: string, action: string) {
+  const t = activeTab(c);
+  const b = t.banners.find((x) => x.kind === kind);
+  if (!b) throw new Error(`no ${kind} banner (have ${t.banners.map((x) => x.kind).join(", ")})`);
+  await c.ses.getState().bannerAction(t.key, b.id, action as never);
+  await flush();
+}

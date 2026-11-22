@@ -586,7 +586,7 @@ pub fn run() {
       if state_dir.is_some() {
         let c = ctx.clone();
         std::thread::spawn(move || {
-          if let Err(e) = c.prune(10, 500 * 1024 * 1024, 30 * 24 * 3600 * 1000) {
+          if let Err(e) = c.prune(10, 500 * 1024 * 1024, graphfile::DISPLACED_KEEP_MS) {
             log::warn!("[graphfile] pruning safety copies failed: {}", e.message);
           }
         });
@@ -673,6 +673,8 @@ pub fn run() {
       appstate::appstate_write_recent,
       appstate::appstate_read_export_map,
       appstate::appstate_write_export_map,
+      appstate::appstate_read_seen,
+      appstate::appstate_write_seen,
       graphfile::graphfile_read,
       graphfile::graphfile_header,
       graphfile::graphfile_save,
@@ -685,6 +687,8 @@ pub fn run() {
       graphfile::graphfile_list_displaced,
       graphfile::graphfile_read_displaced,
       graphfile::graphfile_reveal,
+      graphfile::graphfile_peek,
+      graphfile::graphfile_remove_copy,
       graphwatch::graphfile_track,
       graphwatch::graphfile_untrack,
       graphwatch::graphfile_poll_now,

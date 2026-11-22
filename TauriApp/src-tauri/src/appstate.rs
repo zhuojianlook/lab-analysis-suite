@@ -433,6 +433,43 @@ pub fn write_export_map(ctx: &FileCtx, map: &Value) -> FResult<()> {
     write_value(&p, map)
 }
 
+// ── first-seen record (phase 2, graph-seen.json) ─────────────────────────────
+
+pub fn default_seen() -> Value {
+    json!({ "v": 1, "analyses": {} })
+}
+
+fn seen_ok(v: &Value) -> bool {
+    v.get("analyses").map(Value::is_object).unwrap_or(false)
+}
+
+/// `appstate_read_seen` (phase2-contract.md §4.3): `SeenMap` as stored.
+/// Missing → default; unparsable or `analyses` not an object → renamed aside
+/// (`graph-seen.json.bad-<ms>`) and default.
+pub fn read_seen(ctx: &FileCtx) -> FResult<Value> {
+    let state = ctx.state()?;
+    let path = state.join("graph-seen.json");
+    let _g = ctx.state_guard();
+    match load_value(&path)? {
+        Loaded::Missing => Ok(default_seen()),
+        Loaded::Ok(v) if seen_ok(&v) => Ok(v),
+        _ => {
+            let _ = fs::rename(&path, state.join(format!("graph-seen.json.bad-{}", wall_ms())));
+            Ok(default_seen())
+        }
+    }
+}
+
+/// `appstate_write_seen`: atomic; `Invalid` unless `seen.analyses` is an object.
+pub fn write_seen(ctx: &FileCtx, seen: &Value) -> FResult<()> {
+    if !seen_ok(seen) {
+        return Err(FileErr::invalid("seen.analyses must be an object"));
+    }
+    let state = ctx.state()?;
+    let _g = ctx.state_guard();
+    write_value(&state.join("graph-seen.json"), seen)
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // app_info
 // ═════════════════════════════════════════════════════════════════════════════
@@ -570,6 +607,16 @@ pub async fn appstate_read_export_map(ctx: tauri::State<'_, Ctx>) -> Result<Valu
 #[tauri::command]
 pub async fn appstate_write_export_map(ctx: tauri::State<'_, Ctx>, map: Value) -> Result<(), FileErr> {
     cmd!(ctx, move |c: &FileCtx| write_export_map(c, &map))
+}
+
+#[tauri::command]
+pub async fn appstate_read_seen(ctx: tauri::State<'_, Ctx>) -> Result<Value, FileErr> {
+    cmd!(ctx, |c: &FileCtx| read_seen(c))
+}
+
+#[tauri::command]
+pub async fn appstate_write_seen(ctx: tauri::State<'_, Ctx>, seen: Value) -> Result<(), FileErr> {
+    cmd!(ctx, move |c: &FileCtx| write_seen(c, &seen))
 }
 
 #[tauri::command]
@@ -744,6 +791,33 @@ mod tests {
         write_export_map(&c, &m).unwrap();
         assert_eq!(read_export_map(&c).unwrap(), m);
         assert!(write_export_map(&c, &json!({"rows": []})).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R8: first-seen record — default, round trip, bad file moved aside, invalid write refused.
+    #[test]
+    fn seen_map_default_round_trip_and_bad_file() {
+        let d = tmp();
+        let c = ctx_in(&d);
+        assert_eq!(read_seen(&c).unwrap(), default_seen());
+        assert!(!d.join("graph-seen.json").exists(), "reading never creates the file");
+        let m = json!({"v":1,"analyses":{"a-1":{"r-01":1_763_640_000_000_i64,"r-m-0123456789abcdef0123456789":1_763_640_000_123_i64}},"zz":true});
+        write_seen(&c, &m).unwrap();
+        assert_eq!(read_seen(&c).unwrap(), m, "stored as it is given");
+        assert_eq!(write_seen(&c, &json!({"v":1,"analyses":[]})).unwrap_err().kind, crate::graphfile::ErrKind::Invalid);
+        assert_eq!(write_seen(&c, &json!({"v":1})).unwrap_err().kind, crate::graphfile::ErrKind::Invalid);
+        assert_eq!(read_seen(&c).unwrap(), m, "a refused write changes nothing");
+        let bad = |d: &Path| fs::read_dir(d).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("graph-seen.json.bad-")).count();
+        fs::write(d.join("graph-seen.json"), b"{not json").unwrap();
+        assert_eq!(read_seen(&c).unwrap(), default_seen());
+        assert_eq!(bad(&d), 1);
+        assert!(!d.join("graph-seen.json").exists());
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        fs::write(d.join("graph-seen.json"), br#"{"v":1,"analyses":"x"}"#).unwrap();
+        assert_eq!(read_seen(&c).unwrap(), default_seen());
+        assert_eq!(bad(&d), 2);
+        assert_eq!(read_seen(&FileCtx::new(None)).unwrap_err().kind, crate::graphfile::ErrKind::NoStateDir);
+        assert_eq!(write_seen(&FileCtx::new(None), &default_seen()).unwrap_err().kind, crate::graphfile::ErrKind::NoStateDir);
         let _ = fs::remove_dir_all(&d);
     }
 

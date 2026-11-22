@@ -20,22 +20,32 @@ import {
 import { flushScratch as realFlushScratch } from "../scratchpad/scratchBridge";
 import { SCRATCH_LIMIT } from "../scratchpad/scratchModel";
 import type {
-  DeviceIdentity, DraftRecord, FileErrorCode, FileEvent, GraphSession, ReadResult, RecentEntry, SaveRequest, SaveResult, SessionTab,
+  DeviceIdentity, DraftRecord, FileErrorCode, FileEvent, FileMemo, GraphSession, JournalHead, ReadResult, RecentEntry, SaveRequest, SaveResult,
+  SessionTab,
 } from "./backend";
 import {
-  BANNER_ORDER, CMD, EVT, LIMITS, MENU,
-  type AppInfo, type BannerAction, type BannerKind, type ConflictChoice, type DialogAnswer, type DraftListItem, type ExportState,
-  type FileBackendP1, type FileSessionState, type FileSettings, type FileTab, type MenuEvent, type MenuId, type MenuState,
-  type OpenFilesEvent, type OpenOutcome, type PathPickerRequest, type QuitRequest, type QuitSource, type RecentItem,
-  type RestoreCard, type SaveAsMode, type SaveOutcome, type SessionDialog, type SessionToast, type TabBanner, type TabStatus,
-  type VersionInfo,
+  BANNER_ORDER, CMD, EVT, LIMITS, LIMITS_P2, MENU, SUMMARY, WORKING_ROW, emptySeenMap,
+  type AppInfo, type BannerAction, type BannerKind, type BaseChoice, type CombinePlan, type CombineResult, type CombineSource,
+  type CombineState, type ConflictChoice, type DialogAnswer, type DraftListItem, type ExportState,
+  type FileBackendP2, type FileSessionStateP2, type FileSettings, type FileTab, type LaneLayout, type LaneNode, type MenuEvent, type MenuId,
+  type MenuState, type OpenFilesEvent, type OpenOutcome, type PathPickerRequest, type QuitRequest, type QuitSource, type RecentItem,
+  type RestoreCard, type RevisionP2, type SaveAsMode, type SaveOutcome, type SectionValues, type SeenMap, type SessionDialog,
+  type SessionToast, type SidePick, type SnapshotPool, type TabBanner, type TabStatus, type VersionChip, type VersionInfo,
+  type VersionRow, type VersionStub, type VersionsState,
 } from "./contract";
 import {
-  buildNewFile, completeParts, contentOfDraft, draftOf, makeRevision, mergeRevisionId, newAnalysisId, newDocKey,
-  newRevisionId, openFile, partsNotIn, partsOf, pruneSnapshots, relationOf, revisionOf, roundTrip, sectionsOf, summaryOf,
+  buildNewFile, completeParts, contentOfDraft, contentOfSections, draftOf, makeRevision, mergeRevisionId, newAnalysisId, newDocKey,
+  newRevisionId, openFile, partsNotIn, partsOf, relationOf, revisionOf, revisionSections, roundTrip, sectionsOf,
   unionManifests, versionInfo, withAbsentSnapshotsDropped, withRevision, isStrictAncestor, type Author, type BuiltParts,
 } from "./docCodec";
-import { fileStem, isAncestorOrSelf, parentDir, type GraphFileData, type Manifest, type Revision } from "./format";
+import { SECTION_NAMES, fileStem, isAncestorOrSelf, parentDir, type GraphFileData, type Manifest, type Revision, type SectionName } from "./format";
+import { applyChoices, combine, combineDelayMs as defaultCombineDelayMs, combineRevision } from "./graphMerge";
+import { layoutLanes } from "./laneGraph";
+import { applyRetention } from "./retention";
+import {
+  findBase, isAncestorOrSelf as isAncestorOrSelfIn, lowestCommonAncestors, relation, snapshotPool, survivorPath, unionRevisions,
+} from "./revisions";
+import { compareSections, displaySummary, summaryText } from "./summaries";
 import { isExported, libraryStatus, rowContent, runExport, type LibraryApi } from "./libraryExport";
 import { cloudServiceOf, folderLabel, graphPath, isConflictCopyName, isTempLocation, safeFileName, withGraphExt } from "./paths";
 
@@ -48,7 +58,7 @@ export interface Timers {
 
 export interface SessionDeps {
   /** null: chosen in init() (Tauri → Rust commands, else the browser preview's simulated disk). */
-  backend: FileBackendP1 | null;
+  backend: FileBackendP2 | null;
   /** null: detected in init(). */
   desktop: boolean | null;
   graph: GraphStoreApi;
@@ -65,10 +75,52 @@ export interface SessionDeps {
   /** Browser window hooks (focus / blur / beforeunload); null in tests. */
   window: Pick<Window, "addEventListener"> | null;
   /** Preview backend factory (lazy, so the desktop build never makes the simulated world). */
-  makePreviewBackend: (() => Promise<{ backend: FileBackendP1; persistNow(): void }>) | null;
+  makePreviewBackend: (() => Promise<{ backend: FileBackendP2; persistNow(): void }>) | null;
   /** Is the Graphs tool on screen? The File menu's document commands only act when it is
    *  (otherwise they bring it forward first). */
   graphsVisible(): boolean;
+  /** Phase 2 (§5.7): is something being edited that newer content must not interrupt (a cell editor,
+   *  a mouse button held down, an open menu / list / popover / dialog)? Default: looked up in the page. */
+  interactionBusy(): boolean;
+  /** Phase 2: the device-ordered wait before an automatic combine is written (default graphMerge.combineDelayMs). */
+  combineDelayMs(deviceId: string): Promise<number>;
+}
+
+// Mouse button and typing state for domInteractionBusy (listeners added once, on first use).
+let pointerDown = false;
+let pointerHooked = false;
+let lastTyping = Number.NEGATIVE_INFINITY;
+let composing = false;
+/** A focused field counts as "being edited" only this long after the last key or input in it. */
+export const TYPING_QUIET_MS = 2000;
+function hookPointer(): void {
+  if (pointerHooked || typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+  pointerHooked = true;
+  window.addEventListener("pointerdown", (e) => { if ((e as PointerEvent).button === 0) pointerDown = true; }, true);
+  for (const ev of ["pointerup", "pointercancel", "blur"]) window.addEventListener(ev, () => { pointerDown = false; }, true);
+  for (const ev of ["keydown", "input", "paste", "cut"]) window.addEventListener(ev, () => { lastTyping = Date.now(); }, true);
+  window.addEventListener("compositionstart", () => { composing = true; lastTyping = Date.now(); }, true);
+  window.addEventListener("compositionend", () => { composing = false; lastTyping = Date.now(); }, true);
+  window.addEventListener("blur", () => { composing = false; }, true);
+}
+
+/** Phase 2 §5.7: a primary mouse button down; an open menu, list box, popover or dialog; or a field inside
+ *  the Graphs region (input / textarea / contenteditable) that is being typed in: focused, the window has
+ *  the keyboard, and a key or input came within TYPING_QUIET_MS (or an input method is composing). A field
+ *  that merely has the caret is not busy: the data grid keeps its cells focused after every committed value,
+ *  and holding back newer versions for as long as the caret rests there would turn edits made one after the
+ *  other on two computers into a choice. */
+export function domInteractionBusy(): boolean {
+  if (typeof document === "undefined") return false;
+  hookPointer();
+  if (pointerDown) return true;
+  const region = document.querySelector('[role="region"][aria-label="Graphs"]');
+  const a = document.activeElement as HTMLElement | null;
+  if (a && region && region.contains(a) && (a.tagName === "INPUT" || a.tagName === "TEXTAREA" || a.isContentEditable)) {
+    const focused = typeof document.hasFocus !== "function" || document.hasFocus();
+    if (focused && (composing || Date.now() - lastTyping < TYPING_QUIET_MS)) return true;
+  }
+  return !!document.querySelector('[role="menu"], [role="listbox"], [role="dialog"], .MuiPopover-root');
 }
 
 /** The Graphs tool's region is shown (tools stay mounted, hidden, when another one is on screen). */
@@ -138,6 +190,8 @@ interface Working {
   /** My working copy as a real revision (parents: [base]). */
   rev: Revision;
   manifest: Manifest;
+  /** Parts of versions taken in from this computer's saved copies (carry_heads), sent with the save. */
+  extraParts?: Record<string, string>;
   /** Built from the store: its editSerial then (undefined: built from the tab's kept changes). */
   serial: number | undefined;
   /** Built from the kept changes: which write of them it was (Internal.draftSeq). */
@@ -148,6 +202,47 @@ interface ConflictCtx extends Working {
   theirs: GraphFileData;
   base: string | null;
 }
+
+/** Everything one combine needs (phase 2 contract §5.4), kept while its dialog is open. */
+interface CombineCtx {
+  key: string;
+  source: CombineSource;
+  origin: "save" | "banner" | "poll";
+  /** My side: the tab's base R (clean) or my working copy W (unsaved changes). */
+  mineRev: Revision;
+  /** A file holding mineRev (its manifest and at least its parts). */
+  mineFile: GraphFileData;
+  /** R: the base of the tab when this was put together. */
+  mineBase: string | null;
+  working: Working | null;
+  /** The store's editSerial / the kept-changes write it was built from (7.1). */
+  serial: number | undefined;
+  draftSeq: number;
+  theirsFile: GraphFileData;
+  theirsRev: Revision;
+  /** Saved copies of this computer read while looking for the common version. */
+  extra: GraphFileData[];
+  base: BaseChoice;
+  baseId: string | null;
+  plan: CombinePlan;
+  choices: Partial<Record<SectionName, SidePick>>;
+  /** Extra copies still to combine after this one ("Copy 2 of 3"). */
+  queue: string[];
+  index: number;
+  total: number;
+  /** The banner that led here (shown again on Cancel). */
+  fromBanner: TabBanner | null;
+}
+
+type Prepared =
+  | { kind: "plan"; ctx: CombineCtx }
+  | { kind: "notDiverged"; relation: "same" | "older" | "newer"; theirs: GraphFileData }
+  | { kind: "fallback"; theirs: GraphFileData; working: Working | null; mineFile: GraphFileData | null }
+  | { kind: "unreadable" } | { kind: "tooNew" } | { kind: "failed" }
+  /** The extra copy is no longer there (removed or combined on another computer). */
+  | { kind: "gone" };
+
+interface Held { attempt: () => Promise<void>; timer: unknown }
 
 interface Internal {
   manifest: Manifest | null;
@@ -170,30 +265,82 @@ interface Internal {
   draftSeq: number;
   /** The store's editSerial when the kept changes were last written from the store (undefined: not from the store). */
   draftSerialAt: number | undefined;
+  // ── phase 2 ──
+  /** Files this computer saved beside the file because it could not be checked (session `asides`). */
+  asides: string[];
+  /** Heads dropped by "Use the earlier version" whose history the next save takes into the file. */
+  carryHeads: string[];
+  /** An automatic combine is waiting (session `combine_pending`). */
+  combinePending: { theirs: string; source: "disk" | "journal" } | null;
+  autoTimer: unknown;
+  /** A combine of this tab is being prepared or written (poll events wait for it). */
+  combining: number;
+  /** The open combine dialog's context. */
+  combine: CombineCtx | null;
+  /** What the last combine of this tab was with (notSaved → Choose… reopens it). */
+  lastSource: CombineSource | null;
+  /** Banner id → the combine source it stands for. */
+  bannerSource: Map<string, CombineSource>;
+  /** Content held back while something is being edited (§5.7). */
+  held: Held | null;
+  /** My head from before the last combine (Undo on the combined banner). */
+  preCombineHead: string | null;
+  /** A change of the file arrived while a combine was busy: looked at once it is done. */
+  recheck: boolean;
+  /** Times a combine with an extra copy went back to take in the tab's own file first (bounded). */
+  catchUps: number;
+  /** The last working copy built (reused while its content and base are the same). */
+  lastWorking: Working | null;
+  /** Older copies answered "Keep": the head each had then (asked again once it has changes of its own). */
+  keptHeads: Record<string, string>;
 }
 
 const newInternal = (p: Partial<Internal> = {}): Internal => ({
   manifest: null, acceptedHead: null, knownCopies: [], copyAnswer: {}, settled: [], template: null, sample: false,
   conflict: null, retry: null, firstTry: 0, waitedCloud: false, hasDraft: false, bannerData: new Map(), seenCopies: [],
-  draftSeq: 0, draftSerialAt: undefined, ...p,
+  draftSeq: 0, draftSerialAt: undefined,
+  asides: [], carryHeads: [], combinePending: null, autoTimer: null, combining: 0, combine: null, lastSource: null,
+  bannerSource: new Map(), held: null, preCombineHead: null, recheck: false, catchUps: 0, lastWorking: null, keptHeads: {}, ...p,
 });
+
+/** The Versions row of my last save while another computer's save has replaced it (not in the file yet). */
+export const PENDING_SUMMARY = "Your last save — not in the file yet";
+/** The same row when that version was saved by another computer (shown in this tab, gone from the file). */
+export const PENDING_SUMMARY_OTHER = "Shown in this tab — not in the file now";
 
 const CARD_KINDS: readonly TabStatus[] = ["waiting", "downloading", "missing", "permission", "unreadable"];
 const isCard = (s: TabStatus) => CARD_KINDS.includes(s);
 const iso = (t: number) => new Date(t).toISOString();
 const asTemplate = (t: unknown): Template | null => (t === "column" || t === "grouped" || t === "xy" ? t : null);
 
-export type FileSessionStore = UseBoundStore<StoreApi<FileSessionState>> & {
+export type FileSessionStore = UseBoundStore<StoreApi<FileSessionStateP2>> & {
   /** Test and simulator access to controller internals (not for the UI). */
   internal: {
     deps: SessionDeps;
-    backend(): FileBackendP1 | null;
+    backend(): FileBackendP2 | null;
     manifestOf(key: string): Manifest | null;
     knownCopies(key: string): string[];
     acceptedHead(key: string): string | null;
     flushDraftNow(): Promise<void>;
+    // phase 2
+    carryHeads(key: string): string[];
+    asides(key: string): string[];
+    settled(key: string): string[];
+    seen(): SeenMap;
+    flushSeenNow(): Promise<void>;
   };
 };
+
+/** "Alice (Office iMac)", "you on Office iMac", "another computer" (the undo step's label, §6.3). */
+function whoLabel(v: VersionInfo): string {
+  const user = v.userName.trim();
+  const dev = v.deviceName.trim();
+  if (v.mine) return dev ? `you on ${dev}` : "you";
+  if (user && dev) return `${user} (${dev})`;
+  if (user) return user;
+  if (dev) return `someone on ${dev}`;
+  return "another computer";
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -214,10 +361,12 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       return { backend: p.device, persistNow: p.persistNow };
     },
     graphsVisible: domGraphsVisible,
+    interactionBusy: domInteractionBusy,
+    combineDelayMs: defaultCombineDelayMs,
     ...partial,
   };
   const graph = deps.graph;
-  let backend: FileBackendP1 = deps.backend as FileBackendP1;
+  let backend: FileBackendP2 = deps.backend as FileBackendP2;
   let desktop = !!deps.desktop;
   let info: AppInfo = { appVersion: "", platform: "macos", homeDir: "", tempDirs: [], stateDir: null, debug: false };
   let device: DeviceIdentity | null = null;
@@ -245,7 +394,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   // eslint-disable-next-line prefer-const
   let store: FileSessionStore;
   const get = () => store.getState();
-  const set = (p: Partial<FileSessionState>) => store.setState(p);
+  const set = (p: Partial<FileSessionStateP2>) => store.setState(p);
 
   // ── small helpers ──
 
@@ -273,11 +422,61 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   /** Every file read goes through here: older versions whose content isn't in the file are marked as not stored. */
   async function readFile(path: string): Promise<ReadResult> {
     const r = await backend.read(path);
+    if (r.ok) noteSeen(r.file.manifest);
     return r.ok ? { ...r, file: withAbsentSnapshotsDropped(r.file) } : r;
   }
   async function readJournalFile(analysisId: string, revisionId: string): Promise<GraphFileData | null> {
-    const f = await backend.readJournal(analysisId, revisionId);
+    const f = await quietly(backend.readJournal(analysisId, revisionId), null);
+    if (f) noteSeen(f.manifest);
     return f ? withAbsentSnapshotsDropped(f) : null;
+  }
+
+  // ── phase 2: the first-seen record and retention (§3.3, §5.2) ──
+
+  let seen: SeenMap = emptySeenMap();
+  let seenTimer: unknown = null;
+  let seenDirty = false;
+
+  /** Every version id of `m` this computer has not seen before is seen now. */
+  function noteSeen(m: Manifest | null | undefined): void {
+    if (!m || typeof m.analysis_id !== "string" || !m.analysis_id || !Array.isArray(m.revisions)) return;
+    const aid = m.analysis_id;
+    let rec = seen.analyses[aid];
+    const t = now();
+    let added = false;
+    for (const r of m.revisions) {
+      if (!r || typeof r.id !== "string") continue;
+      if (!rec) { rec = {}; seen.analyses[aid] = rec; }
+      if (!Object.prototype.hasOwnProperty.call(rec, r.id)) { rec[r.id] = t; added = true; }
+    }
+    if (!added || !rec) return;
+    const ids = Object.keys(rec);
+    if (ids.length > LIMITS_P2.seenPerAnalysis) {
+      ids.sort((a, b) => rec![a] - rec![b] || (a < b ? -1 : 1));
+      for (const id of ids.slice(0, ids.length - LIMITS_P2.seenPerAnalysis)) delete rec[id];
+    }
+    seenDirty = true;
+    if (seenTimer) deps.timers.clearTimeout(seenTimer);
+    seenTimer = deps.timers.setTimeout(() => { seenTimer = null; void flushSeen(); }, LIMITS_P2.seenDebounceMs);
+  }
+
+  async function flushSeen(): Promise<void> {
+    if (seenTimer) { deps.timers.clearTimeout(seenTimer); seenTimer = null; }
+    if (!seenDirty || !backend) return;
+    seenDirty = false;
+    await quietly(backend.writeSeen(JSON.parse(JSON.stringify(seen)) as SeenMap), undefined);
+  }
+
+  /** A manifest about to be written, through the retention rules (with this computer's first-seen times,
+   *  its unconfirmed saved copies and the versions being worked with). */
+  async function retain(m: Manifest, pinned: (string | null | undefined)[] = []): Promise<Manifest> {
+    noteSeen(m);
+    const heads = await quietly(backend.journalHeads(m.analysis_id), [] as JournalHead[]);
+    return applyRetention(m, {
+      now: now(), firstSeen: seen.analyses[m.analysis_id] ?? {}, beaconHeads: [],
+      unconfirmedHeads: heads.filter((j) => !j.confirmed).map((j) => j.revision_id),
+      pinned: pinned.filter((x): x is string => typeof x === "string" && !!x),
+    });
   }
 
   /** Write a tab's kept changes (and remember which write it was). */
@@ -314,7 +513,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     permission: ["openPrivacy", "retry"], missing: ["findIt", "saveAs"], replaced: ["saveAs"], saveFailed: ["retry", "dismiss"],
     notSaved: ["choose"], savedAside: ["dismiss"], savedOver: ["openCopy", "dismiss"], savedDisplaced: ["openCopy", "dismiss"],
     tookTheirs: ["openCopy", "dismiss"], draftMismatch: ["openAsNew", "discardDraft"], copyQuestion: ["separate", "same"],
-    tempLocation: ["chooseLocation"], rolledBack: ["useEarlier", "backToLatest"], newerOnDisk: ["choose", "later"],
+    tempLocation: ["chooseLocation"], rolledBack: ["useEarlier", "backToLatest"], newerOnDisk: ["combine", "later"],
+    combined: ["whatChanged", "undo"],
     newerCopy: ["updateMine", "later"], olderCopy: ["openThatOne", "later"], recovered: ["dismiss"],
   };
 
@@ -351,7 +551,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       const prev = get().dialog;
       const r = dialogResolve;
       dialogResolve = null;
-      if (prev && (prev.kind === "saveAsKind" || prev.kind === "closeDirty" || prev.kind === "quit")) r({ kind: prev.kind, choice: "cancel" } as DialogAnswer);
+      if (prev && (prev.kind === "saveAsKind" || prev.kind === "closeDirty" || prev.kind === "quit" || prev.kind === "bringBackDirty")) r({ kind: prev.kind, choice: "cancel" } as DialogAnswer);
     }
     set({ dialog: d });
     return new Promise((resolve) => { dialogResolve = resolve; });
@@ -379,10 +579,47 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
 
   // ── session, recent, menu ──
 
+  // ── what this computer decided about a file, kept after its tab is closed (phase 2) ──
+
+  const MEMO_FILES = 100;
+  const MEMO_HEADS = 200;
+  const fileMemo = new Map<string, FileMemo>();
+  const capHeads = (l: string[]) => l.slice(-MEMO_HEADS);
+
+  /** A tab's decisions into the per-file record. */
+  function rememberTab(key: string): void {
+    const t = tabOf(key);
+    const i = internal.get(key);
+    if (!t?.path || !t.analysisId || !i) return;
+    // The tab started from the file's record (seedFromMemo), so its own list is the whole of it now.
+    const settled = capHeads([...new Set(i.settled)]);
+    const rec: FileMemo = {
+      analysis_id: t.analysisId,
+      ...(settled.length ? { settled_heads: settled } : {}),
+      ...(i.acceptedHead ? { accepted_head: i.acceptedHead } : {}),
+      ...(i.carryHeads.length ? { carry_heads: [...i.carryHeads] } : {}),
+    };
+    fileMemo.delete(t.path);
+    if (rec.settled_heads || rec.accepted_head || rec.carry_heads) fileMemo.set(t.path, rec);
+    while (fileMemo.size > MEMO_FILES) fileMemo.delete(fileMemo.keys().next().value as string);
+  }
+
+  /** A tab opened on a file starts from what was decided about it before. */
+  function seedFromMemo(key: string, path: string, aid: string | null): void {
+    const m = fileMemo.get(path);
+    if (!m || !aid || m.analysis_id !== aid) return;
+    const i = it(key);
+    i.settled = capHeads([...new Set([...(m.settled_heads ?? []), ...i.settled])]);
+    if (!i.acceptedHead && m.accepted_head) i.acceptedHead = m.accepted_head;
+    for (const h of m.carry_heads ?? []) if (!i.carryHeads.includes(h)) i.carryHeads = [...i.carryHeads, h];
+  }
+
   function buildSession(): GraphSession {
     const { tabs, activeKey } = get();
+    for (const t of tabs) rememberTab(t.key);
     return {
       v: 1,
+      ...(fileMemo.size ? { files: Object.fromEntries(fileMemo) } : {}),
       tabs: tabs.map((t): SessionTab => {
         const i = it(t.key);
         return {
@@ -394,6 +631,10 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
           ...(Object.keys(i.copyAnswer).length ? { copy_answer: { ...i.copyAnswer } } : {}),
           ...(i.settled.length ? { settled_heads: [...i.settled] } : {}),
           ...(i.seenCopies.length ? { seen_copies: [...i.seenCopies] } : {}),
+          ...(i.asides.length ? { asides: [...i.asides] } : {}),
+          ...(i.carryHeads.length ? { carry_heads: [...i.carryHeads] } : {}),
+          ...(i.combinePending ? { combine_pending: { ...i.combinePending } } : {}),
+          ...(Object.keys(i.keptHeads).length ? { kept_heads: { ...i.keptHeads } } : {}),
         };
       }),
     };
@@ -681,6 +922,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         status: "ready", analysisId: m.analysis_id, baseRevision: head, readOnly: r.readOnly, template: c.doc.template,
         folderLabel: labelOf(t.path), service: serviceOf(t.path),
       });
+      // A "saved a newer version" note for the version just loaded is answered (the draft check below adds
+      // one again when kept changes sit on an older version).
+      removeBanners(key, (b) => b.kind === "newerOnDisk" && (!b.version?.head || b.version.head === head || isAncestorOrSelf(m, b.version.head, head)));
       if (draft) applied = await applyDraft(key, draft, m);
     } finally { suppress--; }
     i.hasDraft = applied === "same" || applied === "older";
@@ -779,8 +1023,10 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     return true;
   }
 
-  /** The journal check (contract §4.8, plan §8). */
-  async function invariantCheck(key: string, m: Manifest): Promise<"ok" | "rolledBack" | "savedOver"> {
+  /** The journal check (plan §8; phase 2 contract §5.5 table B). "diverged": another computer's save
+   *  replaced the version this tab is based on (table A decides); "journal": a combine with my replaced
+   *  save was started or offered. */
+  async function invariantCheck(key: string, m: Manifest): Promise<"ok" | "rolledBack" | "diverged" | "journal"> {
     const t = tabOf(key);
     if (!t?.path) return "ok";
     const i = it(key);
@@ -788,11 +1034,20 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const settled = new Set(i.settled);
     const open = heads.filter((j) => !j.confirmed && j.revision_id !== m.head && !settled.has(j.revision_id))
       .sort((a, b) => a.first_seen - b.first_seen);
-    const j = open[open.length - 1];
+    // A head already in the file's history (taken in by "Use the earlier version" then Save, or kept as a side
+    // branch) is in the file: nothing is lost and nothing to ask.
+    const open2 = open.filter((x) => !revisionOf(m, x.revision_id));
+    const j = open2[open2.length - 1];
     if (!j) return "ok";
     if (isAncestorOrSelf(m, j.revision_id, m.head)) return "ok";
     const jf = await readJournalFile(m.analysis_id, j.revision_id);
-    if (jf && isAncestorOrSelf(jf.manifest, m.head, j.revision_id)) {
+    if (!jf) {
+      // Its content is gone from this computer too: nothing to combine.
+      i.settled = [...i.settled, j.revision_id];
+      await saveSession();
+      return "ok";
+    }
+    if (isAncestorOrSelf(jf.manifest, m.head, j.revision_id)) {
       if (m.head === i.acceptedHead) return "ok";
       const b = addBanner(key, {
         id: "rolledBack", kind: "rolledBack", version: vi(m, m.head), when: revisionOf(m, m.head)?.time,
@@ -800,26 +1055,16 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       if (b) i.bannerData.set(b.id, j.revision_id);
       return "rolledBack";
     }
-    // Another computer saved over my save: keep mine beside the file (unless a copy there already holds it,
-    // e.g. the sync service's conflicted copy).
-    if (jf) {
-      const scan = await quietly(backend.scanDir(parentDir(t.path)), null);
-      const existing = scan && scan.ok
-        ? scan.entries.find((e) => e.path !== t.path && e.header?.analysis_id === m.analysis_id && e.header.head === j.revision_id)?.path ?? null
-        : null;
-      const jr = revisionOf(jf.manifest, j.revision_id);
-      const label = !jr || jr.device_id === device?.device_id
-        ? `(my version from ${device?.device_name || "this computer"})`
-        : `(version from ${jr.device_name || "another computer"})`;
-      const copy = existing ?? await writeCopyBeside(t.path, label, jf);
-      if (copy) {
-        i.knownCopies = [...i.knownCopies, copy];
-        addBanner(key, { kind: "savedOver", name: fileStem(copy), path: copy });
-      }
-    }
-    i.settled = [...i.settled, j.revision_id];
-    await saveSession();
-    return "savedOver";
+    // Another computer's save replaced mine. When the tab is not on the version on disk (or a newer one),
+    // table A combines the tab's version with it first; my replaced save comes after that.
+    if (j.revision_id === t.baseRevision) return "diverged";
+    const R = t.baseRevision;
+    const known = unionRevisions(m, ...(i.manifest ? [i.manifest] : []));
+    if (!R || !isAncestorOrSelfIn(known, m.head, R)) return "diverged";
+    const source: CombineSource = { kind: "journal", revisionId: j.revision_id };
+    if (!tabDirty(key)) await autoCombine(key, source);
+    else chooseBanner(key, source, vi(jf.manifest, j.revision_id));
+    return "journal";
   }
 
   /** A free "<stem> <suffix>.lag" beside `path`. */
@@ -851,19 +1096,35 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   async function handleSibling(key: string, sib: string): Promise<void> {
     const t = tabOf(key);
     const i = it(key);
-    if (!t?.path || i.knownCopies.includes(sib)) return;
+    if (!t?.path) return;
+    if (i.knownCopies.includes(sib)) {
+      // A copy kept as it was: quiet while it still has nothing this file lacks.
+      const kept = i.keptHeads[sib];
+      if (!kept) return;
+      const h = await quietly(backend.header(sib), null);
+      if (!h || !h.ok) return;
+      const head = h.header.head;
+      const known = i.manifest ? unionRevisions(i.manifest) : [];
+      if (head === kept || (t.baseRevision && isAncestorOrSelfIn(known, head, t.baseRevision))) return;
+      i.knownCopies = i.knownCopies.filter((p) => p !== sib);
+      const { [sib]: _k, ...rest } = i.keptHeads;
+      i.keptHeads = rest;
+      void saveSession();
+    }
     if (!i.seenCopies.includes(sib)) {
       // A copy, remembered across restarts: never taken for this file renamed.
       i.seenCopies = [...i.seenCopies, sib].slice(-50);
       void saveSession();
     }
     const r = await readFile(sib);
-    if (!r.ok) return;
+    if (!r.ok) { if (r.code === "NotFound") forgetCopy(key, sib); return; }
     const mine = i.manifest ?? (t.analysisId && t.baseRevision ? (await readJournalFile(t.analysisId, t.baseRevision))?.manifest ?? null : null);
     if (!mine || !t.baseRevision || r.file.manifest.analysis_id !== t.analysisId) return;
     const relation = relationOf(mine, t.baseRevision, r.file.manifest, r.file.manifest.head);
-    const conflictName = isConflictCopyName(sib, fileStem(t.path));
-    if (!conflictName && !i.copyAnswer[sib]) {
+    // Files this computer saved beside it (could not be checked) count as sync-conflict copies (§5.5 C).
+    const conflictName = isConflictCopyName(sib, fileStem(t.path)) || i.asides.includes(sib);
+    // An older copy needs no question: everything in it is in this file (plan §9.4 "older copy → Remove it / Keep").
+    if (!conflictName && !i.copyAnswer[sib] && relation !== "older") {
       addBanner(key, { id: `copy:${sib}`, kind: "copyQuestion", name: t.title, path: sib, folderLabel: labelOf(sib) });
       return;
     }
@@ -874,9 +1135,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     addBanner(key, {
       id: `copy:${sib}`, kind: "extraCopy", name: fileStem(sib), path: sib, folderLabel: labelOf(sib), relation,
       version: vi(f.manifest, f.manifest.head),
-      // A strictly newer copy (a colleague's edited copy saved next to mine) can be taken into my file.
-      actions: relation === "older" || relation === "same" ? ["dismiss"] : relation === "newer" ? ["updateMine", "notSame", "later"] : ["notSame", "later"],
+      // Older / same: it can be removed (moved into the app's folder) or kept. A strictly newer copy (a
+      // colleague's edited copy saved next to mine) can be taken into my file; a diverged one combined.
+      actions: relation === "older" || relation === "same" ? ["remove", "keep"] : relation === "newer" ? ["updateMine", "notSame", "later"] : ["combine", "notSame", "later"],
+      dismissible: true,
     });
+    if (relation === "diverged") it(key).bannerSource.set(`copy:${sib}`, { kind: "copy", path: sib });
+    touchVersions(key);
   }
 
   /** "Update my file with it" on a newer copy beside the open file: its versions are saved over my file
@@ -923,7 +1188,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const aid = newAnalysisId();
     const rev: Revision = {
       ...makeRevision({
-        id: newRevisionId(now()), parents: [m.head], kind: "save", time: now(), author: author(), summary: "Made a separate analysis.",
+        id: newRevisionId(now()), parents: [m.head], kind: "save", time: now(), author: author(), summary: SUMMARY.separated,
         parts: { refs: head.sections!, texts: {}, contentHash: head.content_hash },
       }),
     };
@@ -952,8 +1217,20 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
 
   // ── poll events (contract §4.7) ──
 
+  /** Banners about extra copies that are no longer there (removed or combined on another computer) go quietly. */
+  async function dropGoneCopies(key: string): Promise<void> {
+    const t = tabOf(key);
+    if (!t) return;
+    for (const b of t.banners) {
+      if ((b.kind !== "extraCopy" && b.kind !== "copyQuestion") || !b.path) continue;
+      const h = await quietly(backend.header(b.path), null);
+      if (h && !h.ok && h.code === "NotFound") forgetCopy(key, b.path);
+    }
+  }
+
   async function onFileEvent(e: FileEvent): Promise<void> {
     if (e.type === "presence") return;
+    if (e.type !== "moved") { const t0 = tabByPath(e.path); if (t0) await dropGoneCopies(t0.key); }
     if (e.type === "moved") {
       const t = tabByPath(e.from);
       if (!t) {
@@ -1000,54 +1277,107 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
   }
 
-  /** The file at a tab's path has head H (changed / back / moved). */
+  /** The file at a tab's path has head H (changed / back / moved): phase 2 contract §5.5 table A. */
   async function onHead(key: string, _h: string): Promise<void> {
     const t = tabOf(key);
     if (!t?.path || t.saving || isCard(t.status) || t.status === "opening") return;
+    const i = it(key);
+    // A combine of this tab is waiting, running or open: the file is looked at again once it is done.
+    if (i.autoTimer || i.combining > 0 || i.combine || savesInFlight.has(key)) { i.recheck = true; return; }
     const serial0 = graph.getState().editSerial;
     const base0 = t.baseRevision;
     const r = await readFile(t.path);
     if (!r.ok) return;
     const t1 = tabOf(key);
     if (!t1 || t1.saving || t1.path !== t.path) return;
+    if (i.autoTimer || i.combining > 0 || i.combine) { i.recheck = true; return; }
     const m = r.file.manifest;
     const H = m.head;
     if (m.analysis_id !== t1.analysisId) return;
+    // A "put back to an earlier version" note no longer fits once the file moved on from that earlier version
+    // (another computer saved on top of it): the routing below decides again.
+    const rb = t1.banners.find((b) => b.kind === "rolledBack");
+    const rbHead = rb ? i.bannerData.get(rb.id) : undefined;
+    if (rb && rbHead && H !== rb.version?.head) {
+      const jm = await readJournalFile(m.analysis_id, rbHead);
+      if (!jm || !isAncestorOrSelfIn(unionRevisions(m, jm.manifest), H, rbHead)) removeBanners(key, (b) => b.id === rb.id);
+    }
     if (H === t1.baseRevision) {
-      it(key).manifest = m;
+      i.manifest = m;
+      cancelHeld(key);
       removeKinds(key, ["newerOnDisk"]);
       return;
     }
     const inv = await invariantCheck(key, m);
-    if (inv === "rolledBack") return;
-    const i = it(key);
-    const loaded = isLoaded(key);
+    if (inv === "rolledBack" || inv === "journal") return;
+    const R = tabOf(key)?.baseRevision ?? null;
+    if (!R) return;
+    const mineM = i.manifest ?? (t1.analysisId ? (await readJournalFile(t1.analysisId, R))?.manifest ?? null : null);
+    const revs = unionRevisions(m, ...(mineM ? [mineM] : []));
+    const rel = relation(revs, R, H);
+    if (rel === "same" || rel === "older") return;      // older: the journal check above shows a rollback
     const dirty = tabDirty(key);
-    if (!dirty) {
-      if (loaded) {
-        const s = graph.getState();
-        if (s.editSerial !== serial0 || s.file?.baseRevision !== base0) {
-          addBanner(key, { kind: "newerOnDisk", version: vi(m, H) });
-          return;
-        }
-        const c = openFile(r.file);
-        if (!c) return;
-        suppress++;
-        try {
-          deps.flushScratch({ commitEdit: false });
-          graph.getState().loadFile({
-            file: { docKey: key, analysisId: m.analysis_id, baseRevision: H, path: t1.path }, name: t1.title, ...c, saved: true, inPlace: true,
-          });
-        } finally { suppress--; }
-      }
+    if (rel === "newer") {
+      if (!dirty) { await showNewer(key, r, serial0, base0); return; }
+      addBanner(key, { kind: "newerOnDisk", version: vi(m, H), actions: ["combine", "later"] });
+      i.bannerSource.set("newerOnDisk", { kind: "disk" });
+      return;
+    }
+    // Diverged: another computer's save replaced the version this tab is based on.
+    if (!dirty) { await autoCombine(key, { kind: "disk" }); return; }
+    chooseBanner(key, { kind: "disk" }, vi(m, H));
+  }
+
+  /** Table A "newer" on a clean tab: the version on disk is shown in place (held back while something is
+   *  being edited); a background tab's base just moves. */
+  async function showNewer(key: string, r: Extract<ReadResult, { ok: true }>, serial0: number, base0: string | null): Promise<void> {
+    const t = tabOf(key)!;
+    const m = r.file.manifest;
+    const H = m.head;
+    const i = it(key);
+    if (!isLoaded(key)) {
       i.manifest = m;
       patchTab(key, { baseRevision: H, readOnly: r.readOnly, dirty: false });
       removeKinds(key, ["newerOnDisk", "rolledBack"]);
-      if (loaded && inv !== "savedOver") toast({ tone: "info", kind: "reloaded", version: vi(m, H) });
       await saveSession();
       return;
     }
-    addBanner(key, { kind: "newerOnDisk", version: vi(m, H) });
+    const c = openFile(r.file);
+    if (!c) return;
+    const path = t.path!;
+    await applyWhenFree(key, async () => {
+      if (!isLoaded(key)) {
+        // The tab was left while this waited: a background tab without kept changes just moves on.
+        const tb = tabOf(key);
+        if (!tb) return;
+        if (!tb.dirty && !it(key).hasDraft && tb.baseRevision === base0) {
+          it(key).manifest = m;
+          patchTab(key, { baseRevision: H, readOnly: r.readOnly, dirty: false });
+          removeKinds(key, ["newerOnDisk", "rolledBack"]);
+          await saveSession();
+        } else if (tb.baseRevision !== H) {
+          addBanner(key, { kind: "newerOnDisk", version: vi(m, H), actions: ["combine", "later"] });
+          it(key).bannerSource.set("newerOnDisk", { kind: "disk" });
+        }
+        return;
+      }
+      const ok = replaceInPlace(key, { content: c, head: H, manifest: m, path, expectedBase: base0, expectedSerial: serial0, readOnly: r.readOnly });
+      if (!ok) {
+        // Something was typed meanwhile: it stays; the newer version is offered.
+        if (tabOf(key)?.baseRevision !== H) {
+          addBanner(key, { kind: "newerOnDisk", version: vi(m, H), actions: ["combine", "later"] });
+          it(key).bannerSource.set("newerOnDisk", { kind: "disk" });
+        }
+        return;
+      }
+      removeKinds(key, ["newerOnDisk", "rolledBack", "combined"]);
+      // A "Choose…" / "combining" note whose other version is in this one now is answered.
+      removeBanners(key, (b) => b.kind === "savedOver" && !!b.state && !!b.version?.head && isAncestorOrSelf(m, b.version.head, H));
+      toast({ tone: "info", kind: "reloaded", version: vi(m, H) });
+      await quietly(backend.deleteDraft(key), undefined);
+      it(key).hasDraft = false;
+      await saveSession();
+    });
   }
 
   // ── save ──
@@ -1055,6 +1385,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   async function workingOf(key: string): Promise<Working | null> {
     const t = tabOf(key)!;
     const i = it(key);
+    const reuse = i.lastWorking;
     let c: DocContent | null;
     let serial: number | undefined;
     const draftSeq = i.draftSeq;
@@ -1073,18 +1404,41 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (!manifest) return null;
     const parts = await partsOf(sectionsOf(c));
     const baseRev = revisionOf(manifest, t.baseRevision);
-    const rev = makeRevision({
+    // The same content on the same base as the working copy built last time (a Save or combine tried again):
+    // the same version, so this computer's saved copies don't fill up with copies nobody can tell apart.
+    const same = !!reuse && reuse.parts.contentHash === parts.contentHash
+      && (reuse.rev.parents[0] ?? null) === (t.baseRevision ?? null) && reuse.rev.parents.length === (t.baseRevision ? 1 : 0);
+    const rev = same ? reuse!.rev : makeRevision({
       id: newRevisionId(now()), parents: t.baseRevision ? [t.baseRevision] : [], kind: "save", time: now(), author: author(),
-      summary: summaryOf(baseRev?.sections, parts.refs), parts,
+      summary: summaryText({ kind: "save", root: !t.baseRevision, prev: baseRev?.sections, next: parts.refs }), parts,
     });
-    return { content: c, parts, rev, manifest: pruneSnapshots(withRevision(manifest, rev, author(), c.doc.template)), serial, draftSeq };
+    // Versions dropped by "Use the earlier version" come back into the file's history (§5.5 B).
+    let extraParts: Record<string, string> | undefined;
+    if (i.carryHeads.length && t.analysisId) {
+      for (const h of i.carryHeads) {
+        const jf = await readJournalFile(t.analysisId, h);
+        if (!jf || jf.manifest.analysis_id !== manifest.analysis_id) continue;
+        manifest = unionManifests(manifest, jf.manifest);
+        extraParts = { ...(extraParts ?? {}), ...jf.parts };
+      }
+    }
+    const m = await retain(withRevision(manifest, rev, author(), c.doc.template), [t.baseRevision]);
+    const w: Working = { content: c, parts, rev, manifest: m, serial, draftSeq, ...(extraParts ? { extraParts } : {}) };
+    i.lastWorking = w;
+    return w;
   }
 
-  /** Parts a save sends: those the base revision doesn't reference. */
+  /** Parts a save sends: those the base revision doesn't reference (plus versions taken in from saved copies). */
   function newPartsFor(w: Working, base: string | null): Record<string, string> {
     const baseRev = revisionOf(w.manifest, base);
     const have = new Set(baseRev?.sections ? Object.values(baseRev.sections).map((r) => r.part) : []);
-    return Object.fromEntries(Object.entries(w.parts.texts).filter(([k]) => !have.has(k)));
+    const out = Object.fromEntries(Object.entries(w.parts.texts).filter(([k]) => !have.has(k)));
+    if (w.extraParts) {
+      const used = new Set<string>();
+      for (const r of w.manifest.revisions) if (r.sections) for (const n of SECTION_NAMES) used.add(r.sections[n].part);
+      for (const [k, v] of Object.entries(w.extraParts)) if (used.has(k) && !have.has(k) && !(k in out)) out[k] = v;
+    }
+    return out;
   }
 
   /** One save per tab at a time: a second Save while one runs gets the running one's outcome
@@ -1096,6 +1450,14 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const run = saveOnce(key).finally(() => { if (savesInFlight.get(key) === run) savesInFlight.delete(key); });
     savesInFlight.set(key, run);
     return run;
+  }
+
+  /** Save once more inside the running save (after the tab's base was moved); never loops. */
+  let againDepth = 0;
+  async function saveOnceAgain(key: string): Promise<SaveOutcome> {
+    if (againDepth > 0) return { ok: false, reason: "conflict" };
+    againDepth++;
+    try { return await saveOnce(key); } finally { againDepth--; }
   }
 
   async function saveOnce(key: string): Promise<SaveOutcome> {
@@ -1110,6 +1472,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
     if (t.readOnly) { addBanner(key, { kind: "tooNew" }); return { ok: false, reason: "failed" }; }
     if (isCard(t.status) || t.status === "opening") return { ok: false, reason: "failed" };
+    // A combine nobody asked for is waiting: Save does it now (§5.4.1).
+    const i0 = it(key);
+    if (i0.autoTimer || (i0.combinePending && !tabDirty(key))) {
+      const src: CombineSource = i0.combinePending?.source === "journal" ? { kind: "journal", revisionId: i0.combinePending.theirs } : { kind: "disk" };
+      cancelAuto(key);
+      if (!tabDirty(key)) return startCombineCore(key, src, "save", {});
+    }
     if (!loaded && !t.dirty) return { ok: false, reason: "nothing" };
     if (loaded && graph.getState().scratch.length > SCRATCH_LIMIT) {
       addBanner(key, { kind: "saveFailed", message: "The Scratchpad is too large to save. Clear some cells, then try again." });
@@ -1150,8 +1519,14 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         }
         const path = res.path;
         const title = fileStem(path);
+        if (w.extraParts) i.carryHeads = [];
         patchTab(key, { baseRevision: res.head, notSaved: false });
-        removeKinds(key, ["saveFailed", "notSaved", "newerOnDisk", "missing", "savedAside", "replaced", "rolledBack", "recovered", "tookTheirs"]);
+        // The note about an earlier combine goes with the next save (its Undo would no longer mean that combine).
+        removeKinds(key, ["saveFailed", "notSaved", "newerOnDisk", "missing", "savedAside", "replaced", "rolledBack", "recovered", "tookTheirs", "combined"]);
+        i.lastWorking = null;
+        // A working copy set aside for a dialog earlier and now really saved is a save of mine like any other:
+        // if another computer's save replaces it later, it must be offered again.
+        if (i.settled.includes(w.rev.id)) i.settled = i.settled.filter((x) => x !== w.rev.id);
         if (isLoaded(key)) {
           graph.getState().markFileSaved({ docKey: key, analysisId: aid, baseRevision: res.head, path }, title, roundTrip(w.content), w.serial);
           const dirty = isDirty(graph.getState());
@@ -1175,29 +1550,30 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         await touchRecent(path, aid);
         await saveSession();
         toast({ tone: "success", kind: "saved", name: title });
+        touchVersions(key);
         if (res.kind === "savedButDisplaced") {
-          const j = await quietly(readJournalFile(aid, res.displacedHead), null);
+          // Another computer's save landed in the gap: combined with it (§5.5 C).
+          const D = res.displacedHead;
+          const j = await quietly(readJournalFile(aid, D), null);
           if (j) {
-            const who = revisionOf(j.manifest, res.displacedHead)?.device_name || "another computer";
-            const copy = await writeCopyBeside(path, `(version from ${who})`, j);
-            if (copy) {
-              i.knownCopies = [...i.knownCopies, copy];
-              addBanner(key, { kind: "savedDisplaced", name: fileStem(copy), path: copy, version: vi(j.manifest, res.displacedHead) });
-              await saveSession();
-            }
+            if (!tabDirty(key)) await autoCombine(key, { kind: "journal", revisionId: D });
+            else chooseBanner(key, { kind: "journal", revisionId: D }, vi(j.manifest, D));
           }
         }
+        // Files saved beside it earlier (could not be checked): extra copies now (§5.5 C, D). Copies seen before
+        // (answered "Later", or not answered) are looked at again after every save (§5.5 D).
+        for (const a of [...new Set([...i.asides, ...i.seenCopies])]) if (a !== path) await quietly(handleSibling(key, a), undefined);
         void origin;
         return { ok: true, path };
       }
       case "savedAside":
-        i.knownCopies = addUnique(i.knownCopies, res.path);
+        i.asides = addUnique(i.asides, res.path);
         addBanner(key, { kind: "savedAside", name: fileStem(res.path), path: res.path });
         if (isLoaded(key)) await writeActiveDraft(false);
         await saveSession();
         return { ok: false, reason: "failed" };
       case "conflict":
-        return enterConflict(key, w, "save");
+        return origin === "keepMine" ? enterConflict(key, w, "save") : combineOnSave(key, w, againDepth === 0);
       case "missing":
         addBanner(key, { kind: "missing", name: t.title, folderLabel: t.folderLabel, candidates: [] });
         toast({ tone: "error", kind: "error", message: "Not saved — the file can't be found. Use Find it… or save a new copy." });
@@ -1270,10 +1646,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (choice === "keepMine") {
       const kid = await mergeRevisionId([theirsHead, c.rev.id], c.parts.contentHash);
       const k: Revision = {
-        ...makeRevision({ id: kid, parents: [theirsHead, c.rev.id], kind: "merge", time: now(), author: author(), summary: "Kept this computer's version", parts: c.parts }),
+        ...makeRevision({
+          id: kid, parents: [theirsHead, c.rev.id], kind: "merge", time: now(), author: author(),
+          summary: summaryText({ kind: "merge", root: false, auto: false, prev: null, next: c.parts.refs }), parts: c.parts,
+        }),
       };
       const union = unionManifests(c.theirs.manifest, c.manifest);
-      const m = pruneSnapshots(withRevision(union, k, author(), c.content.doc.template));
+      const m = await retain(withRevision(union, k, author(), c.content.doc.template), [theirsHead, c.rev.id]);
       const done = await completeParts(m, { ...c.theirs.parts, ...c.parts.texts }, fetch);
       if (!done) { addBanner(key, { kind: "saveFailed", message: saveFailedMessage("Invalid") }); notSavedBanner(); return; }
       patchTab(key, { saving: true });
@@ -1324,8 +1703,20 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
 
     // separateCopy: mine as a new analysis in a place the person picks; this file is left as it is.
+    await separateCopyImpl(key, c);
+  }
+
+  /** "Save mine as a separate copy" / "Keep both as separate files" (source disk). */
+  async function separateCopyImpl(key: string, c0: ConflictCtx): Promise<void> {
+    let c = c0;
+    const t = tabOf(key);
+    if (!t?.path) return;
+    const aid = c.manifest.analysis_id;
+    const theirsHead = c.theirs.manifest.head;
+    const notSavedBanner = () => addBanner(key, { kind: "notSaved", version: vi(c.theirs.manifest, theirsHead) });
+    it(key).conflict = c;
     const picked = await pickPath({ mode: "save", title: "Save my version as a separate copy", suggestedName: `${safeFileName(`${t.title} (my copy)`)}.lag`, startDir: parentDir(t.path!) });
-    if (!picked) { notSavedBanner(); return; }
+    if (!picked) { notSavedBanner(); patchTab(key, { notSaved: true }); return; }
     const path = withGraphExt(picked);
     if (tabByPath(path) && tabByPath(path)!.key !== key) {
       addBanner(key, { kind: "saveFailed", message: "That file is open in another tab. Choose another name." });
@@ -1334,7 +1725,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
     c = (await refreshConflict(key, c)).c;
     const newAid = newAnalysisId();
-    const file = await buildNewFile({ content: c.content, analysisId: newAid, forkedFrom: { analysis_id: aid, revision_id: c.base ?? theirsHead }, time: now(), author: author() });
+    const file = await buildNewFile({ content: c.content, analysisId: newAid, forkedFrom: { analysis_id: aid, revision_id: c.base ?? theirsHead }, time: now(), author: author(), summary: SUMMARY.first });
     const res = await backend.save({ path, expectedHead: null, replaceExisting: true, analysisId: newAid, docKey: key, manifest: file.manifest, newParts: file.parts });
     if (!res.ok) {
       addBanner(key, { kind: "saveFailed", message: res.kind === "error" ? saveFailedMessage(res.code) : saveFailedMessage("Io") });
@@ -1343,6 +1734,10 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
     const i = it(key);
     if (!i.settled.includes(c.rev.id)) i.settled = [...i.settled, c.rev.id];
+    // My version (and the version it was made on) lives on in the new file: the old file doesn't ask about it again.
+    if (c.base && !i.settled.includes(c.base)) i.settled = [...i.settled, c.base];
+    rememberTab(key);
+    i.lastSource = null;
     await moveTabToNewFile(key, res.path, res.head, file.manifest, c.content, c.serial, true);
   }
 
@@ -1405,7 +1800,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (kind === "new") {
       const aid = t.path === null ? t.analysisId ?? newAnalysisId() : newAnalysisId();
       const forked = t.path !== null && t.analysisId && t.baseRevision ? { analysis_id: t.analysisId, revision_id: t.baseRevision } : null;
-      const file = await buildNewFile({ content: c, analysisId: aid, forkedFrom: forked, time: now(), author: author() });
+      const file = await buildNewFile({ content: c, analysisId: aid, forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
       req = { path, expectedHead: null, replaceExisting: true, analysisId: aid, docKey: key, manifest: file.manifest, newParts: file.parts };
     } else {
       const w = await workingOf(key);
@@ -1450,7 +1845,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       return { ok: false, reason: "failed" };
     }
     const forked = t.path !== null && t.analysisId && t.baseRevision ? { analysis_id: t.analysisId, revision_id: t.baseRevision } : null;
-    const file = await buildNewFile({ content: content(), analysisId: newAnalysisId(), forkedFrom: forked, time: now(), author: author() });
+    const file = await buildNewFile({ content: content(), analysisId: newAnalysisId(), forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
     const res = await backend.save({
       path, expectedHead: null, replaceExisting: true, analysisId: file.manifest.analysis_id, docKey: newDocKey(), manifest: file.manifest, newParts: file.parts,
     });
@@ -1523,12 +1918,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       return { ok: false, reason: "failed" };
     }
     if (!tabOf(key)) return { ok: false, reason: "cancelled" };     // closed while it was read
-    if (r.ok) patchTab(key, { analysisId: r.file.manifest.analysis_id });
+    if (r.ok) { patchTab(key, { analysisId: r.file.manifest.analysis_id }); seedFromMemo(key, p, r.file.manifest.analysis_id); }
     return exclusive(async () => {
       if (!tabOf(key)) return { ok: false as const, reason: "cancelled" as const };
       const already = get().activeKey === key && isLoaded(key);    // clicked while it was read
       if (get().activeKey !== key) {
         await leaveActive();
+        closeVersionsImpl();
         set({ activeKey: key });
       }
       if (r.ok) await markRecentMissing(p, false);
@@ -1585,6 +1981,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     await exclusive(async () => {
       if (get().activeKey === key && (isLoaded(key) || isCard(tabOf(key)!.status))) return;
       await leaveActive();
+      closeVersionsImpl();
       set({ activeKey: key });
       await loadInto(key);
       await saveSession();
@@ -1594,6 +1991,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   async function showStartImpl(): Promise<void> {
     await exclusive(async () => {
       await leaveActive();
+      closeVersionsImpl();
       set({ activeKey: null });
       suppress++;
       try { graph.getState().close(); } finally { suppress--; }
@@ -1608,7 +2006,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       const idx = tabs.findIndex((t) => t.key === key);
       if (idx < 0) return;
       const t = tabs[idx];
+      rememberTab(key);
       clearRetry(key);
+      cancelAuto(key);
+      cancelHeld(key);
+      if (get().versions?.tabKey === key) closeVersionsImpl();
+      const dlg = get().dialog;
+      if (dlg?.kind === "combine" && dlg.state.tabKey === key) set({ dialog: null });
       if (t.path) backend.untrack(t.path);
       const wasActive = get().activeKey === key;
       if (wasActive && draftTimer) { deps.timers.clearTimeout(draftTimer); draftTimer = null; }
@@ -1729,6 +2133,1478 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Phase 2: reload in place, combining, extra copies, versions (phase2-contract.md §5)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ── reload in place (§5.7) ──
+
+  let holds = 0;
+  const busyNow = () => holds > 0 || quietBool(() => deps.interactionBusy());
+  function quietBool(f: () => boolean): boolean { try { return !!f(); } catch { return false; } }
+
+  /** Put a version's content into the loaded tab (graphStore.replaceContent): only while the tab is still
+   *  on `expectedBase` with `expectedSerial`; false (nothing changed) otherwise. */
+  function replaceInPlace(key: string, p: {
+    content: DocContent; head: string; manifest: Manifest; path: string; expectedBase: string | null; expectedSerial: number;
+    readOnly?: "tooNew" | null; undo?: string; working?: DocContent;
+  }): boolean {
+    const t = tabOf(key);
+    if (!t || !isLoaded(key)) return false;
+    let ok = false;
+    suppress++;
+    try {
+      deps.flushScratch({ commitEdit: false });
+      ok = graph.getState().replaceContent({
+        docKey: key, expectedBase: p.expectedBase, expectedEditSerial: p.expectedSerial,
+        file: { docKey: key, analysisId: p.manifest.analysis_id, baseRevision: p.head, path: p.path }, name: t.title,
+        doc: p.content.doc, analysis: p.content.analysis, figure: p.content.figure, scratch: p.content.scratch,
+        ...(p.undo ? { undo: { label: p.undo } } : {}),
+        ...(p.working ? { working: p.working } : {}),
+      });
+    } finally { suppress--; }
+    const dirty = isDirty(graph.getState());
+    if (!ok) {
+      if (dirty !== t.dirty) patchTab(key, { dirty });
+      if (dirty) scheduleDraft();
+      return false;
+    }
+    const i = it(key);
+    i.manifest = p.manifest;
+    patchTab(key, {
+      baseRevision: p.head, dirty, template: p.content.doc.template,
+      ...(p.readOnly !== undefined ? { readOnly: p.readOnly } : {}),
+    });
+    touchVersions(key);
+    return true;
+  }
+
+  /** Content arriving on its own is applied when nothing is being edited (§5.7 "Held back"): at once when
+   *  free, else `tab.updating` and a retry every LIMITS_P2.replaceRetryMs. A newer arrival replaces a held one. */
+  async function applyWhenFree(key: string, run: () => Promise<void>): Promise<void> {
+    const i = it(key);
+    cancelHeld(key);
+    const h: Held = {
+      timer: null,
+      attempt: async () => {
+        const cur = internal.get(key);
+        if (!cur || cur.held !== h) return;
+        if (isLoaded(key) && busyNow()) {
+          h.timer = deps.timers.setTimeout(() => { h.timer = null; void h.attempt(); }, LIMITS_P2.replaceRetryMs);
+          return;
+        }
+        cur.held = null;
+        if (tabOf(key)?.updating) patchTab(key, { updating: false });
+        await run();
+      },
+    };
+    i.held = h;
+    if (isLoaded(key) && busyNow()) patchTab(key, { updating: true });
+    await h.attempt();
+  }
+
+  /** The window came back: content held back is tried at once (before anything can be typed). */
+  function retryHeldNow(): void {
+    for (const i of internal.values()) {
+      const h = i.held;
+      if (!h || !h.timer) continue;
+      deps.timers.clearTimeout(h.timer);
+      h.timer = null;
+      void h.attempt();
+    }
+  }
+
+  function cancelHeld(key: string): void {
+    const i = internal.get(key);
+    if (!i?.held) return;
+    if (i.held.timer) deps.timers.clearTimeout(i.held.timer);
+    i.held = null;
+    if (tabOf(key)?.updating) patchTab(key, { updating: false });
+  }
+
+  function holdReplaceImpl(_reason: string): () => void {
+    holds++;
+    let released = false;
+    return () => { if (!released) { released = true; holds = Math.max(0, holds - 1); } };
+  }
+
+  // ── combining (§5.4) ──
+
+  /** A file holding the tab's base version R (this computer's saved copy, else the file if it still has it). */
+  async function baseFileOf(aid: string, R: string, path: string | null): Promise<GraphFileData | null> {
+    const j = await readJournalFile(aid, R);
+    if (j && revisionSections(j, R)) return j;
+    if (path) {
+      const r = await readFile(path);
+      if (r.ok && r.file.manifest.analysis_id === aid && revisionSections(r.file, R)) return r.file;
+    }
+    return null;
+  }
+
+  /** §5.4 steps 2–4: both sides, the common version, the plan. Nothing is written except my working copy
+   *  into this computer's own journal. */
+  async function prepareCombine(key: string, source: CombineSource, origin: CombineCtx["origin"], opts: {
+    working?: Working | null; queue?: string[]; index?: number; total?: number; fromBanner?: TabBanner | null;
+  } = {}): Promise<Prepared> {
+    const t = tabOf(key);
+    if (!t?.path || !t.analysisId) return { kind: "failed" };
+    const aid = t.analysisId;
+    const i = it(key);
+    i.combining++;
+    try {
+      if (isLoaded(key)) deps.flushScratch({ commitEdit: true });
+      const R = t.baseRevision;
+      const dirty = tabDirty(key);
+      // The markers of my side: those of the working copy handed in (a Save built it before its first attempt;
+      // anything typed since is newer than it and must make the context stale), else the tab's now.
+      const serial = opts.working ? opts.working.serial : isLoaded(key) ? graph.getState().editSerial : undefined;
+      const draftSeq = opts.working ? opts.working.draftSeq : i.draftSeq;
+      // Theirs, read fresh.
+      let theirsFile: GraphFileData | null;
+      let theirsHead: string;
+      if (source.kind === "journal") {
+        theirsFile = await readJournalFile(aid, source.revisionId);
+        theirsHead = source.revisionId;
+        if (!theirsFile || !revisionSections(theirsFile, theirsHead)) return { kind: "unreadable" };
+      } else {
+        const path = source.kind === "disk" ? t.path : source.path;
+        const r = await readFile(path);
+        if (!r.ok) return source.kind === "copy" && r.code === "NotFound" ? { kind: "gone" } : { kind: "unreadable" };
+        if (r.readOnly) return { kind: "tooNew" };
+        if (r.file.manifest.analysis_id !== aid) return { kind: "failed" };
+        theirsFile = r.file;
+        theirsHead = r.file.manifest.head;
+      }
+      const theirsRev = revisionOf(theirsFile.manifest, theirsHead);
+      if (!theirsRev) return { kind: "unreadable" };
+      // Mine: R, or my working copy W (journaled first, as before the conflict sheet).
+      let baseFile = R ? await baseFileOf(aid, R, source.kind === "disk" ? null : t.path) : null;
+      if (!baseFile && R && !dirty && isLoaded(key) && i.manifest && revisionOf(i.manifest, R)) {
+        // No saved copy of R here: a clean tab's content is R's content.
+        const parts = await partsOf(sectionsOf(content()));
+        if (parts.contentHash === revisionOf(i.manifest, R)!.content_hash) {
+          const m = i.manifest;
+          baseFile = { manifest: { ...m, head: R }, parts: parts.texts };
+        }
+      }
+      let working: Working | null = null;
+      let mineFile: GraphFileData;
+      let mineRev: Revision;
+      if (dirty || !baseFile || !R) {
+        working = opts.working ?? await workingOf(key);
+        if (!working) return { kind: "failed" };
+        mineFile = { manifest: working.manifest, parts: { ...(baseFile?.parts ?? {}), ...(working.extraParts ?? {}), ...working.parts.texts } };
+        mineRev = working.rev;
+        await quietly(backend.writeJournal(t.path, { manifest: working.manifest, parts: { ...working.parts.texts } }), undefined);
+        if (!i.settled.includes(working.rev.id)) i.settled = [...i.settled, working.rev.id];
+      } else {
+        mineFile = baseFile;
+        mineRev = revisionOf(baseFile.manifest, R)!;
+      }
+      const revs = unionRevisions(mineFile.manifest, theirsFile.manifest);
+      const rel = relation(revs, mineRev.id, theirsHead);
+      if (rel !== "diverged") return { kind: "notDiverged", relation: rel, theirs: theirsFile };
+      // The common version: looked for in both files, then in this computer's saved copies (§3.2).
+      const files: GraphFileData[] = [mineFile, theirsFile];
+      let pool = snapshotPool(files);
+      const extra: GraphFileData[] = [];
+      for (const id of lowestCommonAncestors(revs, mineRev.id, theirsHead)) {
+        if (pool.has(id)) continue;
+        const j = await readJournalFile(aid, id);
+        if (j) extra.push(j);
+      }
+      pool = snapshotPool([...files, ...extra]);
+      let base = findBase(revs, mineRev.id, theirsHead, pool.has);
+      if (base.kind !== "lca" && base.kind !== "notDiverged") {
+        const heads = await quietly(backend.journalHeads(aid), [] as JournalHead[]);
+        const ids = [...heads].sort((a, b) => b.first_seen - a.first_seen).map((h) => h.revision_id)
+          .filter((id, k, all) => all.indexOf(id) === k).slice(0, LIMITS_P2.baseScanCopies);
+        for (const id of ids) {
+          if (extra.some((f) => f.manifest.head === id)) continue;
+          const j = await readJournalFile(aid, id);
+          if (j) extra.push(j);
+        }
+        pool = snapshotPool([...files, ...extra]);
+        base = findBase(revs, mineRev.id, theirsHead, pool.has);
+      }
+      if (base.kind === "notDiverged") return { kind: "notDiverged", relation: base.relation, theirs: theirsFile };
+      const baseId = base.kind === "none" ? null : base.id;
+      const mineSections: SectionValues | null = working
+        ? (sectionsOf(working.content) as unknown as SectionValues)
+        : (pool.get(mineRev.id) ?? (revisionSections(mineFile, mineRev.id) as SectionValues | null));
+      const theirsSections = revisionSections(theirsFile, theirsHead) as SectionValues | null;
+      if (!mineSections || !theirsSections) return { kind: "fallback", theirs: theirsFile, working, mineFile };
+      const plan = await combine({
+        base: baseId ? pool.get(baseId) : null, baseKind: base.kind === "none" ? "none" : base.kind, mine: mineSections, theirs: theirsSections,
+      });
+      if (!plan.ok) return { kind: "fallback", theirs: theirsFile, working, mineFile };
+      return {
+        kind: "plan",
+        ctx: {
+          key, source, origin, mineRev, mineFile, mineBase: R, working, serial, draftSeq, theirsFile, theirsRev, extra, base, baseId, plan,
+          choices: {}, queue: opts.queue ?? [], index: opts.index ?? 1, total: opts.total ?? 1, fromBanner: opts.fromBanner ?? null,
+        },
+      };
+    } finally { i.combining--; }
+  }
+
+  /** The dialog's state for a context (§6.4). */
+  async function combineStateOf(ctx: CombineCtx, extra: Partial<CombineState> = {}): Promise<CombineState> {
+    const t = tabOf(ctx.key);
+    const sections = ctx.plan.sections.map((s) => ({ key: s.key, status: s.status, choice: ctx.choices[s.key] ?? s.pick }));
+    const complete = sections.every((s) => s.choice !== null);
+    const result = complete ? await applyChoices(ctx.plan, ctx.choices) : null;
+    const union = unionManifests(ctx.mineFile.manifest, ctx.theirsFile.manifest);
+    return {
+      tabKey: ctx.key, name: t?.title ?? "", origin: ctx.origin, source: ctx.source,
+      copyName: ctx.source.kind === "copy" ? fileStem(ctx.source.path) : null,
+      index: ctx.index, total: ctx.total,
+      mine: vi(ctx.mineFile.manifest, ctx.mineRev.id), mineUnsaved: !!ctx.working,
+      theirs: vi(ctx.theirsFile.manifest, ctx.theirsRev.id),
+      since: ctx.baseId ? vi(union, ctx.baseId) : null,
+      twoWay: ctx.plan.twoWay, sections, adjusted: result?.repairs ?? [], canApply: complete && !!result, applying: false,
+      mineContent: ctx.plan.mine.content, theirsContent: ctx.plan.theirs.content,
+      compare: compareSections(ctx.plan.theirs.sections, ctx.plan.mine.sections), error: null,
+      ...extra,
+    };
+  }
+
+  /** The other side changed while a dialog was open or a write was prepared: same statuses? */
+  const sameStatuses = (a: CombinePlan, b: CombinePlan) => a.sections.every((s, k) => s.status === b.sections[k]?.status);
+
+  /** The tab's content moved on since the context was built (§5.4 step 7.1). */
+  function staleCtx(ctx: CombineCtx): boolean {
+    const i = it(ctx.key);
+    if (isLoaded(ctx.key)) return ctx.serial === undefined || graph.getState().editSerial !== ctx.serial;
+    return ctx.serial !== undefined || i.draftSeq !== ctx.draftSeq;
+  }
+
+  /** A context put together again (edits typed meanwhile, or the other side moved on): must the person look
+   *  again before anything is written? When a section's status changed; when it was going to be written
+   *  without anyone looking and now can't be (a repair, or no true common version any more); or when a
+   *  section somebody chose for changed on either side since they chose. */
+  function lookAgain(a: CombineCtx, b: CombineCtx, auto: boolean): boolean {
+    if (!sameStatuses(a.plan, b.plan)) return true;
+    if (auto && !b.plan.autoApplicable) return true;
+    for (const k of Object.keys(a.choices) as SectionName[]) {
+      if (a.plan.theirs.parts.refs[k]?.sha256 !== b.plan.theirs.parts.refs[k]?.sha256) return true;
+      if (a.plan.mine.parts.refs[k]?.sha256 !== b.plan.mine.parts.refs[k]?.sha256) return true;
+    }
+    return false;
+  }
+
+  type WriteResult =
+    | { kind: "saved"; path: string }
+    | { kind: "changed"; ctx: CombineCtx }
+    | { kind: "conflict" }
+    /** Combining with an extra copy, but the tab's own file has a version the tab doesn't have yet. */
+    | { kind: "diskAhead" }
+    | { kind: "failed"; outcome: SaveOutcome };
+
+  /** §5.4 step 7: write the combined version once. */
+  async function writeCombine(ctx0: CombineCtx, auto0: boolean, opts: { hold: boolean }): Promise<WriteResult> {
+    let ctx = ctx0;
+    let auto = auto0;
+    const key = ctx.key;
+    const i = it(key);
+    // 7.1 Edits since my side was put together: put it together again; any status change → the person looks again.
+    if (staleCtx(ctx)) {
+      const again = await prepareCombine(key, ctx.source, ctx.origin, { queue: ctx.queue, index: ctx.index, total: ctx.total, fromBanner: ctx.fromBanner });
+      if (again.kind !== "plan") return { kind: "failed", outcome: { ok: false, reason: "failed" } };
+      again.ctx.choices = { ...ctx.choices };
+      if (lookAgain(ctx, again.ctx, auto)) return { kind: "changed", ctx: again.ctx };
+      // Written without anyone looking only while the new plan still allows it.
+      auto = auto && again.ctx.plan.autoApplicable;
+      ctx = again.ctx;
+      if (i.combine === ctx0) i.combine = ctx;
+    }
+    const t = tabOf(key);
+    if (!t?.path || !t.analysisId) return { kind: "failed", outcome: { ok: false, reason: "nothing" } };
+    const aid = t.analysisId;
+    // 7.2
+    const result = Object.keys(ctx.choices).length || !ctx.plan.result ? await applyChoices(ctx.plan, ctx.choices) : ctx.plan.result;
+    if (!result) return { kind: "failed", outcome: { ok: false, reason: "failed" } };
+    // 7.3 The file it goes into, as it is now.
+    const targetPath = ctx.source.kind === "copy" ? survivorPath([t.path, ctx.source.path]) : t.path;
+    const tr = await readFile(targetPath);
+    if (!tr.ok || tr.file.manifest.analysis_id !== aid) {
+      addBanner(key, { kind: "saveFailed", message: "The other version can't be read yet. Try again in a moment." });
+      return { kind: "failed", outcome: { ok: false, reason: "failed" } };
+    }
+    const expected = tr.file.manifest.head;
+    const allowed = targetPath === t.path
+      ? (ctx.source.kind === "disk" ? [ctx.theirsRev.id] : [ctx.mineBase, ctx.mineRev.id])
+      : [ctx.theirsRev.id];
+    if (!allowed.includes(expected)) return ctx.source.kind === "copy" && targetPath === t.path ? { kind: "diskAhead" } : { kind: "conflict" };
+    // 7.4
+    const M = await combineRevision({ mine: ctx.mineRev, theirs: ctx.theirsRev, result, auto, author: author(), time: now() });
+    // 7.5
+    const union = unionManifests(tr.file.manifest, unionManifests(ctx.mineFile.manifest, ctx.theirsFile.manifest));
+    const manifest0 = await retain(withRevision(union, M, author(), result.content.doc.template), [ctx.mineRev.id, ctx.theirsRev.id, ctx.baseId]);
+    const have: Record<string, string> = {};
+    for (const f of [...ctx.extra].reverse()) Object.assign(have, f.parts);
+    Object.assign(have, ctx.theirsFile.parts, ctx.mineFile.parts, tr.file.parts, result.parts.texts);
+    const done = await completeParts(manifest0, have, (rid) => readJournalFile(aid, rid));
+    if (!done) {
+      addBanner(key, { kind: "saveFailed", message: saveFailedMessage("Invalid") });
+      return { kind: "failed", outcome: { ok: false, reason: "failed" } };
+    }
+    // 7.6
+    const owner = tabByPath(targetPath);
+    patchTab(key, { saving: true });
+    let res: SaveResult;
+    try {
+      res = await backend.save({
+        path: targetPath, expectedHead: expected, analysisId: aid, docKey: owner?.key ?? newDocKey(), manifest: done.manifest,
+        newParts: partsNotIn(done.parts, tr.file),
+      });
+    } finally { patchTab(key, { saving: false }); }
+    switch (res.kind) {
+      case "saved": case "savedButDisplaced":
+        await afterCombineSaved(ctx, res.path, done.manifest, result, M, opts);
+        if (res.kind === "savedButDisplaced") {
+          const D = res.displacedHead;
+          if (!tabDirty(key)) void autoCombine(key, { kind: "journal", revisionId: D });
+          else { const j = await readJournalFile(aid, D); if (j) chooseBanner(key, { kind: "journal", revisionId: D }, vi(j.manifest, D)); }
+        }
+        return { kind: "saved", path: res.path };
+      case "conflict": return { kind: "conflict" };
+      case "savedAside":
+        i.asides = addUnique(i.asides, res.path);
+        addBanner(key, { kind: "savedAside", name: fileStem(res.path), path: res.path });
+        await saveSession();
+        return { kind: "failed", outcome: { ok: false, reason: "failed" } };
+      case "missing":
+        addBanner(key, { kind: "missing", name: t.title, folderLabel: t.folderLabel, candidates: [] });
+        return { kind: "failed", outcome: { ok: false, reason: "failed" } };
+      case "error":
+        addBanner(key, { kind: "saveFailed", message: saveFailedMessage(res.code) });
+        return { kind: "failed", outcome: { ok: false, reason: "failed" } };
+    }
+  }
+
+  /** Unsaved changes made while a combine was written, on top of its result (three-way with the side the
+   *  combine used as mine). null when they touch a section the result took from the other side. */
+  async function rebaseOnto(mineUsed: DocContent, current: DocContent, result: CombineResult): Promise<DocContent | null> {
+    const p = await combine({
+      base: sectionsOf(mineUsed) as unknown as SectionValues, baseKind: "lca",
+      mine: sectionsOf(current) as unknown as SectionValues, theirs: result.sections as unknown as SectionValues,
+    });
+    // A result that had to be adjusted (typing removed a column the combined settings use) is not taken
+    // silently: the tab keeps what it has and the combined version is offered as newer.
+    return p.ok && p.result && !p.needsChoice && p.result.repairs.length === 0 ? p.result.content : null;
+  }
+
+  /** §5.4.2 */
+  async function afterCombineSaved(ctx: CombineCtx, path: string, manifest: Manifest, result: CombineResult, M: RevisionP2, opts: { hold: boolean }): Promise<void> {
+    const key = ctx.key;
+    const i = it(key);
+    const t = tabOf(key)!;
+    const aid = manifest.analysis_id;
+    const theirsInfo = vi(ctx.theirsFile.manifest, ctx.theirsRev.id);
+    i.preCombineHead = ctx.mineRev.id;
+    i.conflict = null;
+    i.lastSource = null;
+    if (ctx.source.kind === "journal" && !i.settled.includes(ctx.source.revisionId)) i.settled = [...i.settled, ctx.source.revisionId];
+    const oldPath = t.path!;
+    if (path !== oldPath) {
+      // Combined into the extra copy with the shorter name: the tab is that file now; mine is an older copy.
+      i.knownCopies = i.knownCopies.filter((p) => p !== path);
+      i.seenCopies = addUnique(i.seenCopies.filter((p) => p !== path), oldPath);
+      i.asides = i.asides.filter((p) => p !== path);
+      i.copyAnswer = { ...i.copyAnswer, [oldPath]: "same" };
+      await repoint(key, path, { recent: "replace" });
+      toast({ tone: "info", kind: "renamed", name: fileStem(path) });
+    }
+    patchTab(key, { notSaved: false });
+    removeKinds(key, ["newerOnDisk", "notSaved", "savedOver", "saveFailed"]);
+    if (ctx.source.kind === "copy") { const cp = ctx.source.path; removeBanners(key, (b) => b.id === `copy:${cp}`); }
+    const mineUsed = ctx.working?.content ?? (contentOfSections(ctx.plan.mine.sections as unknown as Record<string, unknown>) ?? ctx.plan.mine.content);
+    if (isLoaded(key)) {
+      // My own save that was replaced is not "someone's changes".
+      const label = theirsInfo.mine ? "Undo: combine with your earlier save" : `Undo: combine with ${whoLabel(theirsInfo)}'s changes`;
+      const expectedBase = ctx.mineBase;
+      const apply = async () => {
+        let ok = false;
+        for (let round = 0; round < 3 && !ok; round++) {
+          if (!isLoaded(key) || graph.getState().file?.baseRevision !== expectedBase) break;
+          const serialNow = graph.getState().editSerial;
+          const stale = ctx.serial === undefined || serialNow !== ctx.serial;
+          if (!stale) {
+            ok = replaceInPlace(key, { content: result.content, head: M.id, manifest, path, expectedBase, expectedSerial: serialNow, undo: label });
+            continue;
+          }
+          // Typed while the combine was written: kept, on top of the combined version.
+          deps.flushScratch({ commitEdit: true });
+          const cur = content();
+          const s0 = graph.getState().editSerial;
+          const rebased = await rebaseOnto(mineUsed, cur, result);
+          if (!rebased) break;
+          ok = replaceInPlace(key, { content: result.content, head: M.id, manifest, path, expectedBase, expectedSerial: s0, undo: label, working: rebased });
+        }
+        if (!ok) {
+          // The tab keeps what it has (on its old base); the combined version is offered as newer.
+          if (tabOf(key)?.baseRevision !== M.id) {
+            addBanner(key, { kind: "newerOnDisk", version: vi(manifest, M.id), actions: ["combine", "later"] });
+            i.bannerSource.set("newerOnDisk", { kind: "disk" });
+          }
+          return;
+        }
+        if (isDirty(graph.getState())) await writeActiveDraft(false);
+        else { await quietly(backend.deleteDraft(key), undefined); i.hasDraft = false; }
+        await saveSession();
+      };
+      if (opts.hold) await applyWhenFree(key, apply); else await apply();
+    } else {
+      i.manifest = manifest;
+      const same = ctx.working ? (ctx.serial !== undefined ? i.draftSerialAt === ctx.serial : i.draftSeq === ctx.draftSeq) : !i.hasDraft;
+      const d = same ? null : await quietly(backend.readDraft(key), null);
+      const dc = d ? contentOfDraft(d) : null;
+      const rebased = dc ? await rebaseOnto(mineUsed, dc, result) : null;
+      if (rebased) {
+        await putDraft(key, draftOf({ docKey: key, analysisId: aid, path, baseRevision: M.id, content: rebased, savedAt: now(), title: fileStem(path), template: rebased.doc.template }), undefined);
+        i.hasDraft = true;
+        patchTab(key, { baseRevision: M.id, dirty: true });
+      } else if (dc) {
+        addBanner(key, { kind: "newerOnDisk", version: vi(manifest, M.id), actions: ["combine", "later"] });
+        i.bannerSource.set("newerOnDisk", { kind: "disk" });
+      } else {
+        await quietly(backend.deleteDraft(key), undefined);
+        i.hasDraft = false;
+        patchTab(key, { baseRevision: M.id, dirty: false });
+      }
+    }
+    const taken = SECTION_NAMES.filter((k) => result.from[k] === "theirs");
+    addBanner(key, { kind: "combined", version: theirsInfo, sections: taken, actions: ["whatChanged", "undo"], dismissible: true });
+    toast({ tone: "success", kind: "combined", version: theirsInfo });
+    await touchRecent(path, aid);
+    await saveSession();
+    touchVersions(key);
+    if (path !== oldPath && tabOf(key)) await quietly(handleSibling(key, oldPath), undefined);
+    if (ctx.source.kind === "copy" && tabOf(key)) {
+      const cp = ctx.source.path;
+      if (cp !== path) await quietly(handleSibling(key, cp), undefined);
+    }
+  }
+
+  /** "Another computer saved over your last save. … Choose what to keep." [Choose…] */
+  function chooseBanner(key: string, source: CombineSource, version: VersionInfo): void {
+    const b = addBanner(key, { id: "savedOver", kind: "savedOver", state: "choose", version, actions: ["combine"], dismissible: true });
+    if (b) it(key).bannerSource.set(b.id, source);
+  }
+
+  function clearCombining(key: string): void {
+    const i = internal.get(key);
+    if (!i) return;
+    if (i.autoTimer) { deps.timers.clearTimeout(i.autoTimer); i.autoTimer = null; }
+    const had = !!i.combinePending;
+    i.combinePending = null;
+    if (tabOf(key)?.combining) patchTab(key, { combining: false });
+    removeBanners(key, (b) => b.kind === "savedOver" && b.state === "combining");
+    if (had) void saveSession();
+    recheckLater(key);
+  }
+
+  /** A waiting automatic combine is called off (closing the tab, Save, a manual combine, quitting). */
+  function cancelAuto(key: string): void { clearCombining(key); }
+
+  /** After combine work: a change of the file that arrived meanwhile is looked at now. */
+  function recheckLater(key: string): void {
+    const i = internal.get(key);
+    if (!i?.recheck) return;
+    void Promise.resolve().then(() => {
+      const j = internal.get(key);
+      if (!j || !j.recheck || j.autoTimer || j.combining > 0 || j.combine || savesInFlight.has(key)) return;
+      j.recheck = false;
+      void onHead(key, "");
+    });
+  }
+
+  /** §5.4.1: a combine nobody asked for (clean tab, sources disk / journal), written after the device-ordered
+   *  delay when the plan needs no choice; otherwise the "Choose…" banner. */
+  async function autoCombine(key: string, source: CombineSource): Promise<void> {
+    const i = it(key);
+    if (i.autoTimer || i.combine) return;
+    const prep = await prepareCombine(key, source, "poll");
+    const t = tabOf(key);
+    if (!t?.path) return;
+    switch (prep.kind) {
+      case "unreadable": case "gone": return;
+      case "tooNew": addBanner(key, { kind: "tooNew" }); return;
+      case "failed": return;
+      case "notDiverged":
+        if (source.kind === "journal" && !i.settled.includes(source.revisionId)) { i.settled = [...i.settled, source.revisionId]; await saveSession(); }
+        if (prep.relation === "newer" && source.kind === "disk") await onHead(key, prep.theirs.manifest.head);
+        return;
+      case "fallback": await fallbackCopy(key, source, prep); return;
+      case "plan": break;
+    }
+    const ctx = prep.ctx;
+    const theirsInfo = vi(ctx.theirsFile.manifest, ctx.theirsRev.id);
+    if (!ctx.plan.autoApplicable || tabDirty(key) || ctx.working) { chooseBanner(key, source, theirsInfo); return; }
+    removeBanners(key, (b) => b.kind === "savedOver");
+    addBanner(key, { id: "savedOver", kind: "savedOver", state: "combining", version: theirsInfo, actions: [], dismissible: false });
+    patchTab(key, { combining: true });
+    i.combinePending = { theirs: ctx.theirsRev.id, source: source.kind === "journal" ? "journal" : "disk" };
+    await saveSession();
+    const delay = await deps.combineDelayMs(device?.device_id ?? "");
+    if (!i.combinePending || i.autoTimer) return;
+    const expected = source.kind === "disk" ? ctx.theirsRev.id : ctx.mineBase;
+    i.autoTimer = deps.timers.setTimeout(() => { i.autoTimer = null; void autoRecheck(key, ctx, expected); }, delay);
+  }
+
+  /** §5.4.1 step 3: look at the file again before writing. */
+  async function autoRecheck(key: string, ctx: CombineCtx, expected: string | null): Promise<void> {
+    const t = tabOf(key);
+    if (!t?.path || internal.get(key) === undefined) return;
+    const theirsInfo = vi(ctx.theirsFile.manifest, ctx.theirsRev.id);
+    if (tabDirty(key)) { clearCombining(key); chooseBanner(key, ctx.source, theirsInfo); return; }
+    const r = await readFile(t.path);
+    if (!r.ok) { clearCombining(key); chooseBanner(key, ctx.source, theirsInfo); return; }
+    const m = r.file.manifest;
+    if (isAncestorOrSelf(m, ctx.mineRev.id, m.head) && isAncestorOrSelf(m, ctx.theirsRev.id, m.head)) {
+      // The result (or more) already arrived from the other computer: nothing to write.
+      clearCombining(key);
+      const i = it(key);
+      if (ctx.source.kind === "journal" && !i.settled.includes(ctx.source.revisionId)) i.settled = [...i.settled, ctx.source.revisionId];
+      await onHead(key, m.head);
+      return;
+    }
+    if (m.head === expected && !tabDirty(key)) {
+      it(key).combining++;
+      let w: WriteResult;
+      try { w = await inSaveSlot(key, async () => { const x = await writeCombine(ctx, true, { hold: true }); return x; }); }
+      finally { it(key).combining--; }
+      clearCombining(key);
+      if (w.kind === "changed" || w.kind === "conflict") await onHead(key, m.head);
+      else if (w.kind === "failed") chooseBanner(key, ctx.source, theirsInfo);
+      return;
+    }
+    clearCombining(key);
+    await onHead(key, m.head);
+  }
+
+  /** Combining is not possible (a side is not a readable document): phase 1 behaviour (§5.4 step 4). */
+  async function fallbackCopy(key: string, source: CombineSource, prep: Extract<Prepared, { kind: "fallback" }>): Promise<void> {
+    const t = tabOf(key);
+    if (!t?.path) return;
+    const i = it(key);
+    if (source.kind === "copy") return;     // the copy's banner stays (notSame / later)
+    // My version (or the version this computer saved) is written beside the file as a copy.
+    const mine = source.kind === "journal" ? prep.theirs : prep.mineFile;
+    if (!mine) return;
+    const head = mine.manifest.head;
+    const scan = await quietly(backend.scanDir(parentDir(t.path)), null);
+    const existing = scan && scan.ok
+      ? scan.entries.find((e) => e.path !== t.path && e.header?.analysis_id === mine.manifest.analysis_id && e.header.head === head)?.path ?? null
+      : null;
+    const jr = revisionOf(mine.manifest, head);
+    const label = !jr || jr.device_id === device?.device_id
+      ? `(my version from ${device?.device_name || "this computer"})`
+      : `(version from ${jr.device_name || "another computer"})`;
+    const copy = existing ?? await writeCopyBeside(t.path, label, mine);
+    if (copy) {
+      i.knownCopies = addUnique(i.knownCopies, copy);
+      addBanner(key, { id: "savedOver", kind: "savedOver", name: fileStem(copy), path: copy, actions: ["openCopy", "dismiss"] });
+    }
+    if (!i.settled.includes(head)) i.settled = [...i.settled, head];
+    await saveSession();
+    // A clean tab then shows the version on disk (phase 1).
+    if (source.kind === "disk" && !tabDirty(key)) {
+      const r = await readFile(t.path);
+      const c = r.ok ? openFile(r.file) : null;
+      if (r.ok && c && r.file.manifest.analysis_id === t.analysisId) {
+        if (isLoaded(key)) {
+          const s = graph.getState();
+          replaceInPlace(key, { content: c, head: r.file.manifest.head, manifest: r.file.manifest, path: t.path, expectedBase: s.file?.baseRevision ?? null, expectedSerial: s.editSerial, readOnly: r.readOnly });
+        } else {
+          i.manifest = r.file.manifest;
+          patchTab(key, { baseRevision: r.file.manifest.head, dirty: false });
+        }
+        await saveSession();
+      }
+    }
+  }
+
+  /** One combine (or save) per tab at a time: a Save pressed meanwhile gets the same outcome (§5.4 step 1). */
+  function inSaveSlot<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const running = savesInFlight.get(key);
+    let release!: (o: SaveOutcome) => void;
+    const slot = new Promise<SaveOutcome>((r) => { release = r; });
+    const run = (running ? running.then(() => undefined, () => undefined) : Promise.resolve()).then(fn);
+    const mine = slot.finally(() => { if (savesInFlight.get(key) === mine) savesInFlight.delete(key); });
+    savesInFlight.set(key, mine);
+    void run.then((v) => release(outcomeOf(v)), () => release({ ok: false, reason: "failed" }));
+    return run;
+  }
+  function outcomeOf(v: unknown): SaveOutcome {
+    if (v && typeof v === "object" && "ok" in (v as object)) return v as SaveOutcome;
+    const w = v as WriteResult | undefined;
+    if (w?.kind === "saved") return { ok: true, path: w.path };
+    if (w?.kind === "failed") return w.outcome;
+    return { ok: false, reason: "conflict" };
+  }
+
+  /** startCombine (public): in the tab's save slot. */
+  async function startCombineImpl(key: string, source: CombineSource, origin: CombineCtx["origin"] = "banner", opts: {
+    queue?: string[]; index?: number; total?: number;
+  } = {}): Promise<SaveOutcome> {
+    const t = tabOf(key);
+    if (!t?.path || t.saving || isCard(t.status)) return { ok: false, reason: "nothing" };
+    if (savesInFlight.has(key)) return savesInFlight.get(key)!;
+    cancelAuto(key);
+    if (get().activeKey !== key) await switchTabImpl(key);
+    it(key).catchUps = 0;
+    const out = await inSaveSlot(key, () => startCombineCore(key, source, origin, opts));
+    await Promise.resolve();
+    recheckLater(key);
+    return out;
+  }
+
+  /** Before combining with an extra copy (or a saved copy of this computer): the tab first takes in what its
+   *  own file has that the tab doesn't (a newer version is shown, a diverged one combined; the person may be
+   *  asked). "ok": the tab is on its file's newest version now (or the file can't be looked at, as before). */
+  async function catchUpWithDisk(key: string, depth: number): Promise<"ok" | "stopped"> {
+    const t = tabOf(key);
+    if (!t?.path || !t.analysisId || !t.baseRevision) return "ok";
+    const i = it(key);
+    const r = await readFile(t.path);
+    if (!r.ok || r.file.manifest.analysis_id !== t.analysisId) return "ok";
+    const m = r.file.manifest;
+    const H = m.head;
+    const R = t.baseRevision;
+    if (H === R) return "ok";
+    if (depth > 1) return "stopped";
+    const revs = unionRevisions(m, ...(i.manifest ? [i.manifest] : []));
+    const rel = relation(revs, R, H);
+    if (rel === "same") return "ok";
+    if (rel === "older") {
+      // Put back to an earlier version: the rollback note decides first.
+      await quietly(invariantCheck(key, m), "ok" as const);
+      return "stopped";
+    }
+    if (rel === "newer" && !tabDirty(key)) {
+      // A click led here: the newer version is shown at once.
+      const c = openFile(r.file);
+      if (!c) return "stopped";
+      if (isLoaded(key)) {
+        const s0 = graph.getState();
+        if (!replaceInPlace(key, { content: c, head: H, manifest: m, path: t.path, expectedBase: R, expectedSerial: s0.editSerial, readOnly: r.readOnly })) return "stopped";
+      } else {
+        i.manifest = m;
+        patchTab(key, { baseRevision: H, readOnly: r.readOnly, dirty: false });
+      }
+      removeKinds(key, ["newerOnDisk", "rolledBack"]);
+      await saveSession();
+      return "ok";
+    }
+    // Unsaved changes on an older version, or another computer's save replaced mine: combined first.
+    const out = await startCombineCore(key, { kind: "disk" }, "banner", {}, depth + 1);
+    if (!out.ok || get().dialog?.kind === "combine") return "stopped";
+    const h = await backend.header(t.path);
+    return h.ok && h.header.head === tabOf(key)?.baseRevision ? "ok" : "stopped";
+  }
+
+  /** §5.4 procedure for one source: applied at once when nothing needs a choice, else the dialog. */
+  async function startCombineCore(key: string, source: CombineSource, origin: CombineCtx["origin"], opts: {
+    working?: Working | null; queue?: string[]; index?: number; total?: number;
+  }, depth = 0): Promise<SaveOutcome> {
+    const t = tabOf(key);
+    if (!t?.path) return { ok: false, reason: "nothing" };
+    const i = it(key);
+    cancelAuto(key);
+    if (source.kind === "copy" && !opts.working && (await catchUpWithDisk(key, depth)) === "stopped") {
+      // The copy's banner stays; it can be combined once the tab is on its file's newest version.
+      return { ok: false, reason: "conflict" };
+    }
+    const t1 = tabOf(key);
+    if (!t1?.path) return { ok: false, reason: "nothing" };
+    const fromBanner = t1.banners.find((b) => (source.kind === "copy" ? b.id === `copy:${source.path}` : b.kind === "newerOnDisk" || b.kind === "savedOver")) ?? null;
+    const prep = await prepareCombine(key, source, origin, { ...opts, fromBanner });
+    switch (prep.kind) {
+      case "gone":
+        // Removed or combined on another computer meanwhile: nothing to do.
+        if (source.kind === "copy") forgetCopy(key, source.path);
+        await nextInQueue(key, opts.queue ?? [], opts.index ?? 1, opts.total ?? 1);
+        return { ok: true, path: tabOf(key)?.path ?? t.path };
+      case "unreadable":
+        addBanner(key, { kind: "saveFailed", message: "The other version can't be read yet. Try again in a moment." });
+        return { ok: false, reason: "failed" };
+      case "tooNew": addBanner(key, { kind: "tooNew" }); return { ok: false, reason: "failed" };
+      case "failed": return { ok: false, reason: "failed" };
+      case "notDiverged":
+        if (source.kind === "journal" && !i.settled.includes(source.revisionId)) { i.settled = [...i.settled, source.revisionId]; await saveSession(); }
+        if (source.kind === "copy") { removeBanners(key, (b) => b.id === `copy:${source.path}`); await handleSibling(key, source.path); }
+        else if (prep.relation === "newer") { removeKinds(key, ["savedOver"]); await onHead(key, prep.theirs.manifest.head); }
+        else removeBanners(key, (b) => b.kind === "newerOnDisk" || (b.kind === "savedOver" && !!b.state));
+        await nextInQueue(key, opts.queue ?? [], (opts.index ?? 1) + 1, opts.total ?? 1);
+        return { ok: true, path: tabOf(key)?.path ?? t.path };
+      case "fallback": {
+        if (source.kind === "disk") {
+          const w = prep.working ?? await workingOf(key);
+          if (!w) return { ok: false, reason: "failed" };
+          return enterConflict(key, w, origin === "save" ? "save" : "banner");
+        }
+        await fallbackCopy(key, source, prep);
+        return { ok: false, reason: "failed" };
+      }
+      case "plan": break;
+    }
+    const ctx = prep.ctx;
+    i.lastSource = source;
+    if (ctx.plan.autoApplicable) return applyNow(ctx);
+    return openCombineDialog(ctx);
+  }
+
+  async function openCombineDialog(ctx: CombineCtx, extra: Partial<CombineState> = {}): Promise<SaveOutcome> {
+    const key = ctx.key;
+    const i = it(key);
+    i.combine = ctx;
+    if (ctx.origin === "save") patchTab(key, { notSaved: true });
+    if (ctx.fromBanner) removeBanners(key, (b) => b.id === ctx.fromBanner!.id);
+    removeKinds(key, ["notSaved"]);
+    await saveSession();
+    set({ dialog: { kind: "combine", state: await combineStateOf(ctx, extra) } });
+    return { ok: false, reason: "conflict" };
+  }
+
+  /** Write a plan that needs no choice now (a click or Save led here), up to 3 rounds when the file moves on. */
+  async function applyNow(ctx0: CombineCtx): Promise<SaveOutcome> {
+    let ctx = ctx0;
+    for (let round = 0; round < 3; round++) {
+      const w = await writeCombine(ctx, ctx.plan.autoApplicable && Object.keys(ctx.choices).length === 0, { hold: false });
+      if (w.kind === "saved") { await nextInQueue(ctx.key, ctx.queue, ctx.index + 1, ctx.total); return { ok: true, path: w.path }; }
+      if (w.kind === "failed") return w.outcome;
+      if (w.kind === "changed") return openCombineDialog(w.ctx);
+      if (w.kind === "diskAhead") {
+        // The tab's own file moved on: that first, then this copy again.
+        const i = it(ctx.key);
+        if (round > 0 || i.catchUps > 1) break;
+        i.catchUps++;
+        return startCombineCore(ctx.key, ctx.source, ctx.origin, { queue: ctx.queue, index: ctx.index, total: ctx.total }, 1);
+      }
+      const again = await prepareCombine(ctx.key, ctx.source, ctx.origin, { queue: ctx.queue, index: ctx.index, total: ctx.total, fromBanner: ctx.fromBanner });
+      if (again.kind !== "plan") return startCombineCore(ctx.key, ctx.source, ctx.origin, { queue: ctx.queue, index: ctx.index, total: ctx.total });
+      if (!again.ctx.plan.autoApplicable) return openCombineDialog(again.ctx);
+      ctx = again.ctx;
+    }
+    if (ctx.source.kind === "copy") {
+      // An extra copy's own banner is the way back (never "saved over your last save").
+      await quietly(handleSibling(ctx.key, ctx.source.path), undefined);
+      return { ok: false, reason: "failed" };
+    }
+    chooseBanner(ctx.key, ctx.source, vi(ctx.theirsFile.manifest, ctx.theirsRev.id));
+    return { ok: false, reason: "failed" };
+  }
+
+  async function nextInQueue(key: string, queue: string[], index: number, total: number): Promise<void> {
+    if (!queue.length || !tabOf(key)) return;
+    const [next, ...rest] = queue;
+    await startCombineCore(key, { kind: "copy", path: next }, "banner", { queue: rest, index, total });
+  }
+
+  /** Save met another version on disk (§5.5 C). */
+  async function combineOnSave(key: string, w: Working, again = true): Promise<SaveOutcome> {
+    const t = tabOf(key)!;
+    const r = await readFile(t.path!);
+    if (!r.ok) {
+      addBanner(key, { kind: "saveFailed", message: "The file was changed on another computer and can't be read yet. Try again in a moment." });
+      return { ok: false, reason: "failed" };
+    }
+    const T = r.file.manifest.head;
+    const R = t.baseRevision;
+    const revs = unionRevisions(w.manifest, r.file.manifest);
+    if (R && T !== R && isAncestorOrSelf(w.manifest, T, R) && T === it(key).acceptedHead && again) {
+      // The person already chose "Use the earlier version": the changes are saved on top of it.
+      await moveBaseTo(key, r.file);
+      return saveOnceAgain(key);
+    }
+    if (R && T !== R && isAncestorOrSelf(w.manifest, T, R)) {
+      // The file was put back to an earlier version: shown, never undone automatically.
+      await quietly(backend.writeJournal(t.path!, { manifest: w.manifest, parts: { ...w.parts.texts } }), undefined);
+      const b = addBanner(key, { id: "rolledBack", kind: "rolledBack", version: vi(r.file.manifest, T), when: revisionOf(r.file.manifest, T)?.time });
+      if (b) it(key).bannerData.set(b.id, R);
+      patchTab(key, { notSaved: true });
+      return { ok: false, reason: "conflict" };
+    }
+    void revs;
+    return startCombineCore(key, { kind: "disk" }, "save", { working: w });
+  }
+
+  async function applyCombineImpl(): Promise<SaveOutcome> {
+    const d = get().dialog;
+    if (!d || d.kind !== "combine") return { ok: false, reason: "nothing" };
+    const key = d.state.tabKey;
+    const i = it(key);
+    const ctx = i.combine;
+    if (!ctx || d.state.applying) return { ok: false, reason: "nothing" };
+    set({ dialog: { kind: "combine", state: { ...d.state, applying: true, error: null } } });
+    const out = await inSaveSlot(key, async () => {
+      let cur = ctx;
+      for (let round = 0; round < 3; round++) {
+        const presetOnly = Object.entries(cur.choices).every(([k, v]) => cur.plan.sections.find((s) => s.key === k)?.pick === v);
+        const w = await writeCombine(cur, cur.plan.autoApplicable && presetOnly, { hold: false });
+        if (w.kind === "diskAhead") {
+          // Combining with an extra copy while the tab's own file has a newer version: that is taken in
+          // first (combined, or the person is asked), then this copy is offered again.
+          if (i.combine === ctx || i.combine === cur) i.combine = null;
+          const dd = get().dialog;
+          if (dd?.kind === "combine" && dd.state.tabKey === key) set({ dialog: null });
+          i.catchUps = 0;
+          return startCombineCore(key, cur.source, cur.origin, { queue: cur.queue, index: cur.index, total: cur.total });
+        }
+        if (w.kind === "saved") {
+          if (i.combine === ctx || i.combine === cur) i.combine = null;
+          const dd = get().dialog;
+          if (dd?.kind === "combine" && dd.state.tabKey === key) set({ dialog: null });
+          await nextInQueue(key, cur.queue, cur.index + 1, cur.total);
+          return { ok: true, path: w.path } as SaveOutcome;
+        }
+        if (w.kind === "failed") {
+          const dd = get().dialog;
+          if (dd?.kind === "combine" && dd.state.tabKey === key) {
+            set({ dialog: { kind: "combine", state: { ...dd.state, applying: false, error: "The combined version couldn't be saved. Nothing was changed." } } });
+          }
+          return w.outcome;
+        }
+        const next = w.kind === "changed" ? w.ctx : await (async () => {
+          const again = await prepareCombine(key, cur.source, cur.origin, { queue: cur.queue, index: cur.index, total: cur.total, fromBanner: cur.fromBanner });
+          return again.kind === "plan" ? again.ctx : null;
+        })();
+        if (!next) {
+          const dd = get().dialog;
+          if (dd?.kind === "combine") set({ dialog: { kind: "combine", state: { ...dd.state, applying: false, error: "The other version can't be read yet. Try again in a moment." } } });
+          return { ok: false, reason: "failed" } as SaveOutcome;
+        }
+        next.choices = Object.fromEntries(Object.entries(cur.choices).filter(([k]) => next.plan.sections.find((s) => s.key === k)?.status !== "same"));
+        i.combine = next;
+        if (w.kind === "changed" || lookAgain(cur, next, false)) {
+          // Something changed underneath (a status, or a part somebody chose for): the person looks again;
+          // nothing was written.
+          await openCombineDialog(next);
+          return { ok: false, reason: "conflict" } as SaveOutcome;
+        }
+        cur = next;
+      }
+      const dd = get().dialog;
+      if (dd?.kind === "combine") set({ dialog: { kind: "combine", state: { ...dd.state, applying: false, error: "The file keeps changing on another computer. Try again in a moment." } } });
+      return { ok: false, reason: "failed" } as SaveOutcome;
+    });
+    await Promise.resolve();
+    recheckLater(key);
+    return out;
+  }
+
+  async function setSectionChoiceImpl(section: SectionName, choice: SidePick): Promise<void> {
+    const d = get().dialog;
+    if (!d || d.kind !== "combine") return;
+    const ctx = it(d.state.tabKey).combine;
+    if (!ctx) return;
+    ctx.choices = { ...ctx.choices, [section]: choice };
+    const st = await combineStateOf(ctx, { index: d.state.index, total: d.state.total });
+    const now2 = get().dialog;
+    if (now2?.kind === "combine" && now2.state.tabKey === d.state.tabKey) set({ dialog: { kind: "combine", state: { ...st, applying: now2.state.applying } } });
+  }
+
+  function cancelCombineImpl(): void {
+    const d = get().dialog;
+    if (!d || d.kind !== "combine") return;
+    const key = d.state.tabKey;
+    const i = it(key);
+    const ctx = i.combine;
+    i.combine = null;
+    set({ dialog: null });
+    if (!ctx || !tabOf(key)) return;
+    if (ctx.origin === "save") {
+      patchTab(key, { notSaved: true });
+      i.lastSource = ctx.source;
+      addBanner(key, { kind: "notSaved", version: vi(ctx.theirsFile.manifest, ctx.theirsRev.id) });
+    } else if (ctx.fromBanner) {
+      const { id: _id, ...rest } = ctx.fromBanner;
+      const b = addBanner(key, { ...rest, id: ctx.fromBanner.id });
+      if (b) i.bannerSource.set(b.id, ctx.source);
+    }
+    void saveSession();
+    recheckLater(key);
+  }
+
+  async function keepBothAsSeparateImpl(): Promise<void> {
+    const d = get().dialog;
+    if (!d || d.kind !== "combine") return;
+    const key = d.state.tabKey;
+    const i = it(key);
+    const ctx = i.combine;
+    i.combine = null;
+    set({ dialog: null });
+    const t = tabOf(key);
+    if (!ctx || !t?.path || !t.analysisId) return;
+    const aid = t.analysisId;
+    if (ctx.source.kind === "copy") { await markDifferentAnalysisImpl(key, ctx.source.path); return; }
+    if (ctx.source.kind === "journal") {
+      // That version is written beside the file as a new analysis.
+      const c = openFile(ctx.theirsFile, ctx.theirsRev.id);
+      if (!c) return;
+      const who = ctx.theirsRev.device_name || "another computer";
+      const target = await freeBeside(t.path, `(version from ${who})`);
+      const file = await buildNewFile({
+        content: c, analysisId: newAnalysisId(), forkedFrom: { analysis_id: aid, revision_id: ctx.theirsRev.id }, time: now(), author: author(),
+        summary: SUMMARY.first,
+      });
+      const res = await backend.save({ path: target, expectedHead: null, analysisId: file.manifest.analysis_id, docKey: newDocKey(), manifest: file.manifest, newParts: file.parts });
+      if (!res.ok) { addBanner(key, { kind: "saveFailed", message: res.kind === "error" ? saveFailedMessage(res.code) : saveFailedMessage("Io") }); return; }
+      i.knownCopies = addUnique(i.knownCopies, res.path);
+      if (!i.settled.includes(ctx.theirsRev.id)) i.settled = [...i.settled, ctx.theirsRev.id];
+      removeKinds(key, ["savedOver"]);
+      toast({ tone: "success", kind: "savedAsNew", name: fileStem(res.path) });
+      await saveSession();
+      return;
+    }
+    // disk: mine as a new analysis in a place the person picks; this file is left as they saved it.
+    const w = ctx.working ?? await workingOf(key);
+    if (!w) return;
+    await separateCopyImpl(key, { ...w, theirs: ctx.theirsFile, base: t.baseRevision });
+  }
+
+  async function undoCombineImpl(key: string): Promise<SaveOutcome> {
+    const i = it(key);
+    const prev = i.preCombineHead;
+    if (!prev) return { ok: false, reason: "nothing" };
+    const out = await bringBackImpl(prev, key);
+    if (out.ok) removeKinds(key, ["combined"]);
+    return out;
+  }
+
+  async function showWhatChangedImpl(key: string): Promise<void> {
+    await openVersionsImpl(key);
+    const v = get().versions;
+    if (!v || v.tabKey !== key) return;
+    // My version from before the combine against the combined one shows what came in.
+    const prev = it(key).preCombineHead;
+    const id = prev && v.rows.some((r) => r.id === prev) ? prev : tabOf(key)?.baseRevision ?? null;
+    if (!id) return;
+    await selectVersionImpl(id);
+    await compareWithCurrentImpl(true);
+  }
+
+  // ── a file put back to an earlier version ──
+
+  async function useEarlierImpl(key: string): Promise<void> {
+    const t = tabOf(key);
+    if (!t?.path) return;
+    const i = it(key);
+    const r = await readFile(t.path);
+    if (!r.ok) return;
+    const H = r.file.manifest.head;
+    i.acceptedHead = H;
+    // Everything newer that this device saved is not asked about again; its history goes into the next save.
+    const heads = await backend.journalHeads(r.file.manifest.analysis_id, t.path);
+    for (const j of heads) {
+      if (j.confirmed || j.revision_id === H || isAncestorOrSelf(r.file.manifest, j.revision_id, H)) continue;
+      if (!i.settled.includes(j.revision_id)) i.settled = [...i.settled, j.revision_id];
+      if (!i.carryHeads.includes(j.revision_id)) i.carryHeads = [...i.carryHeads, j.revision_id];
+    }
+    removeKinds(key, ["rolledBack"]);
+    if (!tabDirty(key)) {
+      const c = openFile(r.file);
+      if (isLoaded(key) && c) {
+        replaceInPlace(key, { content: c, head: H, manifest: r.file.manifest, path: t.path, expectedBase: graph.getState().file?.baseRevision ?? null, expectedSerial: graph.getState().editSerial });
+      } else {
+        i.manifest = r.file.manifest;
+        patchTab(key, { baseRevision: H, dirty: false });
+      }
+    } else await moveBaseTo(key, r.file);
+    patchTab(key, { notSaved: false });
+    await saveSession();
+  }
+
+  /** "Use the earlier version" with unsaved changes: they stay, now on top of the version in the file, so the
+   *  next save is an ordinary one; the version they were made on is taken into the file's history with it. */
+  async function moveBaseTo(key: string, file: GraphFileData): Promise<void> {
+    const t = tabOf(key);
+    if (!t) return;
+    const i = it(key);
+    const H = file.manifest.head;
+    const R = t.baseRevision;
+    if (R && R !== H && !i.carryHeads.includes(R)) i.carryHeads = [...i.carryHeads, R];
+    if (R && !i.settled.includes(R)) i.settled = [...i.settled, R];
+    i.manifest = file.manifest;
+    i.lastWorking = null;
+    patchTab(key, { baseRevision: H });
+    removeKinds(key, ["newerOnDisk"]);
+    if (isLoaded(key)) {
+      suppress++;
+      try { graph.getState().setFileRef({ baseRevision: H }); } finally { suppress--; }
+      await writeActiveDraft(false);
+    } else {
+      const d = await quietly(backend.readDraft(key), null);
+      if (d) await putDraft(key, { ...d, base_revision: H }, undefined);
+    }
+  }
+
+  async function goBackToMyLatestImpl(key: string): Promise<void> {
+    const t = tabOf(key);
+    const i = it(key);
+    const b = t?.banners.find((x) => x.kind === "rolledBack");
+    const j = b ? i.bannerData.get(b.id) : undefined;
+    if (!t?.path || !t.analysisId || !j || !b) return;
+    const jf = await readJournalFile(t.analysisId, j);
+    const cur = await readFile(t.path);
+    if (!jf || !cur.ok || cur.file.manifest.analysis_id !== t.analysisId) { addBanner(key, { kind: "saveFailed", message: "Your latest version couldn't be put back yet. Try again in a moment." }); return; }
+    const dm = cur.file.manifest;
+    if (!isAncestorOrSelfIn(unionRevisions(jf.manifest, dm), dm.head, j)) {
+      // The file moved on since it was put back (another computer saved on top): never overwritten. My latest
+      // version is combined with what is in the file instead.
+      removeBanners(key, (x) => x.id === b.id);
+      i.acceptedHead = null;
+      await saveSession();
+      await startCombineImpl(key, t.baseRevision === j ? { kind: "disk" } : { kind: "journal", revisionId: j }, "banner");
+      return;
+    }
+    // Everything the file has stays in its history (nothing is rewritten).
+    const manifest = await retain(unionManifests(jf.manifest, dm), [j, dm.head]);
+    const res = await backend.save({
+      path: t.path, expectedHead: dm.head, analysisId: t.analysisId, docKey: key, manifest, newParts: partsNotIn(jf.parts, cur.file),
+    });
+    if (!res.ok) { addBanner(key, { kind: "saveFailed", message: res.kind === "error" ? saveFailedMessage(res.code) : "The file changed again. Try again in a moment." }); return; }
+    removeBanners(key, (x) => x.id === b.id);
+    i.acceptedHead = null;
+    if (!tabDirty(key)) {
+      const c = openFile(jf);
+      if (isLoaded(key) && c) {
+        replaceInPlace(key, { content: c, head: res.head, manifest, path: t.path, expectedBase: graph.getState().file?.baseRevision ?? null, expectedSerial: graph.getState().editSerial });
+      } else {
+        i.manifest = manifest;
+        patchTab(key, { baseRevision: res.head, dirty: false });
+      }
+    }
+    patchTab(key, { notSaved: false });
+    await saveSession();
+  }
+
+  // ── extra copies (§5.6) ──
+
+  /** An extra copy that is no longer there (removed or combined on another computer): its banner goes,
+   *  quietly, and it is not looked at again. */
+  function forgetCopy(key: string, path: string): void {
+    const i = internal.get(key);
+    removeBanners(key, (b) => b.id === `copy:${path}`);
+    if (!i) return;
+    i.bannerSource.delete(`copy:${path}`);
+    i.seenCopies = i.seenCopies.filter((p) => p !== path);
+    i.asides = i.asides.filter((p) => p !== path);
+    const { [path]: _k, ...kept } = i.keptHeads;
+    i.keptHeads = kept;
+    void saveSession();
+    touchVersions(key);
+  }
+
+  async function removeExtraCopyImpl(key: string, path: string): Promise<boolean> {
+    const t = tabOf(key);
+    const name = fileStem(path);
+    if (!t?.path || !t.analysisId) return false;
+    if (tabByPath(path)) { toast({ tone: "error", kind: "error", message: `'${name}' is open in a tab. Close it first.` }); return false; }
+    const res = await backend.removeCopy({ path, keeper: t.path, analysisId: t.analysisId });
+    const i = it(key);
+    if (res.ok) {
+      removeBanners(key, (b) => b.id === `copy:${path}`);
+      i.knownCopies = i.knownCopies.filter((p) => p !== path);
+      i.seenCopies = i.seenCopies.filter((p) => p !== path);
+      i.asides = i.asides.filter((p) => p !== path);
+      const { [path]: _gone, ...answers } = i.copyAnswer;
+      i.copyAnswer = answers;
+      if (recentEntries.some((e) => e.path === path)) await writeRecent(recentEntries.filter((e) => e.path !== path));
+      await saveSession();
+      toast({ tone: "success", kind: "copyRemoved", name });
+      touchVersions(key);
+      return true;
+    }
+    if (res.kind === "refused") {
+      if (res.reason === "open") toast({ tone: "error", kind: "error", message: `'${name}' is open in a tab. Close it first.` });
+      else if (res.reason === "notOlder") {
+        toast({ tone: "error", kind: "error", message: `'${name}' has changes that aren't in this file, so it wasn't removed.` });
+        removeBanners(key, (b) => b.id === `copy:${path}`);
+        // It was treated as a copy of this analysis (Remove it): the diverged / newer banner, no question.
+        i.copyAnswer = { ...i.copyAnswer, [path]: "same" };
+        await saveSession();
+        await quietly(handleSibling(key, path), undefined);
+      } else toast({ tone: "error", kind: "error", message: `'${name}' couldn't be removed.` });
+      return false;
+    }
+    if (res.code === "NotFound") {
+      // Already gone (removed or combined on another computer): nothing to remove.
+      forgetCopy(key, path);
+      return false;
+    }
+    toast({ tone: "error", kind: "error", message: `'${name}' couldn't be removed.` });
+    return false;
+  }
+
+  async function markDifferentAnalysisImpl(key: string, path: string): Promise<void> {
+    await makeSeparate(key, path);
+    touchVersions(key);
+  }
+
+  // ── the Versions panel (§5.8) ──
+
+  interface VersionsCtx {
+    key: string;
+    aid: string;
+    file: GraphFileData;
+    copies: { path: string; file: GraphFileData }[];
+    revs: Revision[];
+    pool: SnapshotPool;
+  }
+  let vctx: VersionsCtx | null = null;
+  let versionsSeq = 0;
+  let versionsQueued = false;
+
+  const emptyLayout = (): LaneLayout => ({ rows: [], edges: [], laneCount: 0, devices: [] });
+
+  /** Rebuild the open panel after a save, reload, combine or copy event of its tab. */
+  function touchVersions(key: string): void {
+    if (get().versions?.tabKey !== key || versionsQueued) return;
+    versionsQueued = true;
+    void Promise.resolve().then(async () => {
+      versionsQueued = false;
+      if (get().versions?.tabKey === key) await quietly(buildVersions(key), undefined);
+    });
+  }
+
+  async function buildVersions(key: string): Promise<void> {
+    const t = tabOf(key);
+    if (!t?.path || !t.analysisId) return;
+    const seq = ++versionsSeq;
+    const cur = get().versions;
+    if (!cur || cur.tabKey !== key) {
+      set({
+        versions: {
+          tabKey: key, name: t.title, loading: true, rows: [], layout: emptyLayout(), devices: [], stubs: [], tooOld: 0,
+          selectedId: null, preview: null, comparing: false, busy: null,
+        },
+      });
+    } else set({ versions: { ...cur, loading: true, name: t.title } });
+    const i = it(key);
+    const r = await readFile(t.path);
+    const file: GraphFileData | null = r.ok && r.file.manifest.analysis_id === t.analysisId ? r.file
+      : i.manifest ? { manifest: i.manifest, parts: {} } : null;
+    if (seq !== versionsSeq || get().versions?.tabKey !== key) return;
+    if (!file) { const v = get().versions; if (v) set({ versions: { ...v, loading: false } }); return; }
+    const aid = file.manifest.analysis_id;
+    const myId = device?.device_id ?? "";
+    // Extra copies of this analysis in the folder.
+    const scan = await quietly(backend.scanDir(parentDir(t.path)), null);
+    const entries = scan && scan.ok ? scan.entries : [];
+    const copies: { path: string; file: GraphFileData }[] = [];
+    for (const e of entries) {
+      if (e.kind !== "graph" || e.path === t.path || e.header?.analysis_id !== aid) continue;
+      const cr = await readFile(e.path);
+      if (cr.ok && cr.file.manifest.analysis_id === aid) copies.push({ path: e.path, file: cr.file });
+    }
+    // My last save that another computer's save replaced is not in the file yet: shown on its own line (from the
+    // tab's own history, or this computer's saved copy), so the list doesn't look as if it vanished.
+    const pendingMine: Manifest[] = [];
+    if (t.baseRevision && !revisionOf(file.manifest, t.baseRevision) && i.manifest && revisionOf(i.manifest, t.baseRevision)) pendingMine.push(i.manifest);
+    for (const b of t.banners) {
+      const src = b.kind === "savedOver" && b.state ? i.bannerSource.get(b.id) : undefined;
+      if (src?.kind !== "journal" || revisionOf(file.manifest, src.revisionId)) continue;
+      const jf = await readJournalFile(aid, src.revisionId);
+      if (jf) pendingMine.push(jf.manifest);
+    }
+    const revs = unionRevisions(file.manifest, ...copies.map((c) => c.file.manifest), ...pendingMine);
+    const pendingIds = new Set(pendingMine.map((pm) => (pm === i.manifest ? t.baseRevision! : pm.head)));
+    const own = new Set(file.manifest.revisions.map((x) => x.id));
+    const ids = new Set(revs.map((x) => x.id));
+    // Separated analyses (their own files, made from one of these versions).
+    const stubs: VersionStub[] = [];
+    const others = entries.filter((e) => e.kind === "graph" && e.path !== t.path && e.header && e.header.analysis_id !== aid)
+      .slice(0, LIMITS_P2.branchScanFiles).map((e) => e.path);
+    for (const p of [...new Set([...i.knownCopies, ...others])]) {
+      if (p === t.path || copies.some((c) => c.path === p)) continue;
+      const pk = await quietly(backend.peek(p), null);
+      if (!pk || !pk.ok) continue;
+      const ff = pk.manifest.forked_from;
+      if (ff && ff.analysis_id === aid && ids.has(ff.revision_id)) stubs.push({ from: ff.revision_id, name: fileStem(p), path: p });
+    }
+    // The tab's unsaved changes as a first row.
+    const dirty = tabDirty(key);
+    const devOf = new Map(revs.map((x) => [x.id, x.device_id ?? ""] as const));
+    const nodes: LaneNode[] = revs.map((x) => {
+      let parents = Array.isArray(x.parents) ? x.parents : [];
+      // At a combine, the line of this computer continues straight down (lane 0 follows the first parent).
+      if (parents.length === 2 && myId && devOf.get(parents[1]) === myId && devOf.get(parents[0]) !== myId) parents = [parents[1], parents[0]];
+      return { id: x.id, parents, time: x.time, deviceId: x.device_id ?? "", ...(own.has(x.id) ? {} : { foreign: true }) };
+    });
+    if (dirty && t.baseRevision) nodes.push({ id: WORKING_ROW, parents: [t.baseRevision], time: iso(now()), deviceId: myId });
+    const layout = layoutLanes(nodes, t.baseRevision);
+    const pool = snapshotPool([file, ...copies.map((c) => c.file)]);
+    const jheads = new Set((await quietly(backend.journalHeads(aid), [] as JournalHead[])).map((j) => j.revision_id));
+    if (seq !== versionsSeq || get().versions?.tabKey !== key) return;
+    const byId = new Map(revs.map((x) => [x.id, x] as const));
+    const copyHead = new Map<string, string>();
+    for (const c of [...copies].sort((a, b) => (a.path < b.path ? 1 : -1))) copyHead.set(c.file.manifest.head, c.path);
+    const rows: VersionRow[] = layout.rows.map((lr) => {
+      if (lr.id === WORKING_ROW) {
+        return {
+          id: WORKING_ROW, kind: "working", summary: "Unsaved changes", who: null, chips: ["unsaved"], openable: true, foreign: false,
+          copyName: null, copyPath: null, restoredFrom: null,
+        };
+      }
+      const rev = byId.get(lr.id)! as RevisionP2;
+      const first = rev.parents?.[0] ? byId.get(rev.parents[0]) ?? null : null;
+      const openable = !!rev.sections && (pool.has(rev.id) || jheads.has(rev.id)) || (!rev.sections && jheads.has(rev.id));
+      const chips: VersionChip[] = [];
+      if (rev.id === t.baseRevision) chips.push("current");
+      if ((rev.parents?.length ?? 0) >= 2) chips.push("combined");
+      if (rev.kind === "restore") chips.push("broughtBack");
+      if (rev.kind === "import") chips.push("fromOldLibrary");
+      if (!openable) chips.push("tooOld");
+      const cp = copyHead.get(rev.id) ?? null;
+      return {
+        id: rev.id, kind: rev.kind, summary: pendingIds.has(rev.id) ? (myId && rev.device_id === myId ? PENDING_SUMMARY : PENDING_SUMMARY_OTHER) : displaySummary(rev, first), openable, chips,
+        who: rev.auto ? null : { head: rev.id, userName: rev.user_name ?? "", deviceName: rev.device_name ?? "", time: rev.time ?? "", mine: !!myId && rev.device_id === myId },
+        foreign: !own.has(rev.id), copyName: cp ? fileStem(cp) : null, copyPath: cp, restoredFrom: rev.kind === "restore" ? rev.restored_from ?? null : null,
+      };
+    });
+    // Newest name seen for each computer.
+    const names = new Map<string, string>();
+    for (const lr of layout.rows) {
+      const rev = byId.get(lr.id);
+      if (rev && rev.device_id && rev.device_name && !names.has(rev.device_id)) names.set(rev.device_id, rev.device_name);
+    }
+    if (myId && device?.device_name) names.set(myId, device.device_name);
+    const devices = layout.devices.map((d) => ({ deviceId: d, deviceName: names.get(d) ?? "", mine: d === myId }));
+    vctx = { key, aid, file, copies, revs, pool };
+    const prev = get().versions;
+    if (!prev || prev.tabKey !== key) return;
+    const keep = prev.selectedId && rows.some((x) => x.id === prev.selectedId) ? prev.selectedId : null;
+    set({
+      versions: {
+        ...prev, name: t.title, loading: false, rows, layout, devices, stubs, tooOld: rows.filter((x) => x.chips.includes("tooOld")).length,
+        selectedId: keep, preview: keep ? prev.preview : null, comparing: keep ? prev.comparing : false,
+      },
+    });
+  }
+
+  async function openVersionsImpl(key?: string): Promise<void> {
+    const k = key ?? get().activeKey;
+    const t = tabOf(k);
+    if (!k || !t || !t.path) return;
+    if (get().activeKey !== k) await switchTabImpl(k);
+    if (get().activeKey !== k) return;
+    await buildVersions(k);
+  }
+
+  function closeVersionsImpl(): void {
+    if (get().versions) set({ versions: null });
+    vctx = null;
+  }
+
+  /** A version's content: from this file, an extra copy that has it, or this computer's saved copy. */
+  async function versionData(id: string): Promise<{ content: DocContent; rev: Revision; parts: Record<string, string>; manifest: Manifest } | null> {
+    const v = get().versions;
+    const key = v?.tabKey ?? get().activeKey;
+    const t = tabOf(key);
+    if (!t?.analysisId) return null;
+    const files: GraphFileData[] = vctx && vctx.key === key ? [vctx.file, ...vctx.copies.map((c) => c.file)] : [];
+    if (!files.length && t.path) { const r = await readFile(t.path); if (r.ok) files.push(r.file); }
+    for (const f of files) {
+      const rev = revisionOf(f.manifest, id);
+      const sec = rev?.sections ? revisionSections(f, id) : null;
+      const c = sec ? contentOfSections(sec) : null;
+      if (rev && c) return { content: c, rev, parts: f.parts, manifest: f.manifest };
+    }
+    const j = await readJournalFile(t.analysisId, id);
+    const rev = j ? revisionOf(j.manifest, id) : null;
+    const c = j ? openFile(j, id) : null;
+    return j && rev && c ? { content: c, rev, parts: j.parts, manifest: j.manifest } : null;
+  }
+
+  /** The tab's content now (unsaved changes included; the scratchpad flushed first). */
+  async function currentContent(key: string): Promise<DocContent | null> {
+    if (isLoaded(key)) { deps.flushScratch({ commitEdit: false }); return content(); }
+    const d = await quietly(backend.readDraft(key), null);
+    if (d) return contentOfDraft(d);
+    const t = tabOf(key);
+    if (!t?.analysisId || !t.baseRevision) return null;
+    const j = await readJournalFile(t.analysisId, t.baseRevision);
+    return j ? openFile(j, t.baseRevision) : null;
+  }
+
+  async function selectVersionImpl(id: string | null): Promise<void> {
+    const v = get().versions;
+    if (!v) return;
+    if (id === null) { set({ versions: { ...v, selectedId: null, preview: null } }); return; }
+    set({ versions: { ...v, selectedId: id, preview: { id, loading: true, content: null, compare: null, current: null } } });
+    let c: DocContent | null;
+    if (id === WORKING_ROW) c = await currentContent(v.tabKey);
+    else {
+      const row = v.rows.find((x) => x.id === id);
+      c = row && !row.openable ? null : (await versionData(id))?.content ?? null;
+    }
+    const v2 = get().versions;
+    if (!v2 || v2.selectedId !== id) return;
+    let compare = null, current = null;
+    if (v2.comparing && c) {
+      current = await currentContent(v2.tabKey);
+      compare = current ? compareSections(sectionsOf(c), sectionsOf(current)) : null;
+    }
+    const v3 = get().versions;
+    if (!v3 || v3.selectedId !== id) return;
+    set({ versions: { ...v3, preview: { id, loading: false, content: c, compare, current } } });
+  }
+
+  async function compareWithCurrentImpl(on?: boolean): Promise<void> {
+    const v = get().versions;
+    if (!v) return;
+    const next = on ?? !v.comparing;
+    if (!next) { set({ versions: { ...v, comparing: false, preview: v.preview ? { ...v.preview, compare: null, current: null } : null } }); return; }
+    set({ versions: { ...v, comparing: true } });
+    const p = v.preview;
+    if (!p?.content) return;
+    const current = await currentContent(v.tabKey);
+    const v2 = get().versions;
+    if (!v2 || v2.selectedId !== p.id || !v2.preview) return;
+    set({ versions: { ...v2, preview: { ...v2.preview, compare: current ? compareSections(sectionsOf(p.content), sectionsOf(current)) : null, current } } });
+  }
+
+  // ── Bring back (§5.10) ──
+
+  async function bringBackImpl(id: string, keyArg?: string): Promise<SaveOutcome> {
+    const key = keyArg ?? get().versions?.tabKey ?? get().activeKey;
+    const t = tabOf(key);
+    if (!key || !t?.path || !t.analysisId) return { ok: false, reason: "nothing" };
+    if (isLoaded(key)) deps.flushScratch({ commitEdit: true });
+    if (tabDirty(key)) {
+      const data0 = await versionData(id);
+      const a = await ask({
+        kind: "bringBackDirty", tabKey: key, title: t.title,
+        version: data0 ? vi(data0.manifest, id) : { head: id, userName: "", deviceName: "", time: "", mine: false },
+      });
+      if (get().dialog?.kind === "bringBackDirty") set({ dialog: null });
+      if (a.kind !== "bringBackDirty" || a.choice === "cancel") return { ok: false, reason: "cancelled" };
+      const saved = await saveImpl(key);
+      if (!saved.ok) return { ok: false, reason: "failed" };
+    }
+    const setBusy = (b: VersionsState["busy"]) => { const v = get().versions; if (v && v.tabKey === key) set({ versions: { ...v, busy: b } }); };
+    setBusy("bringBack");
+    try {
+      const t1 = tabOf(key)!;
+      const data = await versionData(id);
+      if (!data || !data.rev.sections) {
+        toast({ tone: "error", kind: "error", message: "This version can no longer be opened." });
+        return { ok: false, reason: "failed" };
+      }
+      const R = t1.baseRevision;
+      const r = await readFile(t1.path!);
+      const baseM = r.ok && r.file.manifest.head === R ? r.file.manifest : it(key).manifest;
+      const headRev = baseM ? revisionOf(baseM, R) : null;
+      if (!baseM || !R) return { ok: false, reason: "failed" };
+      if (headRev && headRev.content_hash === data.rev.content_hash) {
+        toast({ tone: "info", kind: "error", message: "That version is the same as the current one." });
+        return { ok: false, reason: "nothing" };
+      }
+      const refs = data.rev.sections;
+      const rev: RevisionP2 = {
+        ...makeRevision({
+          id: newRevisionId(now()), parents: [R], kind: "restore", time: now(), author: author(), summary: SUMMARY.broughtBack,
+          parts: { refs, texts: {}, contentHash: data.rev.content_hash },
+        }),
+        restored_from: id,
+      };
+      const manifest = await retain(withRevision(baseM, rev, author(), data.content.doc.template), [id, R]);
+      const need: Record<string, string> = {};
+      for (const n of SECTION_NAMES) { const k = refs[n].part; if (typeof data.parts[k] === "string") need[k] = data.parts[k]; }
+      const newParts = partsNotIn(need, r.ok ? r.file : null);
+      const serial = isLoaded(key) ? graph.getState().editSerial : 0;
+      patchTab(key, { saving: true });
+      let res: SaveResult;
+      try {
+        res = await backend.save({ path: t1.path!, expectedHead: R, analysisId: t1.analysisId!, docKey: key, manifest, newParts });
+      } finally { patchTab(key, { saving: false }); }
+      if (res.kind === "conflict") {
+        toast({ tone: "error", kind: "error", message: "The file was changed on another computer. Try again." });
+        void onHead(key, res.head);
+        return { ok: false, reason: "failed" };
+      }
+      if (!res.ok) {
+        if (res.kind === "error") addBanner(key, { kind: "saveFailed", message: saveFailedMessage(res.code) });
+        else if (res.kind === "missing") addBanner(key, { kind: "missing", name: t1.title, folderLabel: t1.folderLabel, candidates: [] });
+        return { ok: false, reason: "failed" };
+      }
+      if (res.kind === "savedAside") {
+        it(key).asides = addUnique(it(key).asides, res.path);
+        addBanner(key, { kind: "savedAside", name: fileStem(res.path), path: res.path });
+        await saveSession();
+        return { ok: false, reason: "failed" };
+      }
+      const c = roundTrip(data.content);
+      if (isLoaded(key)) {
+        const ok = replaceInPlace(key, { content: c, head: res.head, manifest, path: res.path, expectedBase: R, expectedSerial: serial });
+        if (!ok) {
+          // Typed meanwhile: kept as unsaved changes; the brought-back version is the newer one.
+          addBanner(key, { kind: "newerOnDisk", version: vi(manifest, res.head), actions: ["combine", "later"] });
+          it(key).bannerSource.set("newerOnDisk", { kind: "disk" });
+        } else { await quietly(backend.deleteDraft(key), undefined); it(key).hasDraft = false; }
+      } else {
+        it(key).manifest = manifest;
+        patchTab(key, { baseRevision: res.head, dirty: false });
+        await quietly(backend.deleteDraft(key), undefined);
+      }
+      removeKinds(key, ["newerOnDisk", "saveFailed"]);
+      toast({ tone: "success", kind: "broughtBack", version: vi(data.manifest, id) });
+      await touchRecent(res.path, t1.analysisId);
+      await saveSession();
+      touchVersions(key);
+      if (res.kind === "savedButDisplaced") {
+        const D = res.displacedHead;
+        if (!tabDirty(key)) void autoCombine(key, { kind: "journal", revisionId: D });
+      }
+      return { ok: true, path: res.path };
+    } finally { setBusy(null); }
+  }
+
+  async function saveVersionAsNewImpl(id: string): Promise<OpenOutcome> {
+    const key = get().versions?.tabKey ?? get().activeKey;
+    const t = tabOf(key);
+    if (!key || !t?.path || !t.analysisId) return { ok: false, reason: "failed" };
+    const data = await versionData(id);
+    if (!data) { toast({ tone: "error", kind: "error", message: "This version can no longer be opened." }); return { ok: false, reason: "failed" }; }
+    const picked = await pickPath({
+      mode: "save", title: "Save this version as a new analysis", suggestedName: `${safeFileName(`${t.title} (earlier version)`)}.lag`, startDir: parentDir(t.path),
+    });
+    if (!picked) return { ok: false, reason: "cancelled" };
+    const path = withGraphExt(picked);
+    if (tabByPath(path)) {
+      toast({ tone: "error", kind: "error", message: "That file is open in another tab. Close it first or choose another name." });
+      return { ok: false, reason: "failed" };
+    }
+    if (get().tabs.length >= LIMITS.tabCap) { toast({ tone: "warning", kind: "tabLimit" }); return { ok: false, reason: "limit" }; }
+    const v = get().versions;
+    if (v && v.tabKey === key) set({ versions: { ...v, busy: "saveAsNew" } });
+    try {
+      const file = await buildNewFile({
+        content: data.content, analysisId: newAnalysisId(), forkedFrom: { analysis_id: t.analysisId, revision_id: id }, time: now(), author: author(),
+        summary: SUMMARY.first,
+      });
+      const res = await backend.save({
+        path, expectedHead: null, replaceExisting: true, analysisId: file.manifest.analysis_id, docKey: newDocKey(), manifest: file.manifest, newParts: file.parts,
+      });
+      if (!res.ok) {
+        toast({ tone: "error", kind: "error", message: res.kind === "error" ? saveFailedMessage(res.code) : saveFailedMessage("Io") });
+        return { ok: false, reason: "failed" };
+      }
+      const i = it(key);
+      i.knownCopies = addUnique(i.knownCopies, res.path);
+      await saveSession();
+      const out = await openImpl(res.path);
+      if (out.ok) toast({ tone: "success", kind: "savedAsNew", name: fileStem(res.path) });
+      return out;
+    } finally {
+      const v2 = get().versions;
+      if (v2 && v2.tabKey === key) set({ versions: { ...v2, busy: null } });
+    }
+  }
+
   // ── banner actions ──
 
   async function bannerActionImpl(key: string, bannerId: string, action: BannerAction): Promise<void> {
@@ -1737,6 +3613,11 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (!t || !b) return;
     const i = it(key);
     const drop = () => removeBanners(key, (x) => x.id === bannerId);
+    if ((b.kind === "extraCopy" || b.kind === "copyQuestion") && b.path && action !== "dismiss" && action !== "later") {
+      // The copy may have been removed or combined on another computer since the banner appeared.
+      const h = await quietly(backend.header(b.path), null);
+      if (h && !h.ok && h.code === "NotFound") { forgetCopy(key, b.path); return; }
+    }
     switch (action) {
       case "dismiss": case "later": drop(); return;
       case "openPrivacy": await openPrivacySettingsImpl(); return;
@@ -1755,6 +3636,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       case "choose": {
         if (!t.path) return;
         if (get().activeKey !== key) await switchTabImpl(key);
+        // "Not saved" → Choose…: the combine that was left open comes back (the conflict sheet when combining isn't possible).
+        if (i.lastSource && !i.conflict) { await startCombineImpl(key, i.lastSource, "save"); return; }
         const w = await workingOf(key);
         if (w) await enterConflict(key, w, "banner");
         return;
@@ -1762,58 +3645,41 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       case "openCopy": case "openThatOne":
         if (b.path) await openImpl(b.path);
         return;
-      case "useEarlier": {
-        if (!t.path) return;
-        const r = await readFile(t.path);
-        if (!r.ok) return;
-        const H = r.file.manifest.head;
-        i.acceptedHead = H;
-        // Everything newer that this device journaled stays in its journal; it is not asked about again.
-        const heads = await backend.journalHeads(r.file.manifest.analysis_id, t.path);
-        for (const j of heads) if (!j.confirmed && j.revision_id !== H && !i.settled.includes(j.revision_id)) i.settled = [...i.settled, j.revision_id];
-        drop();
-        if (!tabDirty(key)) {
-          const c = openFile(r.file);
-          if (isLoaded(key) && c) {
-            suppress++;
-            try {
-              graph.getState().loadFile({ file: { docKey: key, analysisId: r.file.manifest.analysis_id, baseRevision: H, path: t.path }, name: t.title, ...c, saved: true, inPlace: true });
-            } finally { suppress--; }
-          }
-          i.manifest = r.file.manifest;
-          patchTab(key, { baseRevision: H, dirty: false });
-        } else addBanner(key, { kind: "newerOnDisk", relation: "older", version: vi(r.file.manifest, H) });
-        await saveSession();
-        return;
-      }
-      case "backToLatest": {
-        const j = i.bannerData.get(bannerId);
-        if (!t.path || !t.analysisId || !j) return;
-        const jf = await readJournalFile(t.analysisId, j);
-        const h = await backend.header(t.path);
-        if (!jf || !h.ok) { addBanner(key, { kind: "saveFailed", message: "Your latest version couldn't be put back yet. Try again in a moment." }); return; }
-        const res = await backend.save({
-          path: t.path, expectedHead: h.header.head, analysisId: t.analysisId, docKey: key, manifest: jf.manifest, newParts: jf.parts,
-        });
-        if (!res.ok) { addBanner(key, { kind: "saveFailed", message: res.kind === "error" ? saveFailedMessage(res.code) : "The file changed again. Try again in a moment." }); return; }
-        drop();
-        i.acceptedHead = null;
-        if (!tabDirty(key)) {
-          const c = openFile(jf);
-          if (isLoaded(key) && c) {
-            suppress++;
-            try {
-              graph.getState().loadFile({ file: { docKey: key, analysisId: t.analysisId, baseRevision: res.head, path: t.path }, name: t.title, ...c, saved: true, inPlace: true });
-            } finally { suppress--; }
-          }
-          i.manifest = jf.manifest;
-          patchTab(key, { baseRevision: res.head, dirty: false });
+      case "useEarlier": await useEarlierImpl(key); return;
+      case "backToLatest": await goBackToMyLatestImpl(key); return;
+      case "combine": {
+        const src = i.bannerSource.get(bannerId)
+          ?? (b.kind === "extraCopy" && b.path ? { kind: "copy" as const, path: b.path } : { kind: "disk" as const });
+        if (src.kind === "copy") {
+          // Every diverged extra copy of this tab, one after another ("Copy 2 of 3").
+          const copies = t.banners.filter((x) => x.kind === "extraCopy" && x.relation === "diverged" && x.path).map((x) => x.path!)
+            .sort((p, q) => (fileStem(p) < fileStem(q) ? -1 : fileStem(p) > fileStem(q) ? 1 : p < q ? -1 : 1));
+          const queue = copies.includes(src.path) ? copies : [src.path, ...copies];
+          await startCombineImpl(key, { kind: "copy", path: queue[0] }, "banner", { queue: queue.slice(1), index: 1, total: queue.length });
+          return;
         }
-        await saveSession();
+        await startCombineImpl(key, src, "banner");
         return;
       }
-      case "separate": case "notSame":
+      case "remove":
+        if (b.path) await removeExtraCopyImpl(key, b.path);
+        return;
+      case "keep":
+        if (b.path) {
+          i.knownCopies = addUnique(i.knownCopies, b.path);
+          // Remembered with the version it had: asked again once it has versions of its own.
+          if (b.version?.head) i.keptHeads = { ...i.keptHeads, [b.path]: b.version.head };
+          drop();
+          await saveSession();
+        }
+        return;
+      case "whatChanged": await showWhatChangedImpl(key); return;
+      case "undo": await undoCombineImpl(key); return;
+      case "separate":
         if (b.path) await makeSeparate(key, b.path);
+        return;
+      case "notSame":
+        if (b.path) await markDifferentAnalysisImpl(key, b.path);
         return;
       case "same": {
         if (!b.path) return;
@@ -1897,6 +3763,17 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
 
   async function restore(): Promise<number> {
     const session = await quietly(backend.readSession(), { v: 1, tabs: [] } as GraphSession);
+    fileMemo.clear();
+    if (session.files && typeof session.files === "object") {
+      for (const [p, m] of Object.entries(session.files)) {
+        if (!m || typeof m !== "object" || typeof m.analysis_id !== "string") continue;
+        const strs = (l: unknown) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === "string") : []);
+        fileMemo.set(p, {
+          analysis_id: m.analysis_id, settled_heads: strs(m.settled_heads), carry_heads: strs(m.carry_heads),
+          accepted_head: typeof m.accepted_head === "string" ? m.accepted_head : null,
+        });
+      }
+    }
     const tabs: FileTab[] = [];
     let activeKey: string | null = null;
     const drafts = new Map<string, DraftRecord>();
@@ -1910,7 +3787,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       internal.set(st.doc_key, newInternal({
         acceptedHead: st.accepted_head ?? null, knownCopies: [...(st.known_copies ?? [])], copyAnswer: { ...(st.copy_answer ?? {}) },
         settled: [...(st.settled_heads ?? [])], template, hasDraft: !!d, seenCopies: [...(st.seen_copies ?? [])],
+        asides: Array.isArray(st.asides) ? st.asides.filter((p) => typeof p === "string") : [],
+        carryHeads: Array.isArray(st.carry_heads) ? st.carry_heads.filter((p) => typeof p === "string") : [],
+        // combine_pending: looked at again by the journal check when the tab is opened (nothing to keep).
+        combinePending: null,
+        keptHeads: st.kept_heads && typeof st.kept_heads === "object" ? Object.fromEntries(Object.entries(st.kept_heads).filter(([, v]) => typeof v === "string")) : {},
       }));
+      if (st.path) seedFromMemo(st.doc_key, st.path, st.analysis_id);
       const plain = st.title || d?.title || "Untitled";
       const title = st.path ? fileStem(st.path) : plain.endsWith(" (recovered)") ? plain : `${plain} (recovered)`;
       tabs.push(newTab({
@@ -2014,6 +3897,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
     info = await quietly(backend.appInfo(), info);
     device = await quietly(backend.device(), null);
+    const s0 = await quietly(backend.readSeen(), emptySeenMap());
+    seen = s0 && typeof s0 === "object" && s0.analyses && typeof s0.analyses === "object" ? s0 : emptySeenMap();
+    domInteractionBusy();     // starts watching the mouse button (no-op outside a page)
     if (device) set({ settings: { userName: device.user_name, deviceName: device.device_name } });
     recentEntries = await quietly(backend.readRecent(), [] as RecentEntry[]);
     set({ recent: recentItems() });
@@ -2029,7 +3915,10 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     void refreshOldLibrary();
     const w = deps.window;
     if (w) {
-      w.addEventListener("focus", () => backend.pollNow());
+      w.addEventListener("focus", () => { backend.pollNow(); retryHeldNow(); });
+      if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+        document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") retryHeldNow(); });
+      }
       w.addEventListener("blur", () => { void writeActiveDraft(false); });
       if (!desktop) {
         w.addEventListener("beforeunload", () => {
@@ -2057,8 +3946,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   function quitRoutineImpl(source: QuitSource | "update", requestId?: number): Promise<boolean> {
     if (quitPromise) return quitPromise;
     quitPromise = (async () => {
+      // Waiting automatic combines stop; they are looked at again at the next start (combine_pending).
+      const waiting = get().tabs.filter((t) => internal.get(t.key)?.autoTimer).map((t) => t.key);
+      for (const k of waiting) { const i = it(k); if (i.autoTimer) { deps.timers.clearTimeout(i.autoTimer); i.autoTimer = null; } }
+      const resume = () => { for (const k of waiting) if (tabOf(k)) { clearCombining(k); void onHead(k, ""); } };
       await writeActiveDraft(true);
       await saveSession();
+      await flushSeen();
       persistNow?.();
       if (source === "update") return true;
       const dirty = get().tabs.filter((t) => !isCard(t.status) && tabDirty(t.key));
@@ -2066,12 +3960,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       if (desktop && requestId !== undefined) await quietly(deps.invoke(CMD.quitReply, { requestId, stage: "flushed" }), undefined);
       const a = await ask({ kind: "quit", dirty: dirty.map((t) => ({ key: t.key, title: t.title })) });
       set({ dialog: null });
-      if (a.kind !== "quit" || a.choice === "cancel") return false;
+      if (a.kind !== "quit" || a.choice === "cancel") { resume(); return false; }
       if (a.choice === "keep") return true;
       for (const t of get().tabs.filter((x) => dirty.some((d) => d.key === x.key))) {
         const res = await saveImpl(t.key);
         if (!res.ok) {
           if (get().activeKey !== t.key && tabOf(t.key)) await switchTabImpl(t.key);
+          resume();
           return false;
         }
       }
@@ -2143,6 +4038,12 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       case MENU.saveAs: await saveAsImpl("ask"); return;
       case MENU.duplicate: await duplicateImpl(); return;
       case MENU.closeTab: await closeTabImpl(); return;
+      case MENU.versions: {
+        if (!deps.graphsVisible()) focusGraphs();
+        const v = get().versions;
+        if (v && v.tabKey === get().activeKey) closeVersionsImpl(); else await openVersionsImpl();
+        return;
+      }
       // These open a dialog whose actions open analyses: show Graphs behind it.
       case MENU.recover: focusGraphs(); await store.getState().openRecover(); return;
       case MENU.exportLibrary: focusGraphs(); await openExportImpl(); return;
@@ -2155,9 +4056,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
 
   // ── the store ──
 
-  const base = create<FileSessionState>(() => ({
+  const base = create<FileSessionStateP2>(() => ({
     ready: false, desktop: false, tabs: [], activeKey: null, cards: [], recent: [], dialog: null, pathPicker: null, toasts: [],
-    settings: null, oldLibrary: null, focusSerial: 0, aboutSerial: 0, busy: false,
+    settings: null, oldLibrary: null, focusSerial: 0, aboutSerial: 0, busy: false, versions: null,
 
     init: () => (initPromise ??= initImpl().catch((e) => { console.error("[files] init failed", e); set({ ready: true }); })),
     quitRoutine: (source) => quitRoutineImpl(source),
@@ -2181,10 +4082,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       const c = openFile(r.file);
       if (!c) return false;
       if (isLoaded(k)) {
-        suppress++;
-        try {
-          graph.getState().loadFile({ file: { docKey: k, analysisId: r.file.manifest.analysis_id, baseRevision: r.file.manifest.head, path: t.path }, name: t.title, ...c, saved: true, inPlace: true });
-        } finally { suppress--; }
+        const s = graph.getState();
+        if (!replaceInPlace(k, { content: c, head: r.file.manifest.head, manifest: r.file.manifest, path: t.path, expectedBase: s.file?.baseRevision ?? null, expectedSerial: s.editSerial, readOnly: r.readOnly })) return false;
       }
       it(k).manifest = r.file.manifest;
       patchTab(k, { baseRevision: r.file.manifest.head, dirty: false, readOnly: r.readOnly });
@@ -2233,6 +4132,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         return;
       }
       if (d.kind === "find") { get().cancelFind(); return; }
+      if (d.kind === "combine") { cancelCombineImpl(); return; }
+      if (d.kind === "bringBackDirty") { get().answerDialog({ kind: "bringBackDirty", choice: "cancel" }); return; }
       if (d.kind === "export" && d.state.phase === "running") return;
       set({ dialog: null });
     },
@@ -2268,6 +4169,26 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     exportLibrary: (dir) => exportLibraryImpl(dir),
 
     menu: (id, path) => menuImpl(id, path),
+
+    // ── phase 2 ──
+    openVersions: (key) => openVersionsImpl(key),
+    closeVersions: () => closeVersionsImpl(),
+    selectVersion: (id) => selectVersionImpl(id),
+    compareWithCurrent: (on) => compareWithCurrentImpl(on),
+    bringBack: (id) => bringBackImpl(id),
+    saveVersionAsNew: (id) => saveVersionAsNewImpl(id),
+    startCombine: async (key, source) => { await startCombineImpl(key, source, "banner"); },
+    setSectionChoice: (section, choice) => setSectionChoiceImpl(section, choice),
+    applyCombine: () => applyCombineImpl(),
+    cancelCombine: () => cancelCombineImpl(),
+    keepBothAsSeparate: () => keepBothAsSeparateImpl(),
+    undoCombine: (key) => undoCombineImpl(key),
+    showWhatChanged: (key) => showWhatChangedImpl(key),
+    removeExtraCopy: (key, path) => removeExtraCopyImpl(key, path),
+    markDifferentAnalysis: (key, path) => markDifferentAnalysisImpl(key, path),
+    useEarlierVersion: (key) => useEarlierImpl(key),
+    goBackToMyLatest: (key) => goBackToMyLatestImpl(key),
+    holdReplace: (reason) => holdReplaceImpl(reason),
   }));
 
   store = Object.assign(base, {
@@ -2278,6 +4199,11 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       knownCopies: (key: string) => [...(internal.get(key)?.knownCopies ?? [])],
       acceptedHead: (key: string) => internal.get(key)?.acceptedHead ?? null,
       flushDraftNow: () => writeActiveDraft(true),
+      carryHeads: (key: string) => [...(internal.get(key)?.carryHeads ?? [])],
+      asides: (key: string) => [...(internal.get(key)?.asides ?? [])],
+      settled: (key: string) => [...(internal.get(key)?.settled ?? [])],
+      seen: () => JSON.parse(JSON.stringify(seen)) as SeenMap,
+      flushSeenNow: () => { seenDirty = true; return flushSeen(); },
     },
   });
 

@@ -1025,3 +1025,400 @@ fn request_download_never_blocks() {
     std::thread::sleep(Duration::from_millis(50));
     let _ = fs::remove_dir_all(&d);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 2 (phase2-contract.md §4.6): remove an extra copy, pruning, peek
+// ═════════════════════════════════════════════════════════════════════════════
+
+mod p2 {
+    use super::*;
+
+    const AID: &str = "a-p2";
+
+    /// r-1 → r-2 → r-3, plus r-x (a child of r-2 that only a diverged copy has)
+    /// and r-4 (a child of r-3 that only a newer copy has).
+    fn history() -> (Mk, Mk, Mk) {
+        let mut m = Mk::new(AID);
+        m.rev("r-1", &[], t4(&texts("1")));
+        m.rev("r-2", &["r-1"], t4(&texts("2")));
+        let mut diverged = m.clone();
+        diverged.rev("r-x", &["r-2"], t4(&texts("x")));
+        m.rev("r-3", &["r-2"], t4(&texts("3")));
+        let mut newer = m.clone();
+        newer.rev("r-4", &["r-3"], t4(&texts("4")));
+        (m, diverged, newer)
+    }
+
+    fn args(copy: &Path, keeper: &Path) -> RemoveCopyArgs {
+        RemoveCopyArgs {
+            path: copy.to_string_lossy().into_owned(),
+            keeper: keeper.to_string_lossy().into_owned(),
+            analysis_id: AID.into(),
+        }
+    }
+
+    fn sha_of(p: &Path) -> String {
+        sha256_hex(&fs::read(p).unwrap())
+    }
+
+    /// A folder with the keeper (head r-3) and a copy holding `copy_bytes`.
+    fn setup(tag: &str, copy_bytes: &[u8]) -> (PathBuf, FileCtx, PathBuf, PathBuf) {
+        let d = tmpdir(tag);
+        let c = ctx(&d);
+        let (m, _, _) = history();
+        let keeper = d.join("Analysis.lag");
+        put(&keeper, &m.bytes("r-3"));
+        let copy = d.join("Analysis (Office iMac's conflicted copy).lag");
+        put(&copy, copy_bytes);
+        (d, c, keeper, copy)
+    }
+
+    fn displaced_files(c: &FileCtx) -> Vec<String> {
+        let Ok(rd) = fs::read_dir(c.state_dir.as_ref().unwrap().join("displaced")) else { return vec![] };
+        rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".lag")).collect()
+    }
+
+    /// Nothing was moved: the copy is where it was with the same bytes, displaced/ is empty.
+    fn assert_untouched(c: &FileCtx, copy: &Path, sha: &str) {
+        assert_eq!(sha_of(copy), sha, "the copy is unchanged");
+        assert!(c.list_displaced().unwrap().is_empty());
+        assert!(displaced_files(c).is_empty());
+    }
+
+    /// R1: an older copy is moved into displaced/ (same bytes), recorded with
+    /// reason removedCopy; the keeper is untouched; the copy is forgotten by
+    /// every track.
+    #[test]
+    fn older_copy_is_moved_into_displaced() {
+        let (m, _, _) = history();
+        let (d, c, keeper, copy) = setup("rm-older", &m.bytes("r-2"));
+        let (ksha, csha) = (sha_of(&keeper), sha_of(&copy));
+        let now = crate::graphwatch::watch_now(&c);
+        crate::graphwatch::track(&c, &keeper, true, Some("r-3".into()), Some(AID.into()), now, &Default::default());
+        crate::graphwatch::add_copy(&c, &keeper, &copy, "r-2");
+        let t0 = wall_ms();
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        let RemoveCopyReply::Removed { displaced_id, head } = r.clone() else { panic!("{r:?}") };
+        assert_eq!(head, "r-2");
+        assert!(displaced_id.starts_with("x-") && valid_id(&displaced_id), "{displaced_id}");
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v, json!({"kind": "removed", "displacedId": displaced_id, "head": "r-2"}));
+        assert!(!copy.exists(), "the copy is gone from the folder");
+        assert_eq!(sha_of(&keeper), ksha, "the keeper is untouched");
+        let moved = c.state_dir.as_ref().unwrap().join("displaced").join(format!("{displaced_id}.lag"));
+        assert_eq!(sha_of(&moved), csha, "displaced/ holds the very bytes");
+        let list = c.list_displaced().unwrap();
+        assert_eq!(list.len(), 1);
+        let e = &list[0];
+        assert_eq!(
+            (e.id.as_str(), e.original.as_str(), e.analysis_id.as_str(), e.head.as_str(), e.reason.as_str()),
+            (displaced_id.as_str(), copy.to_str().unwrap(), AID, "r-2", "removedCopy")
+        );
+        assert!(e.at >= t0 && e.at <= wall_ms());
+        assert_eq!(c.read_displaced(&displaced_id).unwrap().unwrap().header.head, "r-2");
+        let w = lk(&c.watch);
+        let t = w.tracks.get(&keeper).unwrap();
+        assert!(!t.copy_table.contains(&copy) && !t.sibling_heads.contains_key(&copy), "nothing more is reported about it");
+        drop(w);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The command's argument is `RemoveCopyArgs` of contract.ts (camelCase).
+    #[test]
+    fn remove_copy_args_are_camel_case() {
+        let a: RemoveCopyArgs =
+            serde_json::from_value(json!({"path": "/a/x (1).lag", "keeper": "/a/x.lag", "analysisId": "a-1"})).unwrap();
+        assert_eq!((a.path.as_str(), a.keeper.as_str(), a.analysis_id.as_str()), ("/a/x (1).lag", "/a/x.lag", "a-1"));
+        assert!(serde_json::from_value::<RemoveCopyArgs>(json!({"path": "/a/x.lag", "keeper": "/a/y.lag"})).is_err());
+    }
+
+    /// R1: a copy with the keeper's own head is removed too.
+    #[test]
+    fn copy_with_the_same_head_is_removed() {
+        let (m, _, _) = history();
+        let (d, c, keeper, copy) = setup("rm-equal", &m.bytes("r-3"));
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        assert!(matches!(&r, RemoveCopyReply::Removed { head, .. } if head == "r-3"), "{r:?}");
+        assert!(!copy.exists() && keeper.exists());
+        assert_eq!(c.list_displaced().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R1 (across volumes): the copy is written into displaced/ with the atomic
+    /// writer, checked, and only then removed from the folder.
+    #[test]
+    fn copy_move_across_volumes_writes_checks_then_removes() {
+        let (m, _, _) = history();
+        let (d, c, keeper, copy) = setup("rm-xdev", &m.bytes("r-1"));
+        let csha = sha_of(&copy);
+        lk(&c.hooks).force_copy_move = true;
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        let RemoveCopyReply::Removed { displaced_id, head } = r else { panic!("{r:?}") };
+        assert_eq!(head, "r-1");
+        assert!(!copy.exists());
+        let moved = c.state_dir.as_ref().unwrap().join("displaced").join(format!("{displaced_id}.lag"));
+        assert_eq!(sha_of(&moved), csha);
+        assert!(temps_in(&c.state_dir.as_ref().unwrap().join("displaced")).is_empty(), "no temp left behind");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R2–R5: refused, and nothing moved, for a diverged copy, a newer copy,
+    /// another analysis on either side; the refusal carries both heads.
+    #[test]
+    fn refused_when_the_copy_has_versions_the_keeper_lacks_or_is_another_analysis() {
+        let (m, diverged, newer) = history();
+        let other = one_rev("a-other", "r-o", "other");
+        let cases: Vec<(&str, Vec<u8>, &str, Option<&str>)> = vec![
+            ("diverged", diverged.bytes("r-x"), "notOlder", Some("r-x")),
+            ("newer", newer.bytes("r-4"), "notOlder", Some("r-4")),
+            ("other-copy", other.bytes("r-o"), "otherAnalysis", Some("r-o")),
+        ];
+        for (tag, bytes, reason, head) in cases {
+            let (d, c, keeper, copy) = setup(&format!("rm-{tag}"), &bytes);
+            let csha = sha_of(&copy);
+            let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+            assert_eq!(
+                r,
+                RemoveCopyReply::Refused { reason, head: head.map(str::to_string), keeper_head: Some("r-3".into()) },
+                "{tag}"
+            );
+            assert_untouched(&c, &copy, &csha);
+            let _ = fs::remove_dir_all(&d);
+        }
+        // the keeper belongs to another analysis
+        let (d, c, keeper, copy) = setup("rm-other-keeper", &m.bytes("r-2"));
+        put(&keeper, &other.bytes("r-o"));
+        let csha = sha_of(&copy);
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        assert_eq!(r, RemoveCopyReply::Refused { reason: "otherAnalysis", head: Some("r-2".into()), keeper_head: Some("r-o".into()) });
+        assert_untouched(&c, &copy, &csha);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v, json!({"kind": "refused", "reason": "otherAnalysis", "head": "r-2", "keeperHead": "r-o"}));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R6: one file under two names (a hard link) is never removed.
+    #[cfg(unix)]
+    #[test]
+    fn refused_for_the_same_file_through_a_hard_link() {
+        let d = tmpdir("rm-link");
+        let c = ctx(&d);
+        let (m, _, _) = history();
+        let keeper = d.join("Analysis.lag");
+        put(&keeper, &m.bytes("r-3"));
+        let copy = d.join("Analysis copy.lag");
+        fs::hard_link(&keeper, &copy).unwrap();
+        let ksha = sha_of(&keeper);
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        assert_eq!(r, RemoveCopyReply::Refused { reason: "sameFile", head: Some("r-3".into()), keeper_head: Some("r-3".into()) });
+        assert_untouched(&c, &copy, &ksha);
+        assert_eq!(sha_of(&keeper), ksha);
+        // the same path twice, too
+        let r = remove_copy(&c, &args(&keeper, &keeper)).unwrap();
+        assert!(matches!(r, RemoveCopyReply::Refused { reason: "sameFile", .. }), "{r:?}");
+        // a tracked keeper does not turn its own hard link into "open"
+        let now = crate::graphwatch::watch_now(&c);
+        crate::graphwatch::track(&c, &keeper, true, Some("r-3".into()), Some(AID.into()), now, &Default::default());
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        assert!(matches!(r, RemoveCopyReply::Refused { reason: "sameFile", .. }), "{r:?}");
+        assert_untouched(&c, &copy, &ksha);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R7: an open (tracked) file is never removed.
+    #[test]
+    fn refused_for_a_tracked_path() {
+        let (m, _, _) = history();
+        let (d, c, keeper, copy) = setup("rm-open", &m.bytes("r-2"));
+        let csha = sha_of(&copy);
+        let now = crate::graphwatch::watch_now(&c);
+        crate::graphwatch::track(&c, &copy, false, Some("r-2".into()), Some(AID.into()), now, &Default::default());
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        assert_eq!(r, RemoveCopyReply::Refused { reason: "open", head: None, keeper_head: None });
+        assert_untouched(&c, &copy, &csha);
+        crate::graphwatch::untrack(&c, &copy);
+        assert!(matches!(remove_copy(&c, &args(&copy, &keeper)).unwrap(), RemoveCopyReply::Removed { .. }));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R8: a copy that changes between the read and the move is read again and
+    /// judged again: gained a version of its own → refused; became another
+    /// older version → removed with that head; keeps changing → Incomplete.
+    #[test]
+    fn copy_changed_between_the_check_and_the_move_is_judged_again() {
+        let (m, diverged, _) = history();
+        // gains a version the keeper lacks
+        let (d, c, keeper, copy) = setup("rm-gap-diverged", &m.bytes("r-2"));
+        let calls = Arc::new(Mutex::new(0u32));
+        let (n, b) = (calls.clone(), diverged.bytes("r-x"));
+        lk(&c.hooks).before_remove_move = Some(Box::new(move |p| {
+            let mut k = lk(&n);
+            *k += 1;
+            if *k == 1 {
+                put(p, &b);
+            }
+            Ok(())
+        }));
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        assert_eq!(r, RemoveCopyReply::Refused { reason: "notOlder", head: Some("r-x".into()), keeper_head: Some("r-3".into()) });
+        assert_eq!(*lk(&calls), 1, "judged again before the move, and refused");
+        assert_untouched(&c, &copy, &sha256_hex(&diverged.bytes("r-x")));
+        let _ = fs::remove_dir_all(&d);
+
+        // becomes another older version: removed with what is there now
+        let (d, c, keeper, copy) = setup("rm-gap-older", &m.bytes("r-2"));
+        let calls = Arc::new(Mutex::new(0u32));
+        let (n, b) = (calls.clone(), m.bytes("r-1"));
+        lk(&c.hooks).before_remove_move = Some(Box::new(move |p| {
+            let mut k = lk(&n);
+            *k += 1;
+            if *k == 1 {
+                put(p, &b);
+            }
+            Ok(())
+        }));
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        let RemoveCopyReply::Removed { displaced_id, head } = r else { panic!("{r:?}") };
+        assert_eq!((head.as_str(), *lk(&calls)), ("r-1", 2));
+        let moved = c.state_dir.as_ref().unwrap().join("displaced").join(format!("{displaced_id}.lag"));
+        assert_eq!(sha_of(&moved), sha256_hex(&m.bytes("r-1")));
+        assert_eq!(c.list_displaced().unwrap()[0].head, "r-1");
+        let _ = fs::remove_dir_all(&d);
+
+        // keeps changing
+        let (d, c, keeper, copy) = setup("rm-gap-busy", &m.bytes("r-2"));
+        let (b1, b2) = (m.bytes("r-1"), m.bytes("r-2"));
+        let flip = Arc::new(Mutex::new(false));
+        lk(&c.hooks).before_remove_move = Some(Box::new(move |p| {
+            let mut f = lk(&flip);
+            *f = !*f;
+            put(p, if *f { &b1 } else { &b2 });
+            Ok(())
+        }));
+        let e = remove_copy(&c, &args(&copy, &keeper)).unwrap_err();
+        assert_eq!(e.kind, ErrKind::Incomplete);
+        assert!(copy.exists());
+        assert!(c.list_displaced().unwrap().is_empty() && displaced_files(&c).is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R9: a truncated or missing file, bad arguments and no state folder:
+    /// typed errors, nothing moved.
+    #[test]
+    fn unreadable_files_and_bad_arguments_move_nothing() {
+        let (m, _, _) = history();
+        let full = m.bytes("r-2");
+        let (d, c, keeper, copy) = setup("rm-truncated", &full[..full.len() / 2]);
+        let csha = sha_of(&copy);
+        assert_eq!(remove_copy(&c, &args(&copy, &keeper)).unwrap_err().kind, ErrKind::Incomplete);
+        assert_untouched(&c, &copy, &csha);
+        // a truncated keeper
+        put(&copy, &full);
+        let k = m.bytes("r-3");
+        put(&keeper, &k[..k.len() - 30]);
+        let csha = sha_of(&copy);
+        assert_eq!(remove_copy(&c, &args(&copy, &keeper)).unwrap_err().kind, ErrKind::Incomplete);
+        assert_untouched(&c, &copy, &csha);
+        put(&keeper, &k);
+        // missing
+        assert_eq!(remove_copy(&c, &args(&d.join("gone.lag"), &keeper)).unwrap_err().kind, ErrKind::NotFound);
+        assert_eq!(remove_copy(&c, &args(&copy, &d.join("gone.lag"))).unwrap_err().kind, ErrKind::NotFound);
+        assert_untouched(&c, &copy, &csha);
+        // arguments
+        assert_eq!(remove_copy(&c, &args(&d.join("x.txt"), &keeper)).unwrap_err().kind, ErrKind::Invalid);
+        assert_eq!(remove_copy(&c, &args(&copy, &d.join("x.lagx"))).unwrap_err().kind, ErrKind::Invalid);
+        assert_eq!(remove_copy(&c, &args(Path::new("rel.lag"), &keeper)).unwrap_err().kind, ErrKind::Invalid);
+        // no state folder
+        let none = FileCtx::new(None);
+        assert_eq!(remove_copy(&none, &args(&copy, &keeper)).unwrap_err().kind, ErrKind::NoStateDir);
+        assert_untouched(&c, &copy, &csha);
+        assert!(!d.join("displaced").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The two path locks never deadlock with a save that holds one of them and
+    /// waits for the other (taken in the opposite order).
+    #[test]
+    fn path_locks_of_both_files_do_not_deadlock() {
+        let (m, _, _) = history();
+        let (d, c, keeper, copy) = setup("rm-locks", &m.bytes("r-2"));
+        assert!(copy < keeper, "the copy sorts first, so the other thread takes the locks the other way round");
+        let c = Arc::new(c);
+        let (c2, k2, p2) = (c.clone(), keeper.clone(), copy.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let _a = c2.locks.lock(&k2);
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let _b = c2.locks.lock(&p2);
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        rx.recv().unwrap();
+        let t0 = Instant::now();
+        let r = remove_copy(&c, &args(&copy, &keeper)).unwrap();
+        assert!(matches!(r, RemoveCopyReply::Removed { .. }), "{r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        other.join().unwrap();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R8 (pruning): removed copies are kept 30 days — 29 days old stays, 31 goes.
+    #[test]
+    fn removed_copies_are_pruned_after_thirty_days() {
+        let (m, _, _) = history();
+        let (d, c, keeper, copy) = setup("rm-prune", &m.bytes("r-1"));
+        let copy2 = d.join("Analysis 2.lag");
+        put(&copy2, &m.bytes("r-2"));
+        let RemoveCopyReply::Removed { displaced_id: young, .. } = remove_copy(&c, &args(&copy, &keeper)).unwrap() else { panic!() };
+        let RemoveCopyReply::Removed { displaced_id: old, .. } = remove_copy(&c, &args(&copy2, &keeper)).unwrap() else { panic!() };
+        let ddir = c.state_dir.as_ref().unwrap().join("displaced");
+        let idx_path = ddir.join("index.json");
+        let mut idx: Value = serde_json::from_slice(&fs::read(&idx_path).unwrap()).unwrap();
+        let day = 24 * 3600 * 1000_i64;
+        for e in idx["entries"].as_array_mut().unwrap() {
+            let age = if e["id"] == young.as_str() { 29 } else { 31 };
+            e["at"] = json!(wall_ms() - age * day);
+        }
+        fs::write(&idx_path, serde_json::to_vec(&idx).unwrap()).unwrap();
+        assert_eq!(DISPLACED_KEEP_MS, 30 * day);
+        c.prune(10, u64::MAX, DISPLACED_KEEP_MS).unwrap();
+        let left: Vec<String> = c.list_displaced().unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(left, vec![young.clone()]);
+        assert!(ddir.join(format!("{young}.lag")).exists());
+        assert!(!ddir.join(format!("{old}.lag")).exists());
+        assert!(keeper.exists(), "pruning never touches the user's files");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R9 (peek): the stored manifest text byte for byte, no journal entry, no
+    /// validation record; tooNew flagged; a truncated file → Incomplete.
+    #[test]
+    fn peek_reads_the_manifest_only_and_journals_nothing() {
+        let d = tmpdir("peek");
+        let c = ctx(&d);
+        let (m, _, _) = history();
+        let p = d.join("Analysis.lag");
+        let bytes = m.bytes("r-3");
+        put(&p, &bytes);
+        let r = peek(&p).unwrap();
+        assert_eq!(r.manifest_text, m.manifest("r-3"));
+        assert_eq!((r.stat.size, r.stat.path.as_str(), r.read_only), (bytes.len() as u64, p.to_str().unwrap(), None));
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("manifestText").is_some() && v.get("stat").is_some() && v["readOnly"].is_null());
+        assert!(v.get("parts").is_none(), "no parts");
+        assert!(c.record(&p).is_none(), "no validation record");
+        assert!(c.journal_heads(AID, None).unwrap().is_empty(), "no journal entry");
+        assert!(!c.state_dir.as_ref().unwrap().join("journal").exists());
+        // too new
+        let mut n = m.clone();
+        n.min_reader_version = 2;
+        let q = d.join("New.lag");
+        put(&q, &n.bytes("r-3"));
+        assert_eq!(peek(&q).unwrap().read_only, Some("tooNew"));
+        // truncated, missing
+        put(&q, &bytes[..bytes.len() / 3]);
+        assert_eq!(peek(&q).unwrap_err().kind, ErrKind::Incomplete);
+        assert_eq!(peek(&d.join("gone.lag")).unwrap_err().kind, ErrKind::NotFound);
+        let _ = fs::remove_dir_all(&d);
+    }
+}

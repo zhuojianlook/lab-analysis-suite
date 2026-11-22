@@ -230,6 +230,25 @@ pub fn add_copy(ctx: &FileCtx, track_path: &Path, copy: &Path, head: &str) {
     }
 }
 
+/// An extra copy was moved away (phase 2 remove copy): drop it from every
+/// track's copy table and sibling memory, and from the header cache, so
+/// nothing more is reported about it. A file that later appears at that path
+/// again is new to every track.
+pub fn forget_copy(ctx: &FileCtx, copy: &Path) {
+    {
+        let mut w = lk(&ctx.watch);
+        for t in w.tracks.values_mut() {
+            let in_table = t.copy_table.remove(copy);
+            let had_head = t.sibling_heads.remove(copy).is_some();
+            if in_table || had_head {
+                // A look in flight still has the old tables: its result is dropped.
+                t.gen += 1;
+            }
+        }
+    }
+    lk(&ctx.dir_cache).remove(copy);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Events
 // ═════════════════════════════════════════════════════════════════════════════

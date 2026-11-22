@@ -12,12 +12,20 @@ export function PlotResult({
   result,
   baseName = "plot",
   fitHeight,
+  hold,
 }: {
   result: RunRResponse | null;
   baseName?: string;
   fitHeight?: string;
+  /** Called when a download starts; the returned function is called when it has finished
+   *  (Graphs: newer content of the file is not put in place while a figure is being exported). */
+  hold?: () => () => void;
 }) {
   if (!result) return null;
+  const download = (name: string, b64: string, mime: string) => {
+    const release = hold?.();
+    void saveDownload(name, b64, mime).catch(() => false).finally(() => release?.());
+  };
   if (!result.success) {
     return (
       <Alert severity="error" sx={{ mt: 1, whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
@@ -52,7 +60,7 @@ export function PlotResult({
               <Button
                 size="small"
                 startIcon={<DownloadIcon />}
-                onClick={() => saveDownload(`${baseName}_${i + 1}.png`, b64, "image/png")}
+                onClick={() => download(`${baseName}_${i + 1}.png`, b64, "image/png")}
               >
                 Download PNG
               </Button>
@@ -68,7 +76,7 @@ export function PlotResult({
                   size="small"
                   startIcon={<DownloadIcon />}
                   onClick={() =>
-                    saveDownload(
+                    download(
                       `${baseName}_${i + 1}.${exp.format === "tiff" ? "tiff" : "png"}`,
                       exp.b64,
                       exp.format === "tiff" ? "image/tiff" : "image/png",

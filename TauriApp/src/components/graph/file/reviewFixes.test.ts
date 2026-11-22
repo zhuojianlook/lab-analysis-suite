@@ -1,6 +1,6 @@
 // Regression tests for the defects found in the phase 1 review (each test names its finding).
 // Two simulated computers on the memory backend and the manual clock (testkit).
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SaveRequest, SaveResult } from "./backend";
 import { buildNextFile, openFile, pruneSnapshots, withAbsentSnapshotsDropped } from "./docCodec";
 import type { GraphFileData, Manifest, Revision } from "./format";
@@ -9,6 +9,16 @@ import {
   DBX, DOCS, authorFor, computer, contentAt, firstCell, flush, makeWorld, seedFile, start, tick, withAnswer, type Computer,
 } from "./testkit";
 import type { MemoryDevice, MemoryWorld } from "./memoryBackend";
+
+
+// Phase 2: a save conflict combines; the phase 1 conflict sheet is reached only when combining is not
+// possible (a side that is not a readable document). These tests force that fallback.
+const flags = vi.hoisted(() => ({ fallback: false }));
+vi.mock("./graphMerge", async (importOriginal) => {
+  const m = await importOriginal<typeof import("./graphMerge")>();
+  return { ...m, combine: async (input: Parameters<typeof m.combine>[0]) => (flags.fallback ? { ok: false as const, reason: "unreadable" as const, side: "theirs" as const } : m.combine(input)) };
+});
+afterEach(() => { flags.fallback = false; });
 
 const A = `${DOCS}/A.lag`;
 const B = `${DOCS}/B.lag`;
@@ -101,6 +111,7 @@ describe("edits made while a save is in flight (review V1/V2, TS)", () => {
   });
 
   it("V2: typed during a save that meets a conflict, then 'Use theirs': the typing is in my copy", async () => {
+    flags.fallback = true;
     const { w, a, b } = await two();
     await seedFile(w, a.dev, P);
     await tick(w, 2000);
@@ -130,6 +141,7 @@ describe("edits made while a save is in flight (review V1/V2, TS)", () => {
 
   it("V2: the tab was left during the save; 'Use theirs' keeps what was typed (copy), 'Keep mine' saves it", async () => {
     for (const choice of ["takeTheirs", "keepMine"] as const) {
+      flags.fallback = true;
       const { w, a, b } = await two();
       await seedFile(w, a.dev, P); await seedFile(w, a.dev, B);
       await tick(w, 2000);

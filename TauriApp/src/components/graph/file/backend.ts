@@ -4,9 +4,9 @@
    tests, including simulated other computers. Not wired to the UI yet. */
 
 import type { FileHeader, GraphFileData, Manifest } from "./format";
-import type { FileEventP1, FileBackendP1 } from "./contract";
+import type { FileEventP1, FileBackendP1, FileBackendP2 } from "./contract";
 
-export type { FileBackendP1 };
+export type { FileBackendP1, FileBackendP2 };
 
 /** Typed errors (plan §4.1). */
 export type FileErrorCode =
@@ -124,11 +124,34 @@ export interface SessionTab {
   settled_heads?: string[];
   /** Same-analysis files seen beside this one (copies): never taken for this file renamed, also after a restart. */
   seen_copies?: string[];
+  /** Phase 2: files this computer saved beside the file because the file could not be checked
+   *  ("unsynced from …"); handled as extra copies once the file can be read again. */
+  asides?: string[];
+  /** Phase 2: heads dropped by "Use the earlier version"; the next save takes their history into the file. */
+  carry_heads?: string[];
+  /** Phase 2: an automatic combine that was waiting when the app closed (looked at again on restore). */
+  combine_pending?: { theirs: string; source: "disk" | "journal" };
+  /** Phase 2: older copies answered "Keep", with the newest version each had then (asked again once it has
+   *  versions of its own). */
+  kept_heads?: Record<string, string>;
 }
 
 export interface GraphSession {
   v: 1;
   tabs: SessionTab[];
+  /** Phase 2 (fixer): what this computer decided about a file, kept after its tab is closed (path → record),
+   *  so a closed and reopened tab does not ask again about a version already handled. */
+  files?: Record<string, FileMemo>;
+}
+
+/** Phase 2: per file (by path) — the heads of this computer's saved copies that were handled (combined, kept as
+ *  a separate file, set aside), "Use the earlier version" (accepted head) and the dropped heads the next save
+ *  takes into the file. */
+export interface FileMemo {
+  analysis_id: string;
+  settled_heads?: string[];
+  accepted_head?: string | null;
+  carry_heads?: string[];
 }
 
 /** Unsaved work of one document (drafts/<doc_key>.json). */

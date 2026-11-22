@@ -26,7 +26,11 @@ import type {
   FileStat, GraphSession, HeaderResult, JournalHead, ReadResult, RecentEntry, SaveRequest, SaveResult, ScanResult,
 } from "./backend";
 import { RECENT_MAX, emptyExportMap, emptySession } from "./backend";
-import type { AppInfo, DevicePatch, FileBackendP1, LocateMatch, LocateProgress, LocateResult } from "./contract";
+import {
+  LIMITS_P2, emptySeenMap,
+  type AppInfo, type DevicePatch, type FileBackendP2, type LocateMatch, type LocateProgress, type LocateResult,
+  type PeekResult, type RemoveCopyArgs, type RemoveCopyResult, type SeenMap,
+} from "./contract";
 import {
   GRAPH_EXT, PRESENCE_EXT, READER_VERSION, SECTION_NAMES, fileProblem, fileStem, headerOf, isAncestorOrSelf, parentDir,
   type GraphFileData,
@@ -296,6 +300,8 @@ export interface MemoryDeviceState {
   exportMap: ExportMap;
   folders: string[];
   denied: string[];
+  /** Phase 2: the first-seen record (graph-seen.json). */
+  seen?: SeenMap;
 }
 
 /** Absent on two polls this far apart before a path counts as missing (plan §5.2). */
@@ -307,7 +313,7 @@ const own = (o: Record<string, string>, k: string) => Object.prototype.hasOwnPro
 const under = (path: string, dir: string) => path === dir || path.startsWith(dir.endsWith("/") ? dir : dir + "/");
 const BUNDLE_RE = /\.(app|bundle|framework|plugin|kext|pkg|photoslibrary|musiclibrary|xcodeproj|lproj)$/i;
 
-export class MemoryDevice implements FileBackendP1 {
+export class MemoryDevice implements FileBackendP2 {
   readonly name: string;
   readonly deviceId: string;
   uploadDelayMs: number;
@@ -341,6 +347,7 @@ export class MemoryDevice implements FileBackendP1 {
   private displacedSeq = 0;
   private recent: RecentEntry[] = [];
   private exportMap: ExportMap = emptyExportMap();
+  private seen: SeenMap = emptySeenMap();
   private locateSeq = 0;
   private readonly cancelled = new Set<string>();
   /** Every event emitted, for assertions. */
@@ -603,6 +610,64 @@ export class MemoryDevice implements FileBackendP1 {
 
   async reveal(_path: string): Promise<void> { /* no-op in the preview */ }
 
+  // ── FileBackendP2 ──
+
+  async peek(path: string): Promise<PeekResult> {
+    const f = this.check(path);
+    if ("code" in f) return f;
+    const tooNew = (f.data.manifest.min_reader_version ?? 1) > READER_VERSION;
+    return { ok: true, manifest: clone(f.data.manifest), stat: this.statOf(path, f), readOnly: tooNew ? "tooNew" : null };
+  }
+
+  /** Phase 2 contract §4.2 steps 2–8 on the simulated disk: the copy is moved into displaced/ only when its
+   *  newest version is the keeper's newest version or one of its ancestors, both re-read now. */
+  async removeCopy(req: RemoveCopyArgs): Promise<RemoveCopyResult> {
+    this.pruneDisplaced();
+    const fail = (code: FileErrorCode, message: string): RemoveCopyResult => ({ ...err(code, message), kind: "error" });
+    const refuse = (reason: "notOlder" | "otherAnalysis" | "sameFile" | "open", head: string | null, keeperHead: string | null): RemoveCopyResult =>
+      ({ ok: false, kind: "refused", reason, head, keeperHead });
+    if (!req.path.toLowerCase().endsWith(`.${GRAPH_EXT}`) || !req.keeper.toLowerCase().endsWith(`.${GRAPH_EXT}`)) return fail("Invalid", "Not an analysis file name.");
+    if (this.tracked.has(req.path)) return refuse("open", null, null);
+    const copy = this.check(req.path);
+    if ("code" in copy) return fail(copy.code, copy.message);
+    const keeper = this.check(req.keeper);
+    if ("code" in keeper) return fail(keeper.code, keeper.message);
+    const ch = copy.data.manifest.head;
+    const kh = keeper.data.manifest.head;
+    if (req.path.toLowerCase() === req.keeper.toLowerCase() || copy === keeper) return refuse("sameFile", ch, kh);
+    if (copy.data.manifest.analysis_id !== req.analysisId || keeper.data.manifest.analysis_id !== req.analysisId) return refuse("otherAnalysis", ch, kh);
+    if (!isAncestorOrSelf(keeper.data.manifest, ch, kh)) return refuse("notOlder", ch, kh);
+    const id = this.addDisplaced(req.path, copy.data, "removedCopy");
+    this.files.delete(req.path);
+    this.deletes.set(req.path, copy.cloudRev);
+    this.queueUpload(req.path);
+    for (const [tp, t] of this.tracked) { t.siblingHeads.delete(req.path); this.copyTable.get(tp)?.delete(req.path); }
+    this.emitFor(req.path);
+    this.world.touch();
+    return { ok: true, kind: "removed", displacedId: id, head: ch };
+  }
+
+  async readSeen(): Promise<SeenMap> { return clone(this.seen); }
+  async writeSeen(seen: SeenMap): Promise<void> {
+    if (!seen || typeof seen.analyses !== "object" || seen.analyses === null) throw new Error("writeSeen: Invalid");
+    this.seen = clone(seen);
+    this.world.touch();
+  }
+
+  /** Extra copies removed on this computer (newest first), for the simulator. */
+  removedCopies(): { id: string; original: string; at: number }[] {
+    this.pruneDisplaced();
+    return [...this.displaced.values()].filter((d) => d.entry.reason === "removedCopy")
+      .map((d) => ({ id: d.entry.id, original: d.entry.original, at: d.entry.at }))
+      .sort((a, b) => b.at - a.at || (a.id < b.id ? 1 : -1));
+  }
+
+  /** Displaced entries older than LIMITS_P2.removedKeepMs go (as the app does at startup). */
+  private pruneDisplaced(): void {
+    const now = this.world.clock.now();
+    for (const [id, d] of [...this.displaced]) if (now - d.entry.at > LIMITS_P2.removedKeepMs) this.displaced.delete(id);
+  }
+
   // ── scripting (what the person or the OS does on this computer) ──
 
   isOnline(): boolean { return this.online; }
@@ -765,6 +830,7 @@ export class MemoryDevice implements FileBackendP1 {
       exportMap: this.exportMap,
       folders: [...this.folderSet],
       denied: [...this.denied],
+      seen: this.seen,
     });
   }
 
@@ -788,6 +854,7 @@ export class MemoryDevice implements FileBackendP1 {
     for (const f of c.folders ?? []) this.folderSet.add(f);
     this.denied.clear();
     for (const d of c.denied ?? []) this.denied.add(d);
+    this.seen = c.seen && typeof c.seen.analyses === "object" ? c.seen : emptySeenMap();
     this.tracked.clear();
     this.copyTable.clear();
   }
@@ -924,12 +991,13 @@ export class MemoryDevice implements FileBackendP1 {
     }
   }
 
-  private addDisplaced(original: string, data: GraphFileData, reason: DisplacedEntry["reason"]): void {
+  private addDisplaced(original: string, data: GraphFileData, reason: DisplacedEntry["reason"]): string {
     const id = `x-${this.deviceId}-${++this.displacedSeq}`;
     this.displaced.set(id, {
       entry: { id, original, analysis_id: data.manifest?.analysis_id ?? "", head: data.manifest?.head ?? "", reason, at: this.world.clock.now() },
       data: clone(data),
     });
+    return id;
   }
 
   private freeName(dir: string, stem: string): string {

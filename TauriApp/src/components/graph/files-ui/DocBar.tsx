@@ -1,12 +1,13 @@
-import { Box, Button, Chip, CircularProgress, IconButton, Stack, Tooltip, Typography } from "@mui/material";
+import { Box, Button, Chip, CircularProgress, IconButton, Stack, Tooltip, Typography, alpha } from "@mui/material";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import FolderOutlinedIcon from "@mui/icons-material/FolderOutlined";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
+import HistoryIcon from "@mui/icons-material/History";
 import { useFileSession } from "../file/session";
 import type { FileTab } from "../file/contract";
 import { BannerSlot } from "./BannerSlot";
 import { FileMenu } from "./FileMenu";
-import { REVEAL_LABEL, STATUS, shortcutText } from "./text";
+import { REVEAL_LABEL, STATUS, V, shortcutText } from "./text";
 
 /** Height of the document bar. Fixed, so a banner appearing in it never moves the workspace. */
 export const DOC_BAR_HEIGHT = 60;
@@ -28,6 +29,12 @@ export function DocBar({ tab }: { tab: FileTab }) {
   const save = () => void useFileSession.getState().save(tab.key);
   const reveal = () => void useFileSession.getState().reveal(tab.key);
   const hasBanner = !!tab.banner;
+  const versionsOpen = useFileSession((s) => s.versions?.tabKey === tab.key);
+  const toggleVersions = () => {
+    const s = useFileSession.getState();
+    if (s.versions?.tabKey === tab.key) s.closeVersions();
+    else void s.openVersions(tab.key);
+  };
 
   return (
     <Stack direction="row" alignItems="center" spacing={1.5} data-testid="doc-bar"
@@ -80,6 +87,20 @@ export function DocBar({ tab }: { tab: FileTab }) {
               data-testid="doc-save" startIcon={<SaveOutlinedIcon />}>
               Save
             </Button>
+          </span>
+        </Tooltip>
+        <Tooltip title={V.versionsButton}>
+          <span>
+            <IconButton size="small" aria-label={V.versionsButton} aria-pressed={versionsOpen} data-testid="doc-versions"
+              data-pressed={versionsOpen ? "true" : "false"} disabled={!tab.path} onClick={toggleVersions}
+              sx={{
+                border: 1, borderColor: versionsOpen ? "primary.main" : "divider", borderRadius: 1, p: 0.5,
+                color: versionsOpen ? "primary.main" : "text.secondary",
+                bgcolor: (t) => (versionsOpen ? alpha(t.palette.primary.main, 0.22) : "transparent"),
+                "&:hover": { bgcolor: (t) => alpha(t.palette.primary.main, versionsOpen ? 0.3 : 0.08) },
+              }}>
+              <HistoryIcon sx={{ fontSize: 18 }} />
+            </IconButton>
           </span>
         </Tooltip>
         <FileMenu />

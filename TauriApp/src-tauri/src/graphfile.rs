@@ -617,10 +617,18 @@ pub fn validate_bytes(bytes: &[u8]) -> FResult<Validated> {
 /// Read a whole file (contract §1.3 steps 1–2): stat first (never opens an
 /// online-only file), then open, fstat and read.
 pub fn read_file_bytes(path: &Path) -> FResult<(Vec<u8>, FileStat)> {
+    read_bytes(path, true)
+}
+
+/// `read_file_bytes`; `ask_download` false: an online-only file is reported
+/// `Dataless` without asking for its download (peek, remove copy).
+fn read_bytes(path: &Path, ask_download: bool) -> FResult<(Vec<u8>, FileStat)> {
     let st = stat_path(path)?;
     if st.dataless {
         // Never read here (a read could block for the whole download); ask for it in the background.
-        request_download(path);
+        if ask_download {
+            request_download(path);
+        }
         return Err(FileErr::dataless(path));
     }
     if st.size > READ_LIMIT {
@@ -642,6 +650,13 @@ pub fn read_file_bytes(path: &Path) -> FResult<(Vec<u8>, FileStat)> {
 
 pub fn read_validated(path: &Path) -> FResult<(Validated, FileStat, Vec<u8>)> {
     let (bytes, st) = read_file_bytes(path)?;
+    let v = validate_bytes(&bytes)?;
+    Ok((v, st, bytes))
+}
+
+/// `read_validated` that never asks for an online-only file's download.
+pub fn read_validated_quiet(path: &Path) -> FResult<(Validated, FileStat, Vec<u8>)> {
+    let (bytes, st) = read_bytes(path, false)?;
     let v = validate_bytes(&bytes)?;
     Ok((v, st, bytes))
 }
@@ -817,6 +832,7 @@ type PathHook = Box<dyn FnMut(&Path) -> FResult<()> + Send>;
 enum HookPoint {
     BeforeDisplace,
     BeforeRename,
+    BeforeRemoveMove,
 }
 
 /// Test seams inside a save (None in the app).
@@ -826,6 +842,11 @@ pub struct Hooks {
     pub before_displace: Option<PathHook>,
     /// After the temp file is written and synced, right before the rename.
     pub before_rename: Option<PathHook>,
+    /// Remove copy (phase 2): after the copy was read and judged, before it is
+    /// stat'ed again and moved. Called with the copy's path.
+    pub before_remove_move: Option<PathHook>,
+    /// Remove copy: move by copy + verify + delete, as across volumes.
+    pub force_copy_move: bool,
 }
 
 pub struct FileCtx {
@@ -913,6 +934,7 @@ impl FileCtx {
         let slot = match which {
             HookPoint::BeforeDisplace => &mut hooks.before_displace,
             HookPoint::BeforeRename => &mut hooks.before_rename,
+            HookPoint::BeforeRemoveMove => &mut hooks.before_remove_move,
         };
         match slot {
             Some(h) => h(p),
@@ -2317,6 +2339,302 @@ impl FileCtx {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Phase 2: peek and remove an extra copy (phase2-contract.md §4.1, §4.2)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// How long displaced copies (replaced files, removed extra copies) are kept
+/// (`LIMITS_P2.removedKeepMs`); applied by the startup pruning.
+pub const DISPLACED_KEEP_MS: i64 = 30 * 24 * 3600 * 1000;
+
+/// `PeekReply` of contract.ts.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PeekReply {
+    pub manifest_text: String,
+    pub stat: FileStat,
+    pub read_only: Option<&'static str>,
+}
+
+/// `graphfile_peek`: the full validation of a read (same errors), returning
+/// the manifest only. No journal entry, no validation record, no track is
+/// touched and an online-only file is not asked for.
+pub fn peek(path: &Path) -> FResult<PeekReply> {
+    let (v, st, _) = read_validated_quiet(path)?;
+    Ok(PeekReply { read_only: v.too_new().then_some("tooNew"), manifest_text: v.manifest_text, stat: st })
+}
+
+/// `RemoveCopyArgs` of contract.ts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveCopyArgs {
+    pub path: String,
+    pub keeper: String,
+    pub analysis_id: String,
+}
+
+/// `RemoveCopyReply` of contract.ts.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RemoveCopyReply {
+    Removed {
+        #[serde(rename = "displacedId")]
+        displaced_id: String,
+        head: String,
+    },
+    Refused {
+        /// "notOlder" | "otherAnalysis" | "sameFile" | "open"
+        reason: &'static str,
+        head: Option<String>,
+        #[serde(rename = "keeperHead")]
+        keeper_head: Option<String>,
+    },
+}
+
+fn refused(reason: &'static str, head: Option<&str>, keeper_head: Option<&str>) -> RemoveCopyReply {
+    RemoveCopyReply::Refused { reason, head: head.map(str::to_string), keeper_head: keeper_head.map(str::to_string) }
+}
+
+/// The path locks of two files, taken in sorted path order. The second is
+/// only tried (and everything released and retried when it is held), so a
+/// save that holds one of them and waits for the other can't deadlock with us.
+fn lock_both<'a>(ctx: &'a FileCtx, a: &Path, b: &Path) -> FResult<(PathGuard<'a>, Option<PathGuard<'a>>)> {
+    let (first, second) = if a <= b { (a, b) } else { (b, a) };
+    if first == second {
+        return Ok((ctx.locks.lock(first), None));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let g1 = ctx.locks.lock(first);
+        if let Some(g2) = ctx.locks.try_lock(second) {
+            return Ok((g1, Some(g2)));
+        }
+        drop(g1);
+        if Instant::now() >= deadline {
+            return Err(FileErr::io("the file is busy, try again in a moment"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Is `copy` a tracked (open) file? By path, or by identity (another spelling
+/// of a tracked file) unless that file is the keeper itself (then it is the
+/// `sameFile` case).
+fn is_tracked(ctx: &FileCtx, copy: &Path, keeper: &Path) -> bool {
+    let tracked: Vec<PathBuf> = lk(&ctx.watch).tracks.keys().cloned().collect();
+    if tracked.iter().any(|t| t == copy) {
+        return true;
+    }
+    let me = file_identity(copy);
+    let keeper_id = file_identity(keeper);
+    tracked.iter().any(|t| is_same_file(t, copy, me) && !is_same_file(t, keeper, keeper_id))
+}
+
+fn is_cross_device(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        e.raw_os_error() == Some(17) // ERROR_NOT_SAME_DEVICE
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+fn same_stat(a: &FileStat, b: &FileStat) -> bool {
+    a.size == b.size && a.mtime == b.mtime && !b.dataless
+}
+
+/// What was read and judged in one round of `remove_copy`.
+struct Judged {
+    bytes: Vec<u8>,
+    stat: FileStat,
+    identity: Option<(u64, u64)>,
+    sha256: String,
+    analysis_id: String,
+    head: String,
+}
+
+impl FileCtx {
+    fn add_displaced(&self, e: &DisplacedEntry) -> FResult<()> {
+        let dir = self.displaced_dir()?;
+        fs::create_dir_all(&dir).map_err(|err| FileErr::from_io(&err, &dir))?;
+        let _g = lk(&self.displaced_lock);
+        let idx_path = dir.join("index.json");
+        let mut idx: DisplacedIndex = load_index(&idx_path);
+        idx.v = 1;
+        idx.entries.push(e.clone());
+        save_index(&idx_path, &idx)
+    }
+
+    /// Change (`Some`) or drop (`None`) the head of a displaced entry.
+    fn amend_displaced(&self, id: &str, head: Option<String>) {
+        let Ok(dir) = self.displaced_dir() else { return };
+        let _g = lk(&self.displaced_lock);
+        let idx_path = dir.join("index.json");
+        let mut idx: DisplacedIndex = load_index(&idx_path);
+        match head {
+            Some(h) => idx.entries.iter_mut().filter(|e| e.id == id).for_each(|e| e.head = h.clone()),
+            None => idx.entries.retain(|e| e.id != id),
+        }
+        idx.v = 1;
+        if let Err(e) = save_index(&idx_path, &idx) {
+            log::warn!("[graphfile] couldn't update the record of removed copies: {}", e.message);
+        }
+    }
+}
+
+/// Step 8: move `from` to `dest`. rename; across volumes write the bytes that
+/// were judged, check them and only then remove the original. Ok(true) = moved
+/// as judged. Ok(false) = the file changed in the last instant and couldn't be
+/// put back: it stays in `dest` (nothing is lost) and the caller fixes the
+/// record. Err = nothing moved.
+fn move_copy(ctx: &FileCtx, from: &Path, dest: &Path, j: &Judged) -> FResult<bool> {
+    let force_copy = lk(&ctx.hooks).force_copy_move;
+    if !force_copy {
+        match fs::rename(from, dest) {
+            Ok(()) => {
+                // The rename moved whatever was there: make sure it is what was judged.
+                let same = fs::read(dest).map(|b| sha256_hex(&b) == j.sha256).unwrap_or(false);
+                if same {
+                    return Ok(true);
+                }
+                if rename_no_replace(dest, from).is_ok() {
+                    return Err(FileErr::incomplete("changing"));
+                }
+                return Ok(false);
+            }
+            Err(e) if !is_cross_device(&e) => return Err(FileErr::from_io(&e, from)),
+            Err(_) => {}
+        }
+    }
+    atomic_write(dest, &j.bytes).map_err(|e| FileErr::from_io(&e, dest))?;
+    let kept = fs::read(dest).map(|b| sha256_hex(&b) == j.sha256).unwrap_or(false);
+    if !kept {
+        let _ = fs::remove_file(dest);
+        return Err(FileErr::io("the copy couldn't be kept safely, so it wasn't removed"));
+    }
+    let unchanged = stat_path(from).map(|s| same_stat(&j.stat, &s)).unwrap_or(false) && file_identity(from) == j.identity;
+    if !unchanged {
+        let _ = fs::remove_file(dest);
+        return Err(FileErr::incomplete("changing"));
+    }
+    if let Err(e) = fs::remove_file(from) {
+        let _ = fs::remove_file(dest);
+        return Err(FileErr::from_io(&e, from));
+    }
+    Ok(true)
+}
+
+/// `graphfile_remove_copy` (phase2-contract.md §4.2): move an extra copy into
+/// `<state>/displaced/` when its head is the keeper's head or an ancestor of
+/// it in the keeper's history, both files re-read right now. Never deletes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn remove_copy(ctx: &FileCtx, req: &RemoveCopyArgs) -> FResult<RemoveCopyReply> {
+    remove_copy_cancellable(ctx, req, &AtomicBool::new(false))
+}
+
+/// `remove_copy` that moves nothing once `cancel` is set (the command gave up
+/// waiting and told the frontend it failed).
+pub fn remove_copy_cancellable(ctx: &FileCtx, req: &RemoveCopyArgs, cancel: &AtomicBool) -> FResult<RemoveCopyReply> {
+    let copy = PathBuf::from(&req.path);
+    let keeper = PathBuf::from(&req.keeper);
+    // 1. arguments, state folder
+    for p in [&copy, &keeper] {
+        if !p.is_absolute() {
+            return Err(FileErr::invalid("the path isn't absolute"));
+        }
+        if !has_lag_ext(p) || p.file_name().is_none() {
+            return Err(FileErr::invalid("the file name must end in .lag"));
+        }
+    }
+    let ddir = ctx.displaced_dir()?;
+    let _guards = lock_both(ctx, &copy, &keeper)?;
+    check_cancel(cancel)?;
+    // 2. an open file is never removed
+    if is_tracked(ctx, &copy, &keeper) {
+        return Ok(refused("open", None, None));
+    }
+    if fs::symlink_metadata(&copy).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        return Err(FileErr::invalid("the copy is a link, not a file"));
+    }
+    let mut round = 0;
+    let judged = loop {
+        round += 1;
+        // 3. re-read both now (nothing moved on any error)
+        let (kv, _, _) = read_validated_quiet(&keeper)?;
+        let (cv, cst, cbytes) = read_validated_quiet(&copy)?;
+        let identity = file_identity(&copy);
+        let (ch, kh) = (cv.header.head.as_str(), kv.header.head.as_str());
+        // 4. one file under two names
+        if is_same_file(&copy, &keeper, file_identity(&keeper)) {
+            return Ok(refused("sameFile", Some(ch), Some(kh)));
+        }
+        // 5. both are this analysis
+        if cv.header.analysis_id != req.analysis_id || kv.header.analysis_id != req.analysis_id {
+            return Ok(refused("otherAnalysis", Some(ch), Some(kh)));
+        }
+        // 6. the copy has nothing the keeper lacks
+        if !is_ancestor_or_self(&kv.manifest, ch, kh) {
+            return Ok(refused("notOlder", Some(ch), Some(kh)));
+        }
+        ctx.run_hook(HookPoint::BeforeRemoveMove, &copy)?;
+        // 7. unchanged since it was read?
+        let now = stat_path(&copy)?;
+        if same_stat(&cst, &now) && file_identity(&copy) == identity {
+            break Judged {
+                sha256: cv.sha256.clone(),
+                analysis_id: cv.header.analysis_id.clone(),
+                head: cv.header.head.clone(),
+                bytes: cbytes,
+                stat: cst,
+                identity,
+            };
+        }
+        if round >= 2 {
+            return Err(FileErr::incomplete("changing"));
+        }
+    };
+    check_cancel(cancel)?;
+    // 8. move into displaced/ (the record first: a crash leaves a record of a
+    // missing file, never a file nobody can find)
+    let id = format!("x-{}", uuid::Uuid::new_v4());
+    let dest = ddir.join(format!("{id}.lag"));
+    ctx.add_displaced(&DisplacedEntry {
+        id: id.clone(),
+        original: req.path.clone(),
+        analysis_id: judged.analysis_id.clone(),
+        head: judged.head.clone(),
+        reason: "removedCopy".into(),
+        at: wall_ms(),
+    })?;
+    match move_copy(ctx, &copy, &dest, &judged) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Kept in displaced/ as it is now; record what it really holds.
+            let head = fs::read(&dest).ok().and_then(|b| validate_bytes(&b).ok()).map(|v| v.header.head);
+            ctx.amend_displaced(&id, Some(head.unwrap_or_default()));
+            crate::graphwatch::forget_copy(ctx, &copy);
+            lk(&ctx.records).remove(&copy);
+            return Err(FileErr::incomplete("changing"));
+        }
+        Err(e) => {
+            ctx.amend_displaced(&id, None);
+            return Err(e);
+        }
+    }
+    // 9. nothing is reported about it any more
+    crate::graphwatch::forget_copy(ctx, &copy);
+    lk(&ctx.records).remove(&copy);
+    // 10.
+    Ok(RemoveCopyReply::Removed { displaced_id: id, head: judged.head })
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Running blocking work from async commands
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -2462,6 +2780,24 @@ pub async fn graphfile_list_displaced(ctx: tauri::State<'_, Ctx>) -> Result<Vec<
 pub async fn graphfile_read_displaced(ctx: tauri::State<'_, Ctx>, id: String) -> Result<Option<RawFile>, FileErr> {
     let ctx = ctx.inner().clone();
     blocking(COMMAND_TIMEOUT, move || Ok(ctx.read_displaced(&id)?.map(|v| v.raw()))).await
+}
+
+#[tauri::command]
+pub async fn graphfile_peek(path: String) -> Result<PeekReply, FileErr> {
+    blocking(COMMAND_TIMEOUT, move || peek(Path::new(&path))).await
+}
+
+#[tauri::command]
+pub async fn graphfile_remove_copy(ctx: tauri::State<'_, Ctx>, req: RemoveCopyArgs) -> Result<RemoveCopyReply, FileErr> {
+    let ctx = ctx.inner().clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let r = blocking(COMMAND_TIMEOUT, move || remove_copy_cancellable(&ctx, &req, &flag)).await;
+    if matches!(&r, Err(e) if e.kind == ErrKind::OfflineOrTimeout) {
+        // The frontend is told it failed: the worker must not move the file later.
+        cancel.store(true, Ordering::SeqCst);
+    }
+    r
 }
 
 /// Show the file in Finder / Explorer / the file manager.

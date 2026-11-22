@@ -198,7 +198,7 @@ describe("drafts and restoring the last session", () => {
     expect(a2.ses.getState().tabs).toEqual([]);
   });
 
-  it("a draft based on an older version: newer version banner, Save meets the conflict sheet", async () => {
+  it("a draft based on an older version: newer version banner (Combine), Save combines (phase 2)", async () => {
     const { w, a } = await oneComputer();
     await seedFile(w, a.dev, A);
     await a.ses.getState().open(A);
@@ -216,11 +216,15 @@ describe("drafts and restoring the last session", () => {
     const a2 = await a.restart();
     const t = a2.ses.getState().tabs[0];
     expect(t.baseRevision).toBe(f.manifest.head);
-    expect(t.banners.map((b) => b.kind)).toContain("newerOnDisk");
+    expect(t.banners.find((b) => b.kind === "newerOnDisk")?.actions).toEqual(["combine", "later"]);
     expect(a2.graph.getState().doc!.cells[0][0][0]).toBe("mine");
     const r = await a2.ses.getState().save();
-    expect(r).toEqual({ ok: false, reason: "conflict" });
-    expect(a2.ses.getState().dialog?.kind).toBe("conflict");
+    // Mine changed the table, theirs the graph: combined in one step.
+    expect(r).toEqual({ ok: true, path: A });
+    expect(a2.ses.getState().dialog).toBeNull();
+    expect(a2.graph.getState().doc!.cells[0][0][0]).toBe("mine");
+    expect(a2.graph.getState().figure.title).toBe("theirs");
+    expect(a2.ses.getState().tabs[0].banners.find((b) => b.kind === "combined")?.sections).toEqual(["figure"]);
   });
 
   it("a draft that doesn't match the file is offered, never dropped", async () => {
@@ -492,7 +496,7 @@ describe("copies of one analysis in a folder", () => {
     let t = a.ses.getState().tabs[0];
     await a.ses.getState().bannerAction(t.key, `copy:${DOCS}/A 2.lag`, "same");
     t = a.ses.getState().tabs[0];
-    expect(t.banners.find((x) => x.id === `copy:${DOCS}/A 2.lag`)).toMatchObject({ kind: "extraCopy", relation: "same", actions: ["dismiss"] });
+    expect(t.banners.find((x) => x.id === `copy:${DOCS}/A 2.lag`)).toMatchObject({ kind: "extraCopy", relation: "same", actions: ["remove", "keep"] });
     // A newer conflicted copy.
     const { buildNextFile } = await import("./docCodec");
     const next = await buildNextFile(a.dev.localFile(A)!, { ...contentAt(a.dev, A)!, figure: { ...contentAt(a.dev, A)!.figure, title: "x" } }, {
