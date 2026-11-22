@@ -30,9 +30,6 @@ import r_bridge
 
 router = APIRouter()
 
-# LightCycler export columns to drop (Include, Color, Concentration, Standard, Status)
-QPCR_DROP_COLS = [0, 1, 5, 6, 7]
-
 # Plate-map cells that mean "unassigned well" — pandas' default NA markers
 # minus "NA" and "None", which are plausible sample names.
 PLATEMAP_BLANKS = ["", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan", "1.#IND", "1.#QNAN",
@@ -41,17 +38,64 @@ PLATEMAP_BLANKS = ["", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN",
 
 # ── Parsing ─────────────────────────────────────────────────────────────────
 
+class QpcrFileError(ValueError):
+    """A file whose table could not be found; the message is shown as is."""
+
+
+def _decode(data: bytes) -> str:
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1", errors="replace")
+
+
+def _cells(line: str) -> List[str]:
+    return [c.strip().strip('"').strip().lower() for c in line.split("\t")]
+
+
+def _table_text(data: bytes, wants: List[set], what: str, expected: str) -> str:
+    """The tab-separated table in `data`, from its header row on.
+
+    Exports carry text before the table: the LightCycler's "Experiment: …"
+    line, or a block of "#" comment lines from plate-map generators such as
+    the OT-2 Config Builder. The header is the first row (within the first
+    200 lines) that has a column from every set in `wants`
+    (case-insensitive). Blank and "#" lines are skipped."""
+    lines = _decode(data).splitlines()
+    for i, line in enumerate(lines[:200]):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        cells = set(_cells(line))
+        if all(cells & w for w in wants):
+            return "\n".join(lines[i:])
+    raise QpcrFileError(f"{what}: couldn't find the table header ({expected}). Is this the right file?")
+
+
+_POS = {"pos", "cell position", "well", "position", "well position"}
+
+
+def _rename_like(df: pd.DataFrame, names: set, to: str) -> pd.DataFrame:
+    for c in df.columns:
+        if str(c).strip().lower() in names:
+            return df.rename(columns={c: to})
+    return df
+
+
 def _parse_pair_wells(qpcr_bytes: bytes, platemap_bytes: bytes) -> pd.DataFrame:
     """Every plate-mapped well with its position and Cp (NaN = undetermined),
     unfiltered — what the run library stores."""
-    dq = pd.read_csv(io.BytesIO(qpcr_bytes), sep="\t", skiprows=1)
-    dq = dq.drop(dq.columns[QPCR_DROP_COLS], axis=1)
+    qtext = _table_text(qpcr_bytes, [{"pos"}, {"cp"}], "qPCR file", "Pos and Cp columns")
+    dq = pd.read_csv(io.StringIO(qtext), sep="\t", dtype=str, keep_default_na=False)
+    dq = _rename_like(_rename_like(dq, {"pos"}, "Pos"), {"cp"}, "Cp")[["Pos", "Cp"]]
     # Plate-map labels are text: read them as such so an all-numeric Sample
     # column doesn't become "1.0" in one run and "1" in another, and a sample
     # literally named "NA" isn't read as missing.
-    dl = pd.read_csv(io.BytesIO(platemap_bytes), sep="\t", dtype=str, keep_default_na=False, na_values=PLATEMAP_BLANKS)
-    if "Cell Position" in dl.columns:
-        dl = dl.rename(columns={"Cell Position": "Pos"})
+    ptext = _table_text(platemap_bytes, [_POS, {"gene"}, {"sample"}], "Plate map", "Cell Position, Gene and Sample columns")
+    dl = pd.read_csv(io.StringIO(ptext), sep="\t", dtype=str, keep_default_na=False, na_values=PLATEMAP_BLANKS)
+    dl = _rename_like(_rename_like(_rename_like(dl, _POS, "Pos"), {"gene"}, "Gene"), {"sample"}, "Sample")[["Pos", "Gene", "Sample"]]
     dq["Pos"] = dq["Pos"].astype(str).str.strip()
     dl["Pos"] = dl["Pos"].str.strip()
     merged = pd.merge(dq, dl, on="Pos", how="inner").dropna(subset=["Sample", "Gene"])
