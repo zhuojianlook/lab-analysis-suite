@@ -1,8 +1,8 @@
 {
-  "version": "0.2.24",
-  "notes": "Update to exp-0.2.24",
-  "pub_date": "2026-11-23T00:00:31Z",
+  "version": "0.2.25",
+  "notes": "Update to exp-0.2.25",
+  "pub_date": "2026-11-23T03:08:28Z",
   "platforms": {
-    "darwin-aarch64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5Wm1KSVdJSXJPRVo0ZHpLdkxiRG5MTHQybktlZUxraDVRbXJuMUJLdXF1djJ6ODB0YytFRUY2ODFubTZtKzVyOUtTUUd3cWJTa1F2cXJBdldKM2ptMFEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MzkxOTMzCWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlLmFwcC50YXIuZ3oKaWhFRHErNFdwTUlRWDh2QmJzWDIzL2wxb3QrNGNPdi9xbEJoaXAwTkdKbGl5MW5NdlRSYW5XaEUwa0dSbjZ6d3N4Um5rWXY0ZzFaNTdZL3VuTkdZREE9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.24/Lab.Analysis.Suite.app.tar.gz" }
+    "darwin-aarch64": { "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRT1ZzcGpyREx5WmhFTmQyREdqNTJaZWxnSmNsalNwTnA0b0M4ZHY1MVVmY3hpK3N5OWthdHNoeUgwUGNnaXNtTjRzaGVRWXp2b2ZTSWhyZTZublRvUGJUKzVTTlk0d3cwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NDAzMjU4CWZpbGU6TGFiIEFuYWx5c2lzIFN1aXRlLmFwcC50YXIuZ3oKSk5kMm1sNTlSb09NTE5TdGdjRlc5VWE3aVZEdHVyWURQeHJudGlMalVpcXZvTSt4dGtmMGhmWDE2cXBVTm51WGZFY1NwZnB2RkcwenhvRHpWWFU3Qmc9PQo=", "url": "https://github.com/zhuojianlook/lab-analysis-suite/releases/download/exp-0.2.25/Lab.Analysis.Suite.app.tar.gz" }
   }
 }
