@@ -9,6 +9,7 @@ import { useGraphStore } from "../../../store/graphStore";
 import { MAX_COLS, MAX_ROWS, leadCols, previewPaste, type PasteAnchor, type PasteResult } from "../graphModel";
 import { MOD_KEY } from "../GraphLibrary";
 import { rangeName, type CellRange } from "./scratchModel";
+import { BlockedClick, useReadOnly } from "../RailGuard";
 
 export interface SendInfo {
   range: CellRange;
@@ -28,6 +29,8 @@ export function SendToDataDialog({ info, onClose, onSent }: {
   onSent: (r: PasteResult) => void;
 }) {
   const doc = useGraphStore((s) => s.doc);
+  /** Phase 3: the analysis became read-only while the dialog was open — Send is unavailable. */
+  const readOnly = useReadOnly();
   const template = doc?.template ?? "column";
   const hasLead = template !== "column";
   const [leadFirst, setLeadFirst] = useState(true);
@@ -90,9 +93,11 @@ export function SendToDataDialog({ info, onClose, onSent }: {
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose}>Cancel</Button>
-        <Button autoFocus variant="contained" color={replace ? "warning" : "primary"} onClick={confirm} disabled={!preview}>
-          {replace ? "Replace and send" : "Send"}
-        </Button>
+        <BlockedClick on={readOnly} path="scratchpad" action="sendToData">
+          <Button autoFocus variant="contained" color={replace ? "warning" : "primary"} onClick={confirm} disabled={!preview || readOnly}>
+            {replace ? "Replace and send" : "Send"}
+          </Button>
+        </BlockedClick>
       </DialogActions>
     </Dialog>
   );

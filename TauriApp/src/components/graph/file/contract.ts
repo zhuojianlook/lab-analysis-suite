@@ -11,7 +11,11 @@
    pass through Rust unchanged.
 
    Phase 2 ("Versions and combining", phase2-contract.md) is section 6 at the
-   end, plus the members marked "Phase 2" in the unions and constants above. */
+   end, plus the members marked "Phase 2" in the unions and constants above.
+
+   Phase 3 ("Check-out": read-only on the other computers while one is editing,
+   phase3-contract.md) is section 7 at the end, plus the members marked
+   "Phase 3" above. */
 
 import type { Template } from "../../../api/graph";
 import type {
@@ -67,6 +71,15 @@ export const CMD = {
   removeCopy: "graphfile_remove_copy",
   readSeen: "appstate_read_seen",
   writeSeen: "appstate_write_seen",
+
+  // Phase 3 (who is editing; phase3-contract.md §3)
+  presenceSet: "presence_set",
+  presenceClear: "presence_clear",
+  presenceInput: "presence_input",
+  presenceList: "presence_list",
+  presenceRemoveForeign: "presence_remove_foreign",
+  cloudInfo: "graphfile_cloud_info",
+  newDeviceId: "appstate_new_device_id",
 } as const;
 export type CommandName = (typeof CMD)[keyof typeof CMD];
 
@@ -105,6 +118,8 @@ export const MENU = {
   oldLibrary: "file.old_library",
   /** Phase 2: open / close the Versions panel of the active tab. Enabled with MenuState.hasDoc. */
   versions: "file.versions",
+  /** Phase 3: "Show Others When I'm Editing…" for the active tab. Enabled with MenuState.hasDoc. */
+  sharing: "file.sharing",
 } as const;
 export type MenuId = (typeof MENU)[keyof typeof MENU];
 
@@ -415,6 +430,15 @@ export interface Commands {
   graphfile_remove_copy: { args: { req: RemoveCopyArgs }; result: RemoveCopyReply };
   appstate_read_seen: { args: Record<string, never>; result: SeenMap };
   appstate_write_seen: { args: { seen: SeenMap }; result: null };
+
+  // Phase 3
+  presence_set: { args: { req: PresenceSetArgs }; result: PresenceSetReply };
+  presence_clear: { args: { docPath: string }; result: null };
+  presence_input: { args: { docPath: string }; result: null };
+  presence_list: { args: { docPath: string; analysisId: string }; result: PresenceListReply };
+  presence_remove_foreign: { args: { req: RemoveNoteArgs }; result: RemoveNoteReply };
+  graphfile_cloud_info: { args: { path: string }; result: CloudInfo };
+  appstate_new_device_id: { args: Record<string, never>; result: DeviceIdentity };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -458,8 +482,12 @@ export const BANNER_ORDER = [
   "permission", "downloading", "missing", "replaced", "tooNew",
   "saveFailed", "notSaved", "savedAside", "savedOver", "savedDisplaced", "tookTheirs", "draftMismatch",
   "copyQuestion", "extraCopy", "tempLocation",
+  // Phase 3 ("who is editing"): after the extra-copy group, before newer / older version.
+  "resuming", "continuedElsewhere", "bothEditing", "waitingNewer", "editingElsewhere",
   // Phase 2: "combined" is a note with Undo; it ranks below every banner that asks for a choice.
   "rolledBack", "newerOnDisk", "newerCopy", "combined", "olderCopy", "recovered",
+  // Phase 3: information only, below everything else.
+  "editingInfo", "unconfirmed", "olderPeer",
 ] as const;
 export type BannerKind = (typeof BANNER_ORDER)[number];
 
@@ -470,7 +498,12 @@ export type BannerAction =
   | "updateMine" | "openThatOne" | "openAsNew" | "discardDraft" | "chooseLocation"
   /** Phase 2. combine: start combining (newerOnDisk, savedOver, extraCopy). remove / keep: an older extra copy.
    *  whatChanged / undo: on the "combined" banner. */
-  | "combine" | "remove" | "keep" | "whatChanged" | "undo";
+  | "combine" | "remove" | "keep" | "whatChanged" | "undo"
+  /** Phase 3. editHere: edit on this computer now (my own other computer is editing, or a note that went quiet).
+   *  editAnyway: the same over someone else's editing — asks first (dialog "editAnyway").
+   *  keepEditing: close the "also being edited" / "continued elsewhere" banner, or end the after-sleep check now.
+   *  saveCopy: "Save my changes as a separate copy…" (my version becomes a new analysis in a place I choose). */
+  | "editHere" | "editAnyway" | "keepEditing" | "saveCopy";
 
 /** Who saved a version and when (from a revision). Times are shown as this
  *  computer sees them ("2 h ago", a date when older than a day). */
@@ -508,6 +541,12 @@ export interface TabBanner {
   state?: "combining" | "choose";
   /** Phase 2, combined only: the sections taken from the other version. */
   sections?: SectionName[];
+  /** Phase 3: who the banner is about (kinds resuming, continuedElsewhere, bothEditing, waitingNewer,
+   *  editingElsewhere, editingInfo, olderPeer), most relevant first. */
+  peers?: PeerView[];
+  /** Phase 3, editingElsewhere only: this computer is still checking the notes after waking up
+   *  ("Checking who is editing…"; no buttons). */
+  checking?: boolean;
 }
 
 export interface FileTab {
@@ -541,6 +580,8 @@ export interface FileTab {
   /** Phase 2: newer content is waiting to be shown (held back while a cell is being typed in, a
    *  drag, a menu or an export is active). The UI veils the graph with "Updating…". */
   updating?: boolean;
+  /** Phase 3: who is editing, and whether this tab is read-only because of it. Absent = "editable", nobody else. */
+  presence?: TabPresence;
 }
 
 /** A session entry that could not be opened (startup or later). Shown in the
@@ -645,14 +686,24 @@ export type SessionDialog =
   /** Phase 2: the combine dialog. Nothing is written until applyCombine(). */
   | { kind: "combine"; state: CombineState }
   /** Phase 2: "Bring this version back" / "Undo" on a tab with unsaved changes. */
-  | { kind: "bringBackDirty"; tabKey: string; title: string; version: VersionInfo };
+  | { kind: "bringBackDirty"; tabKey: string; title: string; version: VersionInfo }
+  /** Phase 3: "Edit anyway…" over someone else's editing. */
+  | { kind: "editAnyway"; tabKey: string; title: string; peers: PeerView[] }
+  /** Phase 3: Save, or the first new edit, in the 45 s after this computer woke up while it was editing. */
+  | { kind: "resumeConfirm"; tabKey: string; title: string; what: "save" | "edit" }
+  /** Phase 3: "Show others when I'm editing this file". */
+  | { kind: "sharing"; tabKey: string; title: string; sharing: SharingView };
 
 export type DialogAnswer =
   | { kind: "saveAsKind"; choice: "new" | "same" | "cancel" }
   | { kind: "closeDirty"; choice: "save" | "discard" | "cancel" }
   | { kind: "quit"; choice: "saveAll" | "keep" | "cancel" }
   /** Phase 2. saveFirst: save my changes as a version, then bring the chosen version back. */
-  | { kind: "bringBackDirty"; choice: "saveFirst" | "cancel" };
+  | { kind: "bringBackDirty"; choice: "saveFirst" | "cancel" }
+  /** Phase 3. */
+  | { kind: "editAnyway"; choice: "edit" | "cancel" }
+  /** go: save / keep editing now. wait: close the dialog, nothing happens (the check goes on). */
+  | { kind: "resumeConfirm"; choice: "go" | "wait" };
 
 export interface SessionToast {
   id: number;
@@ -661,7 +712,9 @@ export interface SessionToast {
   kind: "renamed" | "saved" | "reloaded" | "tabLimit" | "alreadyOpen" | "restoredDrafts" | "error"
     /** Phase 2. combined: `version` = the other side. broughtBack: `version` = the version brought back.
      *  copyRemoved: `name` = the copy's file name without extension. savedAsNew: `name` = the new file. */
-    | "combined" | "broughtBack" | "copyRemoved" | "savedAsNew";
+    | "combined" | "broughtBack" | "copyRemoved" | "savedAsNew"
+    /** Phase 3. deviceIdChanged: this computer shared its identity with another one and got a new one. */
+    | "deviceIdChanged";
   name?: string;
   version?: VersionInfo;
   count?: number;
@@ -685,6 +738,8 @@ export interface RecentItem {
 export interface FileSettings {
   userName: string;
   deviceName: string;
+  /** Phase 3: "Show others when I'm editing" for files without a choice of their own. Absent = "auto". */
+  shareDefault?: ShareMode;
 }
 
 export type OpenOutcome =
@@ -695,8 +750,10 @@ export type OpenOutcome =
 export type SaveOutcome =
   | { ok: true; path: string }
   /** cancelled: a picker or question was closed. conflict: the conflict sheet is open.
-   *  nothing: no document / nothing to do. failed: a banner says why. */
-  | { ok: false; reason: "cancelled" | "conflict" | "nothing" | "failed" };
+   *  nothing: no document / nothing to do. failed: a banner says why.
+   *  Phase 3 — readOnly: the tab is read-only (another computer is editing, or a newer version is loading);
+   *  nothing was written and the banner's button was pulsed. */
+  | { ok: false; reason: "cancelled" | "conflict" | "nothing" | "failed" | "readOnly" };
 
 export interface FileSessionState {
   /** init() has finished restoring the last session. */
@@ -1420,4 +1477,555 @@ export interface DevSimApiP2 extends DevSimApi {
   remoteEditMany(path: string, count: number): Promise<string>;
   /** Extra copies removed on this computer (newest first). */
   removed(): SimRemoved[];
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. Phase 3 — check-out: read-only on the other computers while one is editing
+//    (docs/design/analysis-files-phase3-contract.md)
+//
+// Additive. Phase 1 / 2 names keep their meaning; the unions above gained members
+// that are marked "Phase 3". The controller's store becomes FileSessionStateP3,
+// the backend FileBackendP3, the simulator DevSimApiP3, the graph store gains
+// StoreGuardApi. Code words: note = the small ".laguse" file a computer keeps
+// beside an analysis while it has it open ("beacon" in the plan).
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Numbers of phase 3. Times in ms. */
+export const LIMITS_P3 = {
+  /** A note file larger than this is not a note (never read further). */
+  noteMaxBytes: 8192,
+  /** Most ".laguse" files looked at in one folder (by name order). */
+  notesPerFolder: 200,
+  /** While editing with recent input, the note is rewritten this often (seq + 1). */
+  heartbeatMs: 60_000,
+  /** "Recent input": the last edit / key / click in the tab is at most this old. */
+  inputWindowMs: 600_000,
+  /** The frontend tells Rust about input at most this often per file. */
+  inputPingMs: 30_000,
+  /** An idle note is rewritten this often while the app runs, so it never looks abandoned. */
+  idleKeepAliveMs: 6 * 3600_000,
+  /** First sight of a note: quiet at once when its `updated_at` is older than this by my clock. */
+  firstSightOldMs: 600_000,
+  /** First sight otherwise: counts as active this long while waiting for its first seq change. */
+  freshFirstMs: 90_000,
+  /** After a seq change was seen: quiet when no further change came for this long. */
+  staleMs: 300_000,
+  /** After my wake-up: observations are "checking" until the next listing, at most this long. */
+  recheckMaxMs: 15_000,
+  /** After Save, my note stays "editing" this long without further input (decision D6). */
+  lingerMs: 30_000,
+  /** A clean tab waits this long (my own time) for a version a note announces. */
+  waitNewerMs: 120_000,
+  /** The same when the announcing note was already old at first sight. */
+  waitOldNoteMs: 20_000,
+  /** A timer this late (by this computer's clock) means the computer slept. */
+  sleepGapMs: 90_000,
+  /** After a sleep while editing: the "checking for changes" window. */
+  resumeMs: 45_000,
+  /** The controller's presence timer (also the sleep detector in the preview and tests). */
+  tickMs: 5000,
+  /** Another computer's note that has not changed for this long is removed. */
+  cleanupMs: 24 * 3600_000,
+  /** Quit: time allowed for deleting this computer's notes. */
+  quitDeleteMs: 1500,
+  /** Note file name: longest document part / computer part (characters, then UTF-8 bytes). */
+  nameStemChars: 60,
+  nameStemBytes: 120,
+  nameDeviceChars: 30,
+  nameDeviceBytes: 60,
+  /** Becoming read-only is put off this long at a time while something is being typed. */
+  applyHoldRetryMs: 500,
+  /** How long the banner's button is highlighted after a refused edit. */
+  attemptPulseMs: 4000,
+} as const;
+
+/** manifest.features written by phase 3 (format.ts FEATURES becomes this). */
+export const FEATURES_P3 = 2;
+
+// ── 7.1 The note file ───────────────────────────────────────────────────────
+
+/** First line of every note file (then "\n", then the JSON object). */
+export const NOTE_FIRST_LINE = "Lab Analysis Suite note: shows who has this analysis open. Safe to delete.";
+export const NOTE_FORMAT = "lasgraph-presence";
+export const NOTE_VERSION = 1;
+
+/** A claim another note overrides ("Edit here" / "Edit anyway"). */
+export interface NoteTarget {
+  device_id: string;
+  epoch: number;
+}
+
+/** The JSON object of a note file, in this key order. snake_case: it is a file format. */
+export interface NoteJson {
+  format: typeof NOTE_FORMAT;
+  v: 1;
+  analysis_id: string;
+  /** File name of the document with extension ("Dose response.lag"). */
+  document_name: string;
+  device_id: string;
+  session_id: string;
+  device_name: string;
+  user_name: string;
+  /** Reserved, never written in phase 3: "requesting". A reader treats any other value as "idle". */
+  state: "idle" | "editing";
+  /** Newest version this computer wrote or checked; null = none yet. */
+  head: string | null;
+  /** state "editing": the version the unsaved changes are based on; else null. */
+  base_revision: string | null;
+  /** + 1 each time this computer starts editing. */
+  epoch: number;
+  /** + 1 on every rewrite of the note. */
+  seq: number;
+  /** state "editing" after "Edit here": the claims this one overrides; else null. (A reader also accepts one object.) */
+  supersedes: NoteTarget[] | null;
+  /** ISO time of the writer's clock. Display, and the first-sight rule only. */
+  updated_at: string;
+  /** Reserved for the later hand-over feature; always null in phase 3. */
+  request_to: null;
+  handover_to: null;
+  features: number;
+}
+
+/** A note as a folder listing gives it. */
+export interface NoteRecord {
+  /** Absolute path of the note file. */
+  file: string;
+  size: number;
+  /** ms, this computer's file system. */
+  mtime: number;
+  /** SHA-256 (hex) of the file's bytes. */
+  sha: string;
+  /** This computer's clock (ms) when it first recorded the file with exactly these bytes (kept across restarts). */
+  unchangedSince: number;
+  note: NoteJson;
+  /** It is about the document asked for (§1.4 of the contract). */
+  applies: boolean;
+  /** No analysis file in the folder has its analysis id. */
+  orphan: boolean;
+  /** Written by this computer (its device id or an earlier one of it). */
+  own: boolean;
+}
+
+// ── 7.2 Rust commands added in phase 3 ──────────────────────────────────────
+
+/** presence_set { req }: create or replace this computer's note for a document. */
+export interface PresenceSetArgs {
+  /** Absolute path of the analysis file. The note is written in its folder, nowhere else. */
+  docPath: string;
+  analysisId: string;
+  state: "idle" | "editing";
+  head: string | null;
+  baseRevision: string | null;
+  epoch: number;
+  /** [] = none. */
+  supersedes: NoteTarget[];
+  /** true: there was input just now (also counts as presence_input). */
+  input: boolean;
+}
+
+/** presence_set → off: nothing was written. debugRoot: a debug build outside its allowed test folders.
+ *  closing: the app is quitting. */
+export type PresenceSetReply =
+  | { kind: "written"; file: string; note: NoteJson }
+  | { kind: "off"; reason: "debugRoot" | "closing" };
+
+/** presence_list → the notes in the document's folder that are about it, plus orphans. */
+export interface PresenceListReply {
+  notes: NoteRecord[];
+  /** More than LIMITS_P3.notesPerFolder note files: the rest was not looked at. */
+  truncated: boolean;
+}
+
+/** presence_remove_foreign { req }: delete another computer's abandoned note. */
+export interface RemoveNoteArgs {
+  file: string;
+  /** NoteRecord.sha the decision was made on. */
+  sha: string;
+}
+
+/** kept — changed: the bytes are different now. gone: no such file. own: it is this computer's.
+ *  notANote: not a ".laguse" note. */
+export type RemoveNoteReply =
+  | { kind: "removed" }
+  | { kind: "kept"; reason: "changed" | "gone" | "own" | "notANote" };
+
+/** graphfile_cloud_info { path } */
+export interface CloudInfo {
+  /** The path is inside a folder a sync service keeps on several computers. */
+  cloud: boolean;
+  /** "Dropbox", "OneDrive", "Google Drive", "iCloud Drive", "Box", another name, or null. */
+  service: string | null;
+  /** The service's folder (absolute, no trailing slash), or null. */
+  root: string | null;
+}
+
+/** EVT.file in phase 3: RustFileEvent plus
+ *  presence — the notes about a tracked file changed (the full current list, as presence_list gives it);
+ *  wake — the computer slept: a timer of the poll thread fired more than LIMITS_P3.sleepGapMs late. */
+export type RustFileEventP3 =
+  | RustFileEvent
+  | { type: "presence"; path: string; notes: NoteRecord[] }
+  | { type: "wake"; gapMs: number };
+
+// ── 7.3 FileBackend, phase 3 additions ──────────────────────────────────────
+
+/** What a phase 3 backend hands its subscribers. (The phase 1 member { type: "presence"; path } without
+ *  `notes` stays in the union for compatibility; no backend sends it.) */
+export type FileEventP3 = FileEventP1 | RustFileEventP3;
+
+export type PresenceSetResult =
+  | { ok: true; kind: "written"; file: string; note: NoteJson }
+  | { ok: true; kind: "off"; reason: "debugRoot" | "closing" }
+  | FileError;
+
+export type PresenceListResult = ({ ok: true } & PresenceListReply) | FileError;
+
+/** FileBackendP2 with a wider `subscribe` (its listener also gets the phase 3 events), plus the note commands. */
+export interface FileBackendP3 extends Omit<FileBackendP2, "subscribe"> {
+  /** Create or replace this computer's note for a document; the backend keeps beating it while `state` is "editing". */
+  presenceSet(req: PresenceSetArgs): Promise<PresenceSetResult>;
+  /** Delete this computer's note(s) for a document and stop beating. Missing is fine. */
+  presenceClear(docPath: string): Promise<void>;
+  /** "There was input now" for a document being edited. Never touches the disk on the caller's side. */
+  presenceInput(docPath: string): void;
+  presenceList(docPath: string, analysisId: string): Promise<PresenceListResult>;
+  /** Delete another computer's note after re-reading it unchanged. Resolves true when it was removed. */
+  presenceRemoveForeign(req: RemoveNoteArgs): Promise<boolean>;
+  cloudInfo(path: string): Promise<CloudInfo>;
+  /** This computer gets a new identity (its identity was found on another computer too). */
+  newDeviceId(): Promise<DeviceIdentity>;
+  subscribe(listener: (e: FileEventP3) => void): () => void;
+}
+
+// ── 7.4 Pure module file/presence.ts (PresenceApi) ──────────────────────────
+// No I/O, no clock, no randomness, no store access. Every time is passed in.
+
+/** active: counts as being edited right now. quiet: no sign of life (crash, sleep, long pause).
+ *  checking: this computer just woke up and has not looked again yet. */
+export type Freshness = "active" | "quiet" | "checking";
+
+/** What this computer has observed of one other computer's note (times: this computer's clock). */
+export interface NoteObs {
+  deviceId: string;
+  sessionId: string;
+  epoch: number;
+  seq: number;
+  state: "idle" | "editing";
+  /** When this computer first saw a note of that device (again: after its own wake-up). */
+  firstSeenAt: number;
+  /** When (session, epoch, seq) last changed in front of this computer (= firstSeenAt before any change). */
+  changedAt: number;
+  /** Changes seen since firstSeenAt. */
+  changes: number;
+  /** When it was first seen in state "editing" with this epoch (for "at 19:40"). */
+  editingSince: number | null;
+  /** First sight: `updated_at` was more than firstSightOldMs old (or unreadable). */
+  oldAtFirstSight: boolean;
+  /** Set by a sleep gap; cleared by the next observe(). */
+  checking: boolean;
+}
+
+export interface PresenceObs {
+  /** By device id. */
+  notes: Record<string, NoteObs>;
+  /** Version id a note announced that this computer does not have → when that was first seen. */
+  unknownSince: Record<string, number>;
+  /** When the last sleep gap was noted and not yet looked at again; null otherwise. */
+  checkingSince: number | null;
+}
+
+export type TabMode =
+  /** Nothing in the way. */
+  | "editable"
+  /** Clean tab; another computer is editing this very version. */
+  | "readOnly"
+  /** Clean tab; a note announces a version that has not arrived here yet. */
+  | "waiting"
+  /** Editable; someone has unsaved changes on an older version, or a note went quiet. */
+  | "info"
+  /** I have unsaved changes (or just took over) and so does another computer. */
+  | "bothEditing"
+  /** I was editing, the computer slept: checking what happened meanwhile. */
+  | "resuming";
+
+/** One other computer, for texts. */
+export interface PeerView {
+  deviceId: string;
+  deviceName: string;
+  userName: string;
+  /** Its user name equals mine (both non-empty after trim). */
+  sameUser: boolean;
+  state: "idle" | "editing";
+  freshness: Freshness;
+  /** state "editing": what its unsaved changes are based on, seen from my file. myVersion: the version my
+   *  file has. older: an earlier version of my file. unknown: a version I don't have. Else null. */
+  basedOn: "myVersion" | "older" | "unknown" | null;
+  /** Its note's `updated_at` (its clock; display only: "from Fri 18:02"). */
+  updatedAt: string;
+  /** NoteObs.editingSince / changedAt (my clock, ms): "at 19:40", "note updated 2 min ago". */
+  editingSince: number | null;
+  changedAt: number;
+  /** Another note overrides this claim. */
+  superseded: boolean;
+  /** This note overrides my claim. */
+  supersedesMe: boolean;
+}
+
+export interface PresenceInput {
+  me: { deviceId: string; userName: string };
+  /** This computer's clock, ms. */
+  now: number;
+  /** Newest version of the file on this computer's disk; null = unknown / untitled. */
+  diskHead: string | null;
+  /** Is this version id in my file's history (the tab's manifest and the file on disk)? */
+  knows(revisionId: string): boolean;
+  /** The tab has unsaved changes. */
+  dirty: boolean;
+  /** My note says "editing" (unsaved changes, the 30 s after a save, or right after "Edit here"). */
+  holding: boolean;
+  /** My note's epoch (0 = never claimed). */
+  myEpoch: number;
+  /** The after-sleep window is open. */
+  resuming: boolean;
+  /** Claims the person chose to override in this tab ("Edit here" / "Edit anyway"). */
+  overrides: readonly NoteTarget[];
+  /** Other computers' notes about this document, one per device (pickPerDevice). */
+  notes: readonly NoteJson[];
+  obs: PresenceObs;
+}
+
+export interface PresenceDecision {
+  mode: TabMode;
+  /** mode "readOnly" only because of notes this computer has not re-checked since it woke up. */
+  checking: boolean;
+  /** Every other computer with a note, editing first, then by device name / id. */
+  peers: PeerView[];
+  /** Device ids (of `peers`) the mode is about, most relevant first. */
+  about: string[];
+  /** mode "readOnly": the claims "Edit here" must override. */
+  blockers: NoteTarget[];
+  /** mode "bothEditing": the device whose note overrides my claim, if any. */
+  yieldedTo: string | null;
+  /** mode "waiting". `until`: when the tab stops waiting (my clock). */
+  waiting: { head: string; deviceId: string; since: number; until: number } | null;
+  /** A wait ran out: "Couldn't confirm the newest version yet." */
+  unconfirmed: boolean;
+  /** The earliest time (my clock) at which the answer can change without any new input; null = never. */
+  nextCheckAt: number | null;
+}
+
+export type ShareMode = "auto" | "always" | "never";
+
+/** Why notes are / are not written for a file. */
+export type ShareWhy = "always" | "cloud" | "otherComputers" | "never" | "local" | "untitled";
+
+export interface PresenceApi {
+  /** The text of a note file: NOTE_FIRST_LINE + "\n" + JSON.stringify(note, null, 1) + "\n", keys in NoteJson order. */
+  noteText(note: NoteJson): string;
+  /** null: not a note (too long, no JSON object, wrong format / v, a missing or mistyped field). Unknown keys are ignored;
+   *  `supersedes` given as one object becomes a one-element list; an unknown `state` becomes "idle". */
+  parseNote(text: string): NoteJson | null;
+  /** One part of a note file name, made safe (§1.2). `fallback` when nothing is left. */
+  sanitizeNamePart(text: string, maxChars: number, maxBytes: number, fallback: string): string;
+  /** The 4-character tag of a device in note names. attempt 0: the last 4 hex digits of the id; 1: the 4 before
+   *  them; 2: the last 8. Missing digits are filled with "0" on the left. */
+  deviceTag(deviceId: string, attempt: 0 | 1 | 2): string;
+  /** "<stem> (in use on <device>, <tag>).laguse". `docFileName` with or without ".lag". */
+  noteFileName(docFileName: string, deviceName: string, deviceId: string, attempt?: 0 | 1 | 2): string;
+  /** A file name that is a note or a sync service's copy of one (ends in ".laguse", any case). */
+  isNoteFileName(name: string): boolean;
+  /** §1.4: same analysis id, and the note names this file (NFC, case-insensitive) or this is the only file with that id in the folder. */
+  noteApplies(note: Pick<NoteJson, "analysis_id" | "document_name">, doc: { analysisId: string; fileName: string; sameIdFiles: number }): boolean;
+  /** One note per device id: the highest seq; ties → the later `updated_at` string, then the smaller file path. */
+  pickPerDevice(records: readonly NoteRecord[]): NoteRecord[];
+  emptyObs(): PresenceObs;
+  /** Take a new listing in (foreign notes, one per device). Devices without a note are forgotten. */
+  observe(prev: PresenceObs, notes: readonly NoteJson[], now: number, knows: (revisionId: string) => boolean): PresenceObs;
+  /** A sleep gap was detected: every observation is "checking" until the next observe(). */
+  markGap(prev: PresenceObs, now: number): PresenceObs;
+  freshness(o: NoteObs, now: number, checkingSince: number | null): Freshness;
+  /** §2.4. */
+  decide(input: PresenceInput): PresenceDecision;
+  /** A timer that should have fired `intervalMs` after `prevAt` fired at `now`: did the computer sleep
+   *  (now − prevAt − intervalMs > sleepGapMs) or did the clock go backwards (now < prevAt)? */
+  gapDetected(prevAt: number, now: number, intervalMs: number): boolean;
+  /** The file was last saved by an app that shows no notes: manifest.features < FEATURES_P3, the newest version
+   *  was not saved by this computer, and that computer has no note here. → its names, else null. */
+  olderPeer(m: Pick<Manifest, "features" | "head" | "revisions">, myDeviceId: string, notes: readonly NoteJson[]): { deviceId: string; deviceName: string; userName: string } | null;
+  /** More than one computer is involved: a version saved by another device id, or a foreign note. */
+  multiDevice(m: Pick<Manifest, "revisions"> | null, myDeviceId: string, notes: readonly NoteJson[]): boolean;
+  /** Should this computer write notes for the file, and why. */
+  shareDecision(p: { choice: ShareMode | null; fallback: ShareMode; untitled: boolean; cloud: boolean; multiDevice: boolean }): { on: boolean; why: ShareWhy };
+  /** Version ids notes declare (head and base_revision), for RetentionCtx.beaconHeads. Sorted, unique. */
+  liveNoteHeads(notes: readonly NoteJson[]): string[];
+  /** Foreign notes (applying or orphan) whose bytes this computer has seen unchanged for cleanupMs. */
+  cleanupTargets(records: readonly NoteRecord[], now: number): RemoveNoteArgs[];
+  /** Another running app uses my device id: a note with my device id, another session id, whose seq grew between two listings
+   *  taken after this session wrote its own note. */
+  duplicateIdentity(before: readonly NoteRecord[], after: readonly NoteRecord[], me: { deviceId: string; sessionId: string }): boolean;
+}
+
+// ── 7.5 The graph store: read-only guard and the claim hook (store/graphStore.ts) ──
+
+export type EditGuardReason =
+  /** Made with a newer app (phase 1 `readOnly: "tooNew"`). */
+  | "tooNew"
+  /** Another computer is editing this version. */
+  | "editingElsewhere"
+  /** A newer version is on its way. */
+  | "waiting"
+  /** Just woke up: not known yet who is editing. */
+  | "checking"
+  /** Just woke up while editing: the first new edit asks first. */
+  | "resuming";
+
+export interface EditGuard {
+  reason: EditGuardReason;
+}
+
+/** Which way a refused change came in. */
+export type EditPath = "table" | "analysis" | "figure" | "scratchpad" | "name" | "undo" | "command";
+
+export interface BlockedEdit {
+  /** Grows by one with every refused change of this store. */
+  serial: number;
+  path: EditPath;
+  /** The store action or UI command ("setCell", "paste", "sendToData", "save", …). */
+  action: string;
+}
+
+/** Members GraphState gains in phase 3. */
+export interface StoreGuardApi {
+  /** Set: every change by the person is refused (a no-op that is reported in `blocked`). Loads, reloads in place,
+   *  markFileSaved and setFileRef are never refused. Reset to null by newDoc / load / loadFile / close. */
+  guard: EditGuard | null;
+  /** Bumped by every change the person made that was applied (never by a load, a reload, the automatic clean-up,
+   *  replaceWorking, replaceContent, markFileSaved or setFileRef). */
+  userEditSerial: number;
+  /** The last refused change; null = none since the document was opened. */
+  blocked: BlockedEdit | null;
+  setGuard(guard: EditGuard | null): void;
+  /** For edit paths outside the store's own actions (the Scratchpad sheet, the Save button, a menu command). */
+  noteBlockedEdit(path: EditPath, action: string): void;
+}
+
+// ── 7.6 The session controller, phase 3 ─────────────────────────────────────
+
+export interface SharingView {
+  /** This file's own choice; null = it follows the default. */
+  choice: ShareMode | null;
+  /** The default (Settings). */
+  fallback: ShareMode;
+  /** Notes are being written for this file now. */
+  on: boolean;
+  why: ShareWhy;
+  /** The sync service of the folder, when it is in one. */
+  service: string | null;
+}
+
+/** "Up to date · Alice saved 2 min ago": the newest version was saved on another computer. */
+export interface StatusLine {
+  kind: "upToDate";
+  who: VersionInfo;
+  /** When this computer first saw that version (its own clock, ms); null = unknown (use who.time). */
+  seenAt: number | null;
+}
+
+export interface TabPresence {
+  mode: TabMode;
+  /** The tab is read-only because of another computer: `guard` is "editingElsewhere", "checking" or "waiting".
+   *  (Not for "resuming", which only asks before the first new edit, and not for "tooNew": that is FileTab.readOnly.) */
+  readOnly: boolean;
+  /** The graph store's guard for this tab (set on the store while the tab is the loaded one). */
+  guard: EditGuardReason | null;
+  /** Every other computer that has a note for this file, editing first. */
+  peers: PeerView[];
+  /** What this computer's own note says; "none" = no note is written. */
+  mine: "none" | "idle" | "editing";
+  sharing: SharingView;
+  status: StatusLine | null;
+  /** Bumped each time a change was refused; the UI highlights the banner's button for attemptPulseMs. */
+  attempt: number;
+}
+
+export interface FileSessionStateP3 extends FileSessionStateP2 {
+  // ── who is editing ──
+  /** "Edit here": edit on this computer now, over the notes that make the tab read-only. Instant.
+   *  When someone ELSE is editing and `confirmed` is not true, the dialog "editAnyway" is asked first.
+   *  Resolves true when the tab is editable afterwards. */
+  editHere(key?: string, confirmed?: boolean): Promise<boolean>;
+  /** [Keep editing]: closes the "also being edited" / "continued elsewhere" banner (it returns when another
+   *  computer starts editing again), or ends the after-sleep check now. */
+  keepEditing(key?: string): void;
+  /** "Save my changes as a separate copy…": asks for a place; my version becomes a new analysis there and
+   *  the tab moves to it; this file is left as it is on disk. */
+  saveAsSeparateCopy(key?: string): Promise<SaveOutcome>;
+  /** The UI reports a refused change that did not go through the graph store (Save button, a disabled control). */
+  reportEditAttempt(path: EditPath, action: string, key?: string): void;
+
+  // ── "Show others when I'm editing" ──
+  /** Opens the dialog "sharing" for the tab. No-op for an untitled document. */
+  openSharing(key?: string): void;
+  /** This file's own choice (null = follow the default). Notes are written or removed at once. */
+  setSharing(key: string, choice: ShareMode | null): Promise<void>;
+  /** The default for files without a choice of their own (Settings). */
+  setSharingDefault(mode: ShareMode): Promise<void>;
+}
+
+// ── 7.7 Browser preview: simulator additions ────────────────────────────────
+
+/** Which simulated computer acts. other: "Office iMac" (Alice). third: "Lab MacBook" (Bob). */
+export type SimWho = "other" | "third";
+
+export interface SimNote {
+  file: string;
+  /** Name of the note file. */
+  name: string;
+  deviceName: string;
+  userName: string;
+  state: "idle" | "editing";
+  epoch: number;
+  seq: number;
+  head: string | null;
+  baseRevision: string | null;
+  /** The simulated owner keeps rewriting it every 60 s. */
+  beating: boolean;
+}
+
+export interface DevSimApiP3 extends DevSimApiP2 {
+  /** Name of the third simulated computer. */
+  thirdDevice: string;
+  /** The note files beside `path` as this computer's disk has them, sorted by name. */
+  notes(path: string): SimNote[];
+  /** The computer opens the file: an idle note appears. `sameUser`: it uses MY user name (my own other computer). */
+  peerOpens(path: string, opts?: { who?: SimWho; sameUser?: boolean }): Promise<void>;
+  /** It starts editing the version it has (note "editing", epoch + 1) and keeps the note beating every 60 s. */
+  peerStartsEditing(path: string, opts?: { who?: SimWho; sameUser?: boolean }): Promise<void>;
+  /** It saves while editing (one more version; the note gets the new version at once). keepEditing false (default):
+   *  the note goes back to idle 30 s later; true: it keeps editing on the new version. */
+  peerSaves(path: string, opts?: { who?: SimWho; section?: SectionName; keepEditing?: boolean }): Promise<string>;
+  /** It stops editing without saving (discard): the note goes back to idle. */
+  peerStops(path: string, opts?: { who?: SimWho }): Promise<void>;
+  /** It closes the file / quits: its note is deleted. */
+  peerQuits(path: string, opts?: { who?: SimWho }): Promise<void>;
+  /** It crashes or loses power: its note stays as it is and is never rewritten. */
+  peerCrashes(path: string, opts?: { who?: SimWho }): Promise<void>;
+  /** It goes to sleep (the note stops beating) / wakes up (it beats again; when a note overrides its claim it
+   *  keeps its unsaved changes and its note stays "editing"). */
+  peerSleeps(path: string, opts?: { who?: SimWho }): Promise<void>;
+  peerWakes(path: string, opts?: { who?: SimWho }): Promise<void>;
+  /** It presses "Edit here" on the file this computer is editing: its note overrides this computer's claim. */
+  peerEditsHere(path: string, opts?: { who?: SimWho; sameUser?: boolean }): Promise<void>;
+  /** A sync service's conflict copy of that computer's note appears beside it (older seq, "… (conflicted copy).laguse"). */
+  noteConflictCopy(path: string, opts?: { who?: SimWho }): Promise<string>;
+  /** The computer runs an older app: it writes no notes and its saves carry features 1. */
+  setOldApp(on: boolean, who?: SimWho): void;
+  /** Its clock is wrong by `ms` (its `updated_at` values shift; nothing else may change). */
+  setClockSkew(ms: number, who?: SimWho): void;
+  /** Notes and files from other computers reach this computer `ms` later (0 = at once). */
+  setSyncDelay(ms: number): void;
+  /** This computer is offline: nothing arrives or leaves until it is back. */
+  setOffline(on: boolean): void;
+  /** This computer sleeps for `ms` and wakes up: simulated time jumps, no timer runs in between. */
+  sleep(ms: number): void;
 }

@@ -20,6 +20,12 @@ import { SheetGrid, type SheetGridHandle, type ViewMemo } from "./SheetGrid";
 import { SendToDataDialog, type SendInfo } from "./SendToDataDialog";
 import { registerScratchController, useScratchUi } from "./scratchBridge";
 import { SCRATCH_LIMIT, rangeName, scratchCellCount, type CellRange } from "./scratchModel";
+import { BlockedClick, reportBlocked } from "../RailGuard";
+
+/** Phase 3: the analysis is read-only right now (the graph store has a guard). */
+const guarded = () => useGraphStore.getState().guard !== null;
+/** A refused Scratchpad change (the banner's button pulses; the sheet shows no message of its own). */
+const blocked = (action: string) => reportBlocked("scratchpad", action);
 
 // ── session lifetime (module level: survives switching tabs) ────────────────
 
@@ -37,6 +43,7 @@ function acquire(serial: number, text: string): Current {
     if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
     current?.session.dispose();
     const session = new SheetSession(text);
+    session.readOnly = guarded();
     current = { serial, session, lastText: text, flushed: session.version, key: ++keySeq, view: { top: 0, left: 0 } };
   }
   return current;
@@ -49,6 +56,9 @@ function writeStore(): void {
   if (!cur || cur.session.broken) return;   // a broken engine can't be read: the store keeps the last good text
   const st = useGraphStore.getState();
   if (!st.doc || st.docSerial !== cur.serial || cur.flushed === cur.session.version) return;
+  // Read-only: the store would refuse the text. Changes made before the guard came stay pending and are
+  // written once it is cleared (the controller commits and flushes before it sets a guard).
+  if (st.guard) return;
   const text = cur.session.serialize();
   cur.lastText = text;
   cur.flushed = cur.session.version;
@@ -81,6 +91,7 @@ type Notice = { severity: "warning" | "info" | "error" | "success"; text: string
 export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => void }) {
   const docSerial = useGraphStore((s) => s.docSerial);
   const scratch = useGraphStore((s) => s.scratch);
+  const readOnly = useGraphStore((s) => s.guard !== null);
   const over = useScratchUi((s) => s.over);
   const [engine, setEngine] = useState<"loading" | "ready" | "error" | "dead">(engineDead ? "dead" : "loading");
   const [loadErr, setLoadErr] = useState("");
@@ -116,8 +127,22 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
   }, [engine, docSerial, scratch]);
 
   const session = cur?.session ?? null;
+  // The session follows the guard (a session rebuilt by a live refresh gets it in acquire()).
+  if (session && session.readOnly !== readOnly) session.readOnly = readOnly;
+
+  useEffect(() => {
+    if (readOnly) return;
+    // The guard is gone: anything still pending goes into the store now.
+    writeStore();
+    useScratchUi.setState({ canUndo: !!current?.session.canUndo(), canRedo: !!current?.session.canRedo() });
+  }, [readOnly]);
 
   const onResult = useCallback((res: EditResult): boolean => {
+    if (!res.ok && res.reason === "readonly") {
+      // Not a sheet error: the banner says why (its button pulses).
+      blocked("edit");
+      return false;
+    }
     if (!res.ok && res.reason === "fatal") {
       engineDead = true;
       setEngine("dead");
@@ -144,11 +169,13 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
   useEffect(refreshUndo, [rev, cur, refreshUndo]);
 
   const onUndo = useCallback(() => {
+    if (guarded()) { blocked("undo"); return; }
     const s = current?.session;
     if (s?.undoStep()) { setRev((v) => v + 1); scheduleWrite(); gridRef.current?.clearMarquee(); }
     else if (s?.broken) { engineDead = true; setEngine("dead"); }
   }, []);
   const onRedo = useCallback(() => {
+    if (guarded()) { blocked("redo"); return; }
     const s = current?.session;
     if (s?.redoStep()) { setRev((v) => v + 1); scheduleWrite(); gridRef.current?.clearMarquee(); }
     else if (s?.broken) { engineDead = true; setEngine("dead"); }
@@ -162,6 +189,7 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
   const onNotice = useCallback((severity: "warning" | "info" | "error", text: string) => setNotice({ severity, text }), []);
 
   const openSend = useCallback(() => {
+    if (guarded()) { blocked("sendToData"); return; }
     const s = current?.session;
     const grid = gridRef.current;
     if (!s || !grid) return;
@@ -182,6 +210,7 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
   }, []);
 
   const clearAll = useCallback(() => {
+    if (guarded()) { blocked("clearAll"); return; }
     const s = current?.session;
     if (!s) return;
     gridRef.current?.commitEdit();
@@ -252,37 +281,41 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
       <Box sx={{ display: "flex", flexDirection: "column", flexGrow: 1, minHeight: 280, border: 1, borderColor: "divider", borderRadius: 1, overflow: "hidden" }}>
         <Stack direction="row" spacing={0.5} alignItems="center" sx={{ px: 1, height: 38, flexShrink: 0, borderBottom: 1, borderColor: "divider", bgcolor: "#2c2c2e" }}>
           <Tooltip title={`Undo (${MOD_KEY} + Z)`}>
-            <span>
-              <IconButton size="small" aria-label="Undo" disabled={!session.canUndo()} onClick={() => { onUndo(); gridRef.current?.focus(); }}>
+            <span onPointerDown={readOnly ? () => blocked("undo") : undefined}>
+              <IconButton size="small" aria-label="Undo" disabled={readOnly || !session.canUndo()} onClick={() => { onUndo(); gridRef.current?.focus(); }}>
                 <UndoIcon fontSize="small" />
               </IconButton>
             </span>
           </Tooltip>
           <Tooltip title={`Redo (${MOD_KEY} + Shift + Z)`}>
-            <span>
-              <IconButton size="small" aria-label="Redo" disabled={!session.canRedo()} onClick={() => { onRedo(); gridRef.current?.focus(); }}>
+            <span onPointerDown={readOnly ? () => blocked("redo") : undefined}>
+              <IconButton size="small" aria-label="Redo" disabled={readOnly || !session.canRedo()} onClick={() => { onRedo(); gridRef.current?.focus(); }}>
                 <RedoIcon fontSize="small" />
               </IconButton>
             </span>
           </Tooltip>
-          <Select size="small" value={fmt} aria-label="Number format of the selected cells"
-            onChange={(e) => {
-              const g = gridRef.current?.selection() ?? selInfo.range;
-              onResult(session.setNumFmt(g, String(e.target.value)));
-              setTimeout(() => gridRef.current?.focus(), 0);
-            }}
-            sx={{ ml: 1, minWidth: 150, height: 28, fontSize: 13 }}>
-            {!known && <MenuItem value={fmt} sx={{ fontSize: 13 }}>Custom ({fmt})</MenuItem>}
-            {FORMATS.map(([f, label]) => <MenuItem key={f} value={f} sx={{ fontSize: 13 }}>{label}</MenuItem>)}
-          </Select>
+          <BlockedClick on={readOnly} path="scratchpad" action="format" sx={{ ml: 1 }}>
+            <Select size="small" value={fmt} aria-label="Number format of the selected cells" disabled={readOnly}
+              onChange={(e) => {
+                const g = gridRef.current?.selection() ?? selInfo.range;
+                onResult(session.setNumFmt(g, String(e.target.value)));
+                setTimeout(() => gridRef.current?.focus(), 0);
+              }}
+              sx={{ minWidth: 150, height: 28, fontSize: 13 }}>
+              {!known && <MenuItem value={fmt} sx={{ fontSize: 13 }}>Custom ({fmt})</MenuItem>}
+              {FORMATS.map(([f, label]) => <MenuItem key={f} value={f} sx={{ fontSize: 13 }}>{label}</MenuItem>)}
+            </Select>
+          </BlockedClick>
           <Box sx={{ flexGrow: 1 }} />
           <Tooltip title={`Copies the displayed values (${MOD_KEY} + C) — paste them into the Data table`}>
             <Button size="small" startIcon={<ContentCopyIcon />} onClick={() => gridRef.current?.copyValues()}>Copy values</Button>
           </Tooltip>
-          <Button size="small" variant="contained" startIcon={<EastIcon />} onClick={openSend}>Send to Data…</Button>
+          <BlockedClick on={readOnly} path="scratchpad" action="sendToData">
+            <Button size="small" variant="contained" startIcon={<EastIcon />} disabled={readOnly} onClick={openSend}>Send to Data…</Button>
+          </BlockedClick>
         </Stack>
         <SheetGrid key={cur.key} ref={gridRef} session={session} rev={rev} onResult={onResult} onUndo={onUndo} onRedo={onRedo}
-          onSelectionChange={onSelectionChange} onNotice={onNotice} memo={cur.view} />
+          onSelectionChange={onSelectionChange} onNotice={onNotice} memo={cur.view} readOnly={readOnly} onBlocked={blocked} />
       </Box>
       <SendToDataDialog info={send} onClose={() => { setSend(null); gridRef.current?.focus(); }}
         onSent={(r) => { setSend(null); onSent(r); }} />

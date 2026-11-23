@@ -15,7 +15,11 @@ import {
 
 export type EditResult =
   | { ok: true; changed: boolean; truncated?: boolean; range?: CellRange; asText?: { count: number; first: string; why: string } }
-  | { ok: false; reason: "full" | "bounds" | "error" | "invalid" | "fatal"; message: string };
+  | { ok: false; reason: "full" | "bounds" | "error" | "invalid" | "fatal" | "readonly"; message: string };
+
+/** Phase 3: the analysis is read-only right now (another computer is editing it). */
+export const READONLY_MSG = "This analysis is read-only right now.";
+const READONLY: EditResult = { ok: false, reason: "readonly", message: READONLY_MSG };
 
 /** Engine cell-type codes (getCellType). Empty cells report NUMBER: check `isEmpty` first. */
 export const CELL_NUMBER = 1;
@@ -132,6 +136,9 @@ export class SheetSession {
   clip: InternalClip | null = null;
   /** The engine trapped (see isFatal): nothing may touch it again; the sheet is read-only until the window reloads. */
   broken = false;
+  /** Phase 3: every change is refused (reason "readonly") and undo / redo do nothing; reading, copying
+   *  and serialising work. Set by the Scratchpad tab from the graph store's guard. */
+  readOnly = false;
   /** An empty model where typed formulas are tried out before they reach the sheet. */
   private probe: Model | null = null;
   /** Shown text per cell for the current version (the grid asks for it on every render). */
@@ -326,8 +333,8 @@ export class SheetSession {
     try { return this.model.getColumnWidth(0, c); } catch { return DEFAULT_COL_WIDTH; }
   }
 
-  canUndo(): boolean { return !this.broken && this.undo.length > 0; }
-  canRedo(): boolean { return !this.broken && this.redo.length > 0; }
+  canUndo(): boolean { return !this.broken && !this.readOnly && this.undo.length > 0; }
+  canRedo(): boolean { return !this.broken && !this.readOnly && this.redo.length > 0; }
 
   /** Rows (≤ grid) with any content in column c, ascending. */
   rowsWithData(c: number): number[] {
@@ -391,6 +398,7 @@ export class SheetSession {
   }
 
   private mutate(fn: () => { truncated?: boolean; range?: CellRange; asText?: { count: number; first: string; why: string } } | void): EditResult {
+    if (this.readOnly) return READONLY;
     if (this.broken) return { ok: false, reason: "fatal", message: FATAL_MSG };
     let before: Uint8Array;
     try { before = this.model.toBytes(); } catch (e) { return isFatal(e) ? this.fatal() : { ok: false, reason: "error", message: errText(e) }; }
@@ -418,7 +426,7 @@ export class SheetSession {
   }
 
   undoStep(): boolean {
-    if (this.broken) return false;
+    if (this.broken || this.readOnly) return false;
     const prev = this.undo.pop();
     if (!prev) return false;
     this.undoBytes -= prev.length;
@@ -435,7 +443,7 @@ export class SheetSession {
   }
 
   redoStep(): boolean {
-    if (this.broken) return false;
+    if (this.broken || this.readOnly) return false;
     const next = this.redo.pop();
     if (!next) return false;
     try {
@@ -523,6 +531,7 @@ export class SheetSession {
 
   /** Type into one cell ("" clears it). Refused (as Excel refuses it) when the formula is malformed. */
   setInput(r: number, c: number, text: string): EditResult {
+    if (this.readOnly) return READONLY;
     if (!SheetSession.inGrid(r, c)) return this.bounds();
     const t = text.length > SCRATCH_INPUT_MAX ? text.slice(0, SCRATCH_INPUT_MAX) : text;
     if (t === "" && this.isEmpty(r, c)) return { ok: true, changed: false };
@@ -533,6 +542,7 @@ export class SheetSession {
 
   /** Enter `text` in the active cell and the same entry (references adjusted) in every other selected cell (⌘/Ctrl+Enter). */
   enterInRange(g: CellRange, r: number, c: number, text: string): EditResult {
+    if (this.readOnly) return READONLY;
     if (cellsIn(g) <= 1) return this.setInput(r, c, text);
     if (cellsIn(g) > MAX_LOOP_CELLS) return { ok: false, reason: "bounds", message: "Select fewer cells to fill at once." };
     const t = text.slice(0, SCRATCH_INPUT_MAX);
@@ -559,6 +569,7 @@ export class SheetSession {
   /** Delete / Backspace: clear contents (number formats stay, as in Excel). Only
    *  the part of the selection that holds anything is touched (a whole sheet is 1.5 M cells). */
   clear(g: CellRange): EditResult {
+    if (this.readOnly) return READONLY;
     const used = this.usedRange();
     const h = used ? intersect(norm(g), used) : null;
     if (!h) return { ok: true, changed: false };
@@ -566,6 +577,7 @@ export class SheetSession {
   }
 
   clearAll(): EditResult {
+    if (this.readOnly) return READONLY;
     return this.mutate(() => this.model.rangeClearAll(0, 1, 1, SCRATCH_ROWS, SCRATCH_COLS));
   }
 
@@ -573,6 +585,7 @@ export class SheetSession {
    *  cells is formatted only where cells are filled (formats of empty cells
    *  aren't saved anyway, and a whole-sheet format would take many seconds). */
   setNumFmt(g0: CellRange, fmt: string): EditResult {
+    if (this.readOnly) return READONLY;
     let g: CellRange | null = norm(g0);
     if (cellsIn(g) > MAX_STYLE_CELLS) {
       const used = this.usedRange();
@@ -587,6 +600,7 @@ export class SheetSession {
   }
 
   setColWidth(c1: number, c2: number, px: number): EditResult {
+    if (this.readOnly) return READONLY;
     return this.mutate(() => this.model.setColumnsWidth(0, c1, c2, clampWidth(px)));
   }
 
@@ -634,6 +648,7 @@ export class SheetSession {
   }
 
   insertRows(at: number, n: number): EditResult {
+    if (this.readOnly) return READONLY;
     if (at < 1 || at > SCRATCH_ROWS || n < 1) return this.bounds();
     if (this.dataFrom("row", SCRATCH_ROWS - n + 1)) {
       return { ok: false, reason: "bounds", message: `Rows can't be inserted: that would push cells past row ${SCRATCH_ROWS}, the end of the scratchpad.` };
@@ -644,6 +659,7 @@ export class SheetSession {
   /** Delete rows; a range that loses its first or last rows shrinks (=SUM(A1:A5)
    *  with row 5 deleted becomes =SUM(A1:A4)), as in Excel. */
   deleteRows(at: number, n: number): EditResult {
+    if (this.readOnly) return READONLY;
     if (at < 1 || at > SCRATCH_ROWS || n < 1) return this.bounds();
     const d1 = at, d2 = at + n - 1;
     return this.mutate(() => {
@@ -653,6 +669,7 @@ export class SheetSession {
   }
 
   insertCols(at: number, n: number): EditResult {
+    if (this.readOnly) return READONLY;
     if (at < 1 || at > SCRATCH_COLS || n < 1) return this.bounds();
     if (this.dataFrom("col", SCRATCH_COLS - n + 1)) {
       return { ok: false, reason: "bounds", message: "Columns can't be inserted: that would push cells past the last column of the scratchpad." };
@@ -661,6 +678,7 @@ export class SheetSession {
   }
 
   deleteCols(at: number, n: number): EditResult {
+    if (this.readOnly) return READONLY;
     if (at < 1 || at > SCRATCH_COLS || n < 1) return this.bounds();
     const d1 = at, d2 = at + n - 1;
     return this.mutate(() => {
@@ -696,8 +714,10 @@ export class SheetSession {
 
   /** Copy (or cut) a range: returns the TSV for the system clipboard and keeps
    *  the engine's copy so pasting it back inside the sheet adjusts references. */
-  copy(g: CellRange, cut = false): string {
+  copy(g: CellRange, cut0 = false): string {
     if (this.broken) return "";
+    // Read-only: a cut only copies (pasting it later never moves the cells).
+    const cut = cut0 && !this.readOnly;
     const tsv = this.tsvDisplayed(g);
     try {
       this.model.setSelectedCell(g.r1, g.c1);
@@ -714,6 +734,7 @@ export class SheetSession {
    *  sheet's own last copy is pasted from the engine's copy (formulas with
    *  adjusted references, cut moves cells); anything else is typed in as TSV. */
   paste(target: CellRange, text: string): EditResult {
+    if (this.readOnly) return READONLY;
     if (this.broken) return { ok: false, reason: "fatal", message: FATAL_MSG };
     const g = norm(target);
     const clip = this.clip;
@@ -811,6 +832,7 @@ export class SheetSession {
   /** ⌘/Ctrl+D: copy the top row of the selection down through it (a one-row
    *  selection copies the row above). ⌘/Ctrl+R: the same to the right. */
   fill(g: CellRange, dir: "down" | "right"): EditResult {
+    if (this.readOnly) return READONLY;
     const down = dir === "down";
     let src: CellRange, dst: CellRange;
     if (down) {
@@ -850,6 +872,7 @@ export class SheetSession {
    *  auto-fill: relative references adjusted, number series (a linear trend for
    *  uneven steps), dates counting up by day, "Item 1" → "Item 2", Mon → Tue, Jan → Feb. */
   autoFill(src: CellRange, to: CellRange): EditResult {
+    if (this.readOnly) return READONLY;
     const s = norm(src), t = norm(to);
     const a = area(s);
     const vertical = t.c1 === s.c1 && t.c2 === s.c2 && (t.r1 !== s.r1 || t.r2 !== s.r2);

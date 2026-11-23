@@ -13,6 +13,9 @@ import { RecoverDialog } from "./RecoverDialog";
 import { Toasts } from "./Toasts";
 import { CombineDialog } from "./CombineDialog";
 import { BringBackDialog } from "./BringBackDialog";
+import { EditAnywayDialog } from "./EditAnywayDialog";
+import { ResumeDialog } from "./ResumeDialog";
+import { SharingDialog } from "./SharingDialog";
 
 // Browser preview only: kept out of the desktop app's main chunk.
 const PathPicker = lazy(() => import("./PathPicker").then((m) => ({ default: m.PathPicker })));
@@ -76,6 +79,9 @@ export function FilesHost() {
       case "oldLibrary": modal = <OldLibraryDialog />; break;
       case "combine": modal = <CombineDialog key={`${dialog.state.tabKey}:${dialog.state.index}:${dialog.state.theirs.head}`} s={dialog.state} />; break;
       case "bringBackDirty": modal = <BringBackDialog version={dialog.version} />; break;
+      case "editAnyway": modal = <EditAnywayDialog peers={dialog.peers} />; break;
+      case "resumeConfirm": modal = <ResumeDialog key={dialog.what} what={dialog.what} />; break;
+      case "sharing": modal = <SharingDialog tabKey={dialog.tabKey} title={dialog.title} sharing={dialog.sharing} />; break;
     }
   }
 

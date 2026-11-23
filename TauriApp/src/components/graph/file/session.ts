@@ -8,7 +8,15 @@
 
    Everything the controller needs from outside comes through SessionDeps, so the
    tests run two "computers" (two controllers, two graph stores, one simulated
-   sync service) on a manual clock. */
+   sync service) on a manual clock.
+
+   Phase 3 (phase3-contract.md §5): who is editing. Each tab keeps the notes
+   beside its file (presence events), what this computer observed of them on its
+   own clock, and the decision of presence.ts: editable, read-only (the graph
+   store's guard), waiting for a newer version, information only, both editing or
+   resuming after a sleep. This computer's own note says "editing" exactly while it
+   holds the document (unsaved changes, the 30 s after a save, right after "Edit
+   here"); it is written fire-and-forget, never awaited by a person's action. */
 
 import { create, type StoreApi, type UseBoundStore } from "zustand";
 import { getGraphAnalysis, getGraphLibrary, type Template } from "../../../api/graph";
@@ -24,10 +32,12 @@ import type {
   SessionTab,
 } from "./backend";
 import {
-  BANNER_ORDER, CMD, EVT, LIMITS, LIMITS_P2, MENU, SUMMARY, WORKING_ROW, emptySeenMap,
-  type AppInfo, type BannerAction, type BannerKind, type BaseChoice, type CombinePlan, type CombineResult, type CombineSource,
-  type CombineState, type ConflictChoice, type DialogAnswer, type DraftListItem, type ExportState,
-  type FileBackendP2, type FileSessionStateP2, type FileSettings, type FileTab, type LaneLayout, type LaneNode, type MenuEvent, type MenuId,
+  BANNER_ORDER, CMD, EVT, LIMITS, LIMITS_P2, LIMITS_P3, MENU, SUMMARY, WORKING_ROW, emptySeenMap,
+  type AppInfo, type BannerAction, type BannerKind, type BaseChoice, type CloudInfo, type CombinePlan, type CombineResult, type CombineSource,
+  type CombineState, type ConflictChoice, type DialogAnswer, type DraftListItem, type EditGuardReason, type EditPath, type ExportState,
+  type FileBackendP3, type FileSessionStateP3, type FileSettings, type FileTab, type LaneLayout, type LaneNode, type MenuEvent, type MenuId,
+  type NoteJson, type NoteRecord, type NoteTarget, type PeerView, type PresenceDecision, type PresenceObs, type ShareMode, type SharingView,
+  type StatusLine, type TabPresence,
   type MenuState, type OpenFilesEvent, type OpenOutcome, type PathPickerRequest, type QuitRequest, type QuitSource, type RecentItem,
   type RestoreCard, type RevisionP2, type SaveAsMode, type SaveOutcome, type SectionValues, type SeenMap, type SessionDialog,
   type SessionToast, type SidePick, type SnapshotPool, type TabBanner, type TabStatus, type VersionChip, type VersionInfo,
@@ -48,6 +58,10 @@ import {
 import { compareSections, displaySummary, summaryText } from "./summaries";
 import { isExported, libraryStatus, rowContent, runExport, type LibraryApi } from "./libraryExport";
 import { cloudServiceOf, folderLabel, graphPath, isConflictCopyName, isTempLocation, safeFileName, withGraphExt } from "./paths";
+import {
+  cleanupTargets, decide, duplicateIdentity, emptyObs, gapDetected, liveNoteHeads, markGap, multiDevice, observe, olderPeer, pickPerDevice,
+  shareDecision,
+} from "./presence";
 
 // ── dependencies ────────────────────────────────────────────────────────────
 
@@ -58,7 +72,7 @@ export interface Timers {
 
 export interface SessionDeps {
   /** null: chosen in init() (Tauri → Rust commands, else the browser preview's simulated disk). */
-  backend: FileBackendP2 | null;
+  backend: FileBackendP3 | null;
   /** null: detected in init(). */
   desktop: boolean | null;
   graph: GraphStoreApi;
@@ -74,8 +88,9 @@ export interface SessionDeps {
   legacyDraft: { read(): GraphDraft | null; clear(): void };
   /** Browser window hooks (focus / blur / beforeunload); null in tests. */
   window: Pick<Window, "addEventListener"> | null;
-  /** Preview backend factory (lazy, so the desktop build never makes the simulated world). */
-  makePreviewBackend: (() => Promise<{ backend: FileBackendP2; persistNow(): void }>) | null;
+  /** Preview backend factory (lazy, so the desktop build never makes the simulated world). Phase 3: the preview's
+   *  simulated clock and timers (so "+5 min" and "This computer sleeps" reach the controller too). */
+  makePreviewBackend: (() => Promise<{ backend: FileBackendP3; persistNow(): void; now?: () => number; timers?: Timers }>) | null;
   /** Is the Graphs tool on screen? The File menu's document commands only act when it is
    *  (otherwise they bring it forward first). */
   graphsVisible(): boolean;
@@ -84,6 +99,11 @@ export interface SessionDeps {
   interactionBusy(): boolean;
   /** Phase 2: the device-ordered wait before an automatic combine is written (default graphMerge.combineDelayMs). */
   combineDelayMs(deviceId: string): Promise<number>;
+  /** Phase 3: time (deps.now) of the last key or click in the window (default: watched in the window). */
+  lastActivity(): number;
+  /** Phase 3: sleep gaps come from the backend's `wake` event (true) or from the controller's own timer (false).
+   *  null = desktop. */
+  nativeWake: boolean | null;
 }
 
 // Mouse button and typing state for domInteractionBusy (listeners added once, on first use).
@@ -129,6 +149,12 @@ function domGraphsVisible(): boolean {
   const el = document.querySelector<HTMLElement>('[role="region"][aria-label="Graphs"]');
   return !!el && !el.hidden && el.offsetParent !== null;
 }
+
+/** fixer VP-3: how long after a version arrived from a computer that is editing its note may still name the
+ *  version before (the rewritten note is on its way) and is read as based on the new one. */
+const LIMITS_HANDOVER_MS = 30_000;
+/** fixer VS-4: opening a file waits at most this long for the cloud check and the notes beside it. */
+const LIMITS_OPEN_NOTES_MS = 1_500;
 
 /** Timers on real time. */
 const realTimers: Timers = {
@@ -293,14 +319,96 @@ interface Internal {
   lastWorking: Working | null;
   /** Older copies answered "Keep": the head each had then (asked again once it has changes of its own). */
   keptHeads: Record<string, string>;
+  // ── phase 3 ──
+  pr: PresenceTab;
 }
+
+/** What this computer's note on disk says (phase 3 §5.3); `off`: the backend wrote nothing (debug root, quitting). */
+interface WrittenNote {
+  path: string;
+  analysisId: string;
+  state: "idle" | "editing";
+  head: string | null;
+  base: string | null;
+  epoch: number;
+  supersedes: NoteTarget[];
+  /** Device name, user name and id the note was written with. */
+  names: string;
+  off: boolean;
+}
+
+/** Per tab, phase 3 (§5.2 "Internal per tab"). */
+interface PresenceTab {
+  records: NoteRecord[];
+  listed: boolean;
+  obs: PresenceObs;
+  decision: PresenceDecision | null;
+  cloud: CloudInfo | null;
+  share: ShareMode | null;
+  holding: boolean;
+  epoch: number;
+  overrides: NoteTarget[];
+  /** The claims my current claim overrides. */
+  supersedes: NoteTarget[];
+  lastInputAt: number;
+  lastSaveAt: number;
+  lastPingAt: number;
+  lastActivitySeen: number;
+  lingerTimer: unknown;
+  resume: { since: number } | null;
+  resumeTimer: unknown;
+  written: WrittenNote | null;
+  writeSeq: number;
+  /** An own note from an earlier run was found (cleared when notes are off). */
+  leftover: boolean;
+  forceSync: boolean;
+  /** Peer claims ("device\0epoch") whose banner was closed. */
+  dismissed: Set<string>;
+  unconfirmedClosed: string | null;
+  olderPeerClosed: string | null;
+  /** The guard wanted for this tab (the store's while it is loaded). */
+  guard: EditGuardReason | null;
+  guardRetry: unknown;
+  checkTimer: unknown;
+  checkAt: number | null;
+  attempt: number;
+  hadForeignNote: boolean;
+  /** The newest head / manifest read from disk for the path. */
+  diskHead: string | null;
+  diskManifest: Manifest | null;
+  /** The file is missing / replaced: no note until it is back. */
+  gone: boolean;
+  /** The path the cloud info and the listing are for (another path: looked up again). */
+  listedPath: string | null;
+  /** An automatic combine that waits while the tab is read-only. */
+  autoWaiting: { ctx: CombineCtx; expected: string | null } | null;
+  /** fixer VP-3: when this tab's version (decide's diskHead) last changed, and the seq of every foreign note then. */
+  headSeen: { head: string | null; at: number; seqs: Record<string, number> };
+  /** fixer VP-3: until when a note was read as based on my version because its writer just saved it (null: none). */
+  handoverUntil: number | null;
+  /** fixer round 2 (RV-4): the hold began with Edit here and has seen no edit and no save yet: the 30 s rule does
+   *  not end it ("Edit here" means "I'm editing now"); blur, a tab switch, closing and a newer claim still do. */
+  editHereHold: boolean;
+  /** fixer round 2 (RV-4): the other computers' claims ("device\0epoch") known when my hold began. A clean
+   *  holding tab yields to an editing claim on its version that is not among them (made after mine). */
+  claimSeen: Set<string>;
+}
+
+const newPresenceTab = (): PresenceTab => ({
+  records: [], listed: false, obs: emptyObs(), decision: null, cloud: null, share: null, holding: false, epoch: 0, overrides: [], supersedes: [],
+  lastInputAt: Number.NEGATIVE_INFINITY, lastSaveAt: Number.NEGATIVE_INFINITY, lastPingAt: Number.NEGATIVE_INFINITY,
+  lastActivitySeen: Number.NEGATIVE_INFINITY, lingerTimer: null, resume: null, resumeTimer: null, written: null, writeSeq: 0, leftover: false,
+  forceSync: false, dismissed: new Set(), unconfirmedClosed: null, olderPeerClosed: null, guard: null, guardRetry: null, checkTimer: null, checkAt: null,
+  attempt: 0, hadForeignNote: false, diskHead: null, diskManifest: null, gone: false, listedPath: null, autoWaiting: null,
+  headSeen: { head: null, at: Number.NEGATIVE_INFINITY, seqs: {} }, handoverUntil: null, editHereHold: false, claimSeen: new Set(),
+});
 
 const newInternal = (p: Partial<Internal> = {}): Internal => ({
   manifest: null, acceptedHead: null, knownCopies: [], copyAnswer: {}, settled: [], template: null, sample: false,
   conflict: null, retry: null, firstTry: 0, waitedCloud: false, hasDraft: false, bannerData: new Map(), seenCopies: [],
   draftSeq: 0, draftSerialAt: undefined,
   asides: [], carryHeads: [], combinePending: null, autoTimer: null, combining: 0, combine: null, lastSource: null,
-  bannerSource: new Map(), held: null, preCombineHead: null, recheck: false, catchUps: 0, lastWorking: null, keptHeads: {}, ...p,
+  bannerSource: new Map(), held: null, preCombineHead: null, recheck: false, catchUps: 0, lastWorking: null, keptHeads: {}, pr: newPresenceTab(), ...p,
 });
 
 /** The Versions row of my last save while another computer's save has replaced it (not in the file yet). */
@@ -313,11 +421,11 @@ const isCard = (s: TabStatus) => CARD_KINDS.includes(s);
 const iso = (t: number) => new Date(t).toISOString();
 const asTemplate = (t: unknown): Template | null => (t === "column" || t === "grouped" || t === "xy" ? t : null);
 
-export type FileSessionStore = UseBoundStore<StoreApi<FileSessionStateP2>> & {
+export type FileSessionStore = UseBoundStore<StoreApi<FileSessionStateP3>> & {
   /** Test and simulator access to controller internals (not for the UI). */
   internal: {
     deps: SessionDeps;
-    backend(): FileBackendP2 | null;
+    backend(): FileBackendP3 | null;
     manifestOf(key: string): Manifest | null;
     knownCopies(key: string): string[];
     acceptedHead(key: string): string | null;
@@ -328,8 +436,19 @@ export type FileSessionStore = UseBoundStore<StoreApi<FileSessionStateP2>> & {
     settled(key: string): string[];
     seen(): SeenMap;
     flushSeenNow(): Promise<void>;
+    // phase 3
+    presence(key: string): {
+      records: NoteRecord[]; holding: boolean; epoch: number; overrides: NoteTarget[]; supersedes: NoteTarget[]; resume: { since: number } | null;
+      written: { state: "idle" | "editing"; head: string | null; base: string | null; epoch: number; path: string; off: boolean } | null;
+      decision: PresenceDecision | null; obs: PresenceObs; hadForeignNote: boolean;
+    } | null;
+    /** Run the presence timer's work now (tests). */
+    presenceTick(): void;
   };
 };
+
+/** Last key / click in the window, on the controller's clock (phase 3 deps.lastActivity default). */
+const activity = { at: Number.NEGATIVE_INFINITY, now: () => Date.now(), hooked: false };
 
 /** "Alice (Office iMac)", "you on Office iMac", "another computer" (the undo step's label, §6.3). */
 function whoLabel(v: VersionInfo): string {
@@ -358,15 +477,18 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       const p = m.previewBackend();
       await p.ready;
       (await import("./devSim")).devSim();     // window.__lasSim (dev builds)
-      return { backend: p.device, persistNow: p.persistNow };
+      // Phase 3: the controller runs on the simulated clock, with this computer's timers (they stop while it sleeps).
+      return { backend: p.device, persistNow: p.persistNow, now: () => p.clock.now(), timers: p.device.timers() };
     },
     graphsVisible: domGraphsVisible,
     interactionBusy: domInteractionBusy,
     combineDelayMs: defaultCombineDelayMs,
+    lastActivity: () => activity.at,
+    nativeWake: null,
     ...partial,
   };
   const graph = deps.graph;
-  let backend: FileBackendP2 = deps.backend as FileBackendP2;
+  let backend: FileBackendP3 = deps.backend as FileBackendP3;
   let desktop = !!deps.desktop;
   let info: AppInfo = { appVersion: "", platform: "macos", homeDir: "", tempDirs: [], stateDir: null, debug: false };
   let device: DeviceIdentity | null = null;
@@ -394,7 +516,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   // eslint-disable-next-line prefer-const
   let store: FileSessionStore;
   const get = () => store.getState();
-  const set = (p: Partial<FileSessionStateP2>) => store.setState(p);
+  const set = (p: Partial<FileSessionStateP3>) => store.setState(p);
 
   // ── small helpers ──
 
@@ -423,6 +545,15 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   async function readFile(path: string): Promise<ReadResult> {
     const r = await backend.read(path);
     if (r.ok) noteSeen(r.file.manifest);
+    if (r.ok) {
+      // Phase 3: the newest head read from disk for a tab's path (decide()'s diskHead for a tab with unsaved changes).
+      const t = tabByPath(path);
+      if (t && (!t.analysisId || t.analysisId === r.file.manifest.analysis_id)) {
+        const pr = it(t.key).pr;
+        pr.diskHead = r.file.manifest.head;
+        pr.diskManifest = r.file.manifest;
+      }
+    }
     return r.ok ? { ...r, file: withAbsentSnapshotsDropped(r.file) } : r;
   }
   async function readJournalFile(analysisId: string, revisionId: string): Promise<GraphFileData | null> {
@@ -473,7 +604,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     noteSeen(m);
     const heads = await quietly(backend.journalHeads(m.analysis_id), [] as JournalHead[]);
     return applyRetention(m, {
-      now: now(), firstSeen: seen.analyses[m.analysis_id] ?? {}, beaconHeads: [],
+      now: now(), firstSeen: seen.analyses[m.analysis_id] ?? {}, beaconHeads: noteHeadsFor(m.analysis_id),
       unconfirmedHeads: heads.filter((j) => !j.confirmed).map((j) => j.revision_id),
       pinned: pinned.filter((x): x is string => typeof x === "string" && !!x),
     });
@@ -551,7 +682,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       const prev = get().dialog;
       const r = dialogResolve;
       dialogResolve = null;
-      if (prev && (prev.kind === "saveAsKind" || prev.kind === "closeDirty" || prev.kind === "quit" || prev.kind === "bringBackDirty")) r({ kind: prev.kind, choice: "cancel" } as DialogAnswer);
+      if (prev && (prev.kind === "saveAsKind" || prev.kind === "closeDirty" || prev.kind === "quit" || prev.kind === "bringBackDirty" || prev.kind === "editAnyway")) r({ kind: prev.kind, choice: "cancel" } as DialogAnswer);
+      else if (prev?.kind === "resumeConfirm") r({ kind: "resumeConfirm", choice: "wait" });
     }
     set({ dialog: d });
     return new Promise((resolve) => { dialogResolve = resolve; });
@@ -593,14 +725,17 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (!t?.path || !t.analysisId || !i) return;
     // The tab started from the file's record (seedFromMemo), so its own list is the whole of it now.
     const settled = capHeads([...new Set(i.settled)]);
+    const epoch = Math.max(i.pr.epoch, epochByPath.get(t.path) ?? 0, fileMemo.get(t.path)?.note_epoch ?? 0);
     const rec: FileMemo = {
       analysis_id: t.analysisId,
       ...(settled.length ? { settled_heads: settled } : {}),
       ...(i.acceptedHead ? { accepted_head: i.acceptedHead } : {}),
       ...(i.carryHeads.length ? { carry_heads: [...i.carryHeads] } : {}),
+      ...(i.pr.share ? { share: i.pr.share } : {}),
+      ...(epoch > 0 ? { note_epoch: epoch } : {}),
     };
     fileMemo.delete(t.path);
-    if (rec.settled_heads || rec.accepted_head || rec.carry_heads) fileMemo.set(t.path, rec);
+    if (rec.settled_heads || rec.accepted_head || rec.carry_heads || rec.share || rec.note_epoch) fileMemo.set(t.path, rec);
     while (fileMemo.size > MEMO_FILES) fileMemo.delete(fileMemo.keys().next().value as string);
   }
 
@@ -612,6 +747,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     i.settled = capHeads([...new Set([...(m.settled_heads ?? []), ...i.settled])]);
     if (!i.acceptedHead && m.accepted_head) i.acceptedHead = m.accepted_head;
     for (const h of m.carry_heads ?? []) if (!i.carryHeads.includes(h)) i.carryHeads = [...i.carryHeads, h];
+    if (m.share && i.pr.share === null) i.pr.share = m.share;
+    if (typeof m.note_epoch === "number" && m.note_epoch > i.pr.epoch) epochByPath.set(path, Math.max(epochByPath.get(path) ?? 0, m.note_epoch));
   }
 
   function buildSession(): GraphSession {
@@ -620,6 +757,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     return {
       v: 1,
       ...(fileMemo.size ? { files: Object.fromEntries(fileMemo) } : {}),
+      ...(shareDefault !== "auto" ? { share_default: shareDefault } : {}),
       tabs: tabs.map((t): SessionTab => {
         const i = it(t.key);
         return {
@@ -689,7 +827,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const t = tabOf(s.activeKey);
     const hasDoc = !!t && !isCard(t.status);
     return {
-      hasDoc, canSave: hasDoc && !t!.readOnly && !t!.saving,
+      hasDoc, canSave: hasDoc && !t!.readOnly && !t!.saving && !t!.presence?.readOnly,
       recent: s.recent.slice(0, LIMITS.recentMenu).map((r) => ({ path: r.path, label: `${r.name} — ${r.folderLabel}` })),
       canExportLibrary: !!s.oldLibrary && s.oldLibrary.total > 0, hasOldLibrary: !!s.oldLibrary && s.oldLibrary.total > 0,
     };
@@ -871,6 +1009,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     await saveSession();
     if (isLoaded(key) || get().activeKey === key) backend.track(path, { active: get().activeKey === key });
     else backend.track(path, { active: false });
+    presenceRepath(key, old, path);
   }
 
   /** Load a tab's document into the store (the lock is held). `pre`: a read already done. */
@@ -914,6 +1053,10 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     i.manifest = m;
     const head = m.head;
     const draft = await quietly(backend.readDraft(key), null);
+    // Phase 3: who else has it open, before the editor shows it (so a read-only tab never flashes editable).
+    i.pr.gone = false;
+    await presenceOpen(key, t.path, m.analysis_id);
+    if (get().activeKey !== key || !tabOf(key)) return "card";
     suppress++;
     let applied: "none" | "same" | "older" | "mismatch" = "none";
     try {
@@ -929,6 +1072,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     } finally { suppress--; }
     i.hasDraft = applied === "same" || applied === "older";
     patchTab(key, { dirty: isDirty(graph.getState()) });
+    // Phase 3: a tab that opens with unsaved changes holds the document; the guard is set before the editor paints.
+    if (isDirty(graph.getState()) && !i.pr.holding) claim(key, { input: false }); else evaluate(key);
     backend.track(t.path, { active: true });
     if (r.readOnly) addBanner(key, { kind: "tooNew" });
     else removeKinds(key, ["tooNew"]);
@@ -969,6 +1114,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const t = tabOf(key);
     if (isLoaded(key)) await writeActiveDraft(true);
     if (t?.path && !isCard(t.status)) backend.track(t.path, { active: false });
+    // Phase 3 (D6): switching away from a clean tab ends its hold at once.
+    if (tabOf(key)) releaseIfClean(key);
   }
 
   // ── checks after opening ──
@@ -1229,7 +1376,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   }
 
   async function onFileEvent(e: FileEvent): Promise<void> {
-    if (e.type === "presence") return;
+    if (e.type === "presence") { if ("notes" in e && Array.isArray(e.notes)) onPresenceEvent(e.path, e.notes); return; }
+    if (e.type === "wake") { onWakeEvent(); return; }
     if (e.type !== "moved") { const t0 = tabByPath(e.path); if (t0) await dropGoneCopies(t0.key); }
     if (e.type === "moved") {
       const t = tabByPath(e.from);
@@ -1241,6 +1389,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       await repoint(t.key, e.to, { recent: "replace" });
       const i = it(t.key);
       i.seenCopies = i.seenCopies.filter((p) => p !== e.to);
+      // Phase 3: the note follows the file (repoint → presenceRepath, fixer round 2 RV-2).
       // Only the way the name is stored changed (Unicode form): nothing to tell.
       if (e.from.normalize("NFC") !== e.to.normalize("NFC")) toast({ tone: "info", kind: "renamed", name: fileStem(e.to) });
       if (e.head && e.head !== tabOf(t.key)?.baseRevision) await onHead(t.key, e.head);
@@ -1254,10 +1403,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         addBanner(key, {
           kind: "missing", name: t.title, folderLabel: t.folderLabel, candidates: e.candidates.map((p) => ({ path: p, name: fileStem(p) })),
         });
+        presenceGone(key);
         return;
       case "back":
         removeKinds(key, ["missing", "downloading", "permission", "replaced"]);
+        it(key).pr.gone = false;
         if (isCard(t.status)) { await retryTab(key, false); return; }
+        if (t.analysisId) { await presenceOpen(key, e.path, t.analysisId); evaluate(key); }
         await onHead(key, e.head);
         return;
       case "changed":
@@ -1270,6 +1422,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         return;
       case "replaced":
         addBanner(key, { kind: "replaced", name: t.title });
+        presenceGone(key);
         return;
       case "sibling":
         await handleSibling(key, e.sibling);
@@ -1308,6 +1461,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       removeKinds(key, ["newerOnDisk"]);
       return;
     }
+    // Phase 3 §5.6: a newer version arriving in the after-sleep window ends it (then the usual routing).
+    if (i.pr.resume) endResume(key, "newer");
     const inv = await invariantCheck(key, m);
     if (inv === "rolledBack" || inv === "journal") return;
     const R = tabOf(key)?.baseRevision ?? null;
@@ -1373,7 +1528,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       removeKinds(key, ["newerOnDisk", "rolledBack", "combined"]);
       // A "Choose…" / "combining" note whose other version is in this one now is answered.
       removeBanners(key, (b) => b.kind === "savedOver" && !!b.state && !!b.version?.head && isAncestorOrSelf(m, b.version.head, H));
-      toast({ tone: "info", kind: "reloaded", version: vi(m, H) });
+      // Phase 3 §5.7: where another computer's note is (or was) seen, the status line says it instead of a toast.
+      if (!it(key).pr.hadForeignNote) toast({ tone: "info", kind: "reloaded", version: vi(m, H) });
+      releaseIfClean(key);
       await quietly(backend.deleteDraft(key), undefined);
       it(key).hasDraft = false;
       await saveSession();
@@ -1447,6 +1604,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   function saveImpl(key: string): Promise<SaveOutcome> {
     const running = savesInFlight.get(key);
     if (running) return running;
+    // Phase 3 §5.6: Save in the after-sleep window asks first.
+    if (tabOf(key) && it(key).pr.resume) {
+      return (async (): Promise<SaveOutcome> => {
+        if (!(await resumeAsk(key, "save"))) return { ok: false, reason: "cancelled" };
+        return saveImpl(key);
+      })();
+    }
     const run = saveOnce(key).finally(() => { if (savesInFlight.get(key) === run) savesInFlight.delete(key); });
     savesInFlight.set(key, run);
     return run;
@@ -1470,6 +1634,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       if (get().activeKey !== key) await switchTabImpl(key);
       return saveAsImpl("new");
     }
+    // Phase 3 §5.5: a read-only tab writes nothing into its file.
+    if (presenceBlocks(key, "save")) return { ok: false, reason: "readOnly" };
     if (t.readOnly) { addBanner(key, { kind: "tooNew" }); return { ok: false, reason: "failed" }; }
     if (isCard(t.status) || t.status === "opening") return { ok: false, reason: "failed" };
     // A combine nobody asked for is waiting: Save does it now (§5.4.1).
@@ -1547,6 +1713,11 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
             patchTab(key, { dirty: false });
           }
         }
+        // Phase 3 (D6): the note gets the new version at once and stays "editing"; the 30 s start again.
+        i.pr.lastSaveAt = now();
+        i.pr.editHereHold = false;
+        if (i.pr.holding) restartLinger(key);
+        evaluate(key);
         await touchRecent(path, aid);
         await saveSession();
         toast({ tone: "success", kind: "saved", name: title });
@@ -1698,6 +1869,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       patchTab(key, { baseRevision: theirsHead, notSaved: false, dirty: isLoaded(key) ? isDirty(graph.getState()) : false });
       removeKinds(key, ["notSaved", "newerOnDisk"]);
       addBanner(key, { kind: "tookTheirs", name: fileStem(copy), path: copy, version: vi(c.theirs.manifest, theirsHead) });
+      releaseIfClean(key);
       await saveSession();
       return;
     }
@@ -1765,6 +1937,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     await touchRecent(path, manifest.analysis_id);
     await saveSession();
     backend.track(path, { active: get().activeKey === key });
+    presenceRepath(key, old, path);
     toast({ tone: "success", kind: "saved", name: title });
   }
 
@@ -1772,6 +1945,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const key = get().activeKey;
     const t = tabOf(key);
     if (!key || !t || !isLoaded(key)) return { ok: false, reason: "nothing" };
+    if (mode === "same" && t.path && presenceBlocks(key, "saveAs")) return { ok: false, reason: "readOnly" };
     deps.flushScratch({ commitEdit: true });
     const picked = await pickPath({
       mode: "save", title: "Save As", suggestedName: `${safeFileName(t.title)}.lag`, startDir: t.path ? parentDir(t.path) : null,
@@ -1793,6 +1967,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       set({ dialog: null });
       if (a.kind !== "saveAsKind" || a.choice === "cancel") return { ok: false, reason: "cancelled" };
       kind = a.choice;
+      if (kind === "same" && presenceBlocks(key, "saveAs")) return { ok: false, reason: "readOnly" };
     }
     const c = content();
     const serial = graph.getState().editSerial;
@@ -2010,6 +2185,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       clearRetry(key);
       cancelAuto(key);
       cancelHeld(key);
+      disposePresence(key, t.path);
       if (get().versions?.tabKey === key) closeVersionsImpl();
       const dlg = get().dialog;
       if (dlg?.kind === "combine" && dlg.state.tabKey === key) set({ dialog: null });
@@ -2657,6 +2833,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   async function autoRecheck(key: string, ctx: CombineCtx, expected: string | null): Promise<void> {
     const t = tabOf(key);
     if (!t?.path || internal.get(key) === undefined) return;
+    // Phase 3 §5.5: while the tab is read-only the combine stays pending ("combining" note kept), looked at again
+    // when the guard clears.
+    if (readOnlyNow(key)) { it(key).pr.autoWaiting = { ctx, expected }; return; }
     const theirsInfo = vi(ctx.theirsFile.manifest, ctx.theirsRev.id);
     if (tabDirty(key)) { clearCombining(key); chooseBanner(key, ctx.source, theirsInfo); return; }
     const r = await readFile(t.path);
@@ -2751,6 +2930,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   } = {}): Promise<SaveOutcome> {
     const t = tabOf(key);
     if (!t?.path || t.saving || isCard(t.status)) return { ok: false, reason: "nothing" };
+    if (presenceBlocks(key, "combine")) return { ok: false, reason: "readOnly" };
     if (savesInFlight.has(key)) return savesInFlight.get(key)!;
     cancelAuto(key);
     if (get().activeKey !== key) await switchTabImpl(key);
@@ -2938,6 +3118,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const i = it(key);
     const ctx = i.combine;
     if (!ctx || d.state.applying) return { ok: false, reason: "nothing" };
+    if (presenceBlocks(key, "applyCombine")) return { ok: false, reason: "readOnly" };
     set({ dialog: { kind: "combine", state: { ...d.state, applying: true, error: null } } });
     const out = await inSaveSlot(key, async () => {
       let cur = ctx;
@@ -3066,6 +3247,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   }
 
   async function undoCombineImpl(key: string): Promise<SaveOutcome> {
+    if (presenceBlocks(key, "undoCombine")) return { ok: false, reason: "readOnly" };
     const i = it(key);
     const prev = i.preCombineHead;
     if (!prev) return { ok: false, reason: "nothing" };
@@ -3091,6 +3273,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   async function useEarlierImpl(key: string): Promise<void> {
     const t = tabOf(key);
     if (!t?.path) return;
+    if (presenceBlocks(key, "useEarlierVersion")) return;
     const i = it(key);
     const r = await readFile(t.path);
     if (!r.ok) return;
@@ -3143,6 +3326,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
 
   async function goBackToMyLatestImpl(key: string): Promise<void> {
     const t = tabOf(key);
+    if (t && presenceBlocks(key, "goBackToMyLatest")) return;
     const i = it(key);
     const b = t?.banners.find((x) => x.kind === "rolledBack");
     const j = b ? i.bannerData.get(b.id) : undefined;
@@ -3473,6 +3657,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const key = keyArg ?? get().versions?.tabKey ?? get().activeKey;
     const t = tabOf(key);
     if (!key || !t?.path || !t.analysisId) return { ok: false, reason: "nothing" };
+    if (presenceBlocks(key, "bringBack")) return { ok: false, reason: "readOnly" };
     if (isLoaded(key)) deps.flushScratch({ commitEdit: true });
     if (tabDirty(key)) {
       const data0 = await versionData(id);
@@ -3551,6 +3736,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         await quietly(backend.deleteDraft(key), undefined);
       }
       removeKinds(key, ["newerOnDisk", "saveFailed"]);
+      releaseIfClean(key);
       toast({ tone: "success", kind: "broughtBack", version: vi(data.manifest, id) });
       await touchRecent(res.path, t1.analysisId);
       await saveSession();
@@ -3605,6 +3791,910 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Phase 3: who is editing — notes, read-only, edit here (phase3-contract.md §5)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  let shareDefault: ShareMode = "auto";
+  let presenceTimer: unknown = null;
+  let lastTickAt = 0;
+  /** The app is quitting (the preview's simulated quit): no note is written any more. */
+  let closingNotes = false;
+  /** Highest epoch used per path in this run (a reopened file never repeats an epoch). */
+  const epochByPath = new Map<string, number>();
+  /** Foreign notes a removal was asked for (one request per file and bytes). */
+  const removing = new Set<string>();
+  let renewing = false;
+  let renewedOnce = false;
+  /** evaluate() depth: a nested evaluation (a claim fired while setting a guard) makes the outer one stop. */
+  let evalSeq = 0;
+
+  const PRESENCE_KINDS: readonly BannerKind[] = [
+    "resuming", "continuedElsewhere", "bothEditing", "waitingNewer", "editingElsewhere", "editingInfo", "unconfirmed", "olderPeer",
+  ];
+  const isPresenceKind = (k: BannerKind) => PRESENCE_KINDS.includes(k);
+  const READ_ONLY_GUARDS: readonly EditGuardReason[] = ["editingElsewhere", "checking", "waiting"];
+  const nativeWake = () => (deps.nativeWake === null ? desktop : deps.nativeWake);
+  const pkey = (t: NoteTarget) => `${t.device_id}\u0000${t.epoch}`;
+  const me = () => ({ deviceId: device?.device_id ?? "", userName: device?.user_name ?? "" });
+
+  /** The notes of the last listing that are about this tab's document, from other computers, one per device. */
+  function foreignRecords(key: string): NoteRecord[] {
+    return pickPerDevice(it(key).pr.records.filter((r) => r.applies && !r.own));
+  }
+  const foreignNotes = (key: string): NoteJson[] => foreignRecords(key).map((r) => r.note);
+
+  function knowsFn(key: string): (id: string) => boolean {
+    const i = it(key);
+    const ids = new Set<string>();
+    for (const m of [i.manifest, i.pr.diskManifest]) for (const r of m?.revisions ?? []) ids.add(r.id);
+    const base = tabOf(key)?.baseRevision;
+    if (base) ids.add(base);
+    // A version this computer has already seen (in this file or a copy, e.g. before the file was put back to an
+    // earlier version) is not one "on its way": nothing to wait for.
+    const aid = tabOf(key)?.analysisId;
+    const seenIds = aid ? seen.analyses[aid] : undefined;
+    return (id) => ids.has(id) || (!!seenIds && Object.prototype.hasOwnProperty.call(seenIds, id));
+  }
+
+  /** decide()'s diskHead: the tab's base when it is clean, else the newest head read from disk for the path. */
+  function diskHeadOf(key: string): string | null {
+    const t = tabOf(key);
+    if (!t) return null;
+    if (!tabDirty(key)) return t.baseRevision;
+    return it(key).pr.diskHead ?? t.baseRevision;
+  }
+
+  function sharingOf(key: string): SharingView {
+    const t = tabOf(key);
+    const pr = it(key).pr;
+    const d = shareDecision({
+      choice: pr.share, fallback: shareDefault, untitled: !t?.path, cloud: !!pr.cloud?.cloud,
+      multiDevice: multiDevice(it(key).manifest, device?.device_id ?? "", foreignNotes(key)),
+    });
+    return { choice: pr.share, fallback: shareDefault, on: d.on, why: d.why, service: pr.cloud?.service ?? serviceOf(t?.path ?? null) };
+  }
+
+  function decideFor(key: string): PresenceDecision {
+    const pr = it(key).pr;
+    const diskHead = diskHeadOf(key);
+    return decide({
+      me: me(), now: now(), diskHead, knows: knowsFn(key), dirty: tabDirty(key), holding: pr.holding,
+      myEpoch: pr.epoch, resuming: !!pr.resume, overrides: pr.overrides, notes: handoverView(key, diskHead), obs: pr.obs,
+    });
+  }
+
+  /** fixer VP-3: the foreign notes as decide() sees them. Right after this tab took in a version saved by a
+   *  computer that is editing, that computer's note still names the version before it (its rewritten note is on
+   *  its way: the two files sync separately). For LIMITS_HANDOVER_MS after the version arrived, and only while
+   *  that note has not changed since, it is read as based on the new version — so a clean observer stays
+   *  read-only across the editor's save instead of turning editable for the seconds in between. */
+  function handoverView(key: string, diskHead: string | null): NoteJson[] {
+    const notes = foreignNotes(key);
+    const pr = it(key).pr;
+    const t0 = now();
+    if (pr.headSeen.head !== diskHead) {
+      const seqs: Record<string, number> = {};
+      for (const n of notes) seqs[n.device_id] = n.seq;
+      pr.headSeen = { head: diskHead, at: t0, seqs };
+    }
+    pr.handoverUntil = null;
+    const m = it(key).manifest;
+    const until = pr.headSeen.at + LIMITS_HANDOVER_MS;
+    if (!diskHead || !m || tabDirty(key) || pr.holding || t0 >= until) return notes;
+    const r = revisionOf(m, diskHead);
+    if (!r || !r.device_id) return notes;
+    let used = false;
+    const out = notes.map((n) => {
+      if (n.state !== "editing" || n.base_revision === null || n.base_revision === diskHead || n.device_id !== r.device_id) return n;
+      if (!Object.prototype.hasOwnProperty.call(pr.headSeen.seqs, n.device_id) || pr.headSeen.seqs[n.device_id] !== n.seq) return n;
+      if (!isStrictAncestor(m, n.base_revision, diskHead)) return n;
+      used = true;
+      return { ...n, base_revision: diskHead };
+    });
+    if (used) pr.handoverUntil = until;
+    return out;
+  }
+
+  /** The next epoch for a claim on this tab's file (never one used before for it on this computer). */
+  function nextEpoch(key: string): number {
+    const t = tabOf(key);
+    const pr = it(key).pr;
+    const memo = t?.path ? fileMemo.get(t.path)?.note_epoch ?? 0 : 0;
+    const e = Math.max(pr.epoch, t?.path ? epochByPath.get(t.path) ?? 0 : 0, memo) + 1;
+    pr.epoch = e;
+    if (t?.path) epochByPath.set(t.path, e);
+    return e;
+  }
+
+  /** A new listing of the notes beside the tab's file (open, an event, after a wake-up). */
+  function takeRecords(key: string, records: NoteRecord[]): void {
+    const t = tabOf(key);
+    if (!t) return;
+    const pr = it(key).pr;
+    const before = pr.records;
+    pr.records = records;
+    pr.listed = true;
+    const foreign = foreignNotes(key);
+    if (foreign.length) pr.hadForeignNote = true;
+    pr.obs = observe(pr.obs, foreign, now(), knowsFn(key));
+    // A note of mine left from a crash: its epoch is continued, never repeated.
+    const leftovers = records.filter((r) => r.own && r.applies);
+    for (const r of leftovers) {
+      if (r.note.epoch > pr.epoch && !pr.holding) pr.epoch = r.note.epoch;
+      if (t.path) epochByPath.set(t.path, Math.max(epochByPath.get(t.path) ?? 0, r.note.epoch));
+    }
+    if (leftovers.length) pr.leftover = true;
+    // Another computer's note unchanged for 24 h (or about a document that is gone) is removed (§3.7).
+    let n = 0;
+    for (const target of cleanupTargets(records, now())) {
+      const k = `${target.file}\u0000${target.sha}`;
+      if (removing.has(k) || n >= 5) continue;
+      removing.add(k);
+      n++;
+      void quietly(backend.presenceRemoveForeign(target), false);
+    }
+    // A second running app with my identity (§5.4, S18).
+    if (device && duplicateIdentity(before, records, { deviceId: device.device_id, sessionId: device.session_id })) void renewIdentity();
+  }
+
+  async function renewIdentity(): Promise<void> {
+    // At most once per launch (fixer VS-5): two copies of the app on one state folder would otherwise hand the
+    // identity back and forth.
+    if (renewing || renewedOnce) return;
+    renewing = true;
+    renewedOnce = true;
+    try {
+      const d = await quietly(backend.newDeviceId(), null);
+      if (!d) return;
+      device = { ...d };
+      toast({ tone: "info", kind: "deviceIdChanged" });
+      for (const t of get().tabs) { const pr = it(t.key).pr; pr.written = null; evaluate(t.key); }
+    } finally { renewing = false; }
+  }
+
+  /** Open / back / wake: where the file is (cloud), the notes beside it, my epoch. Opening waits for this at most
+   *  LIMITS_OPEN_NOTES_MS (a stalled or offline folder never holds the document back, fixer VS-4); a later
+   *  answer is taken in and the tab evaluated then. */
+  async function presenceOpen(key: string, path: string, analysisId: string): Promise<void> {
+    const pr = it(key).pr;
+    pr.listedPath = path;
+    let late = false;
+    const work = (async () => {
+      const cloud = await quietly(backend.cloudInfo(path), { cloud: false, service: null, root: null } as CloudInfo);
+      if (tabOf(key)?.path !== path) return;
+      pr.cloud = cloud;
+      const r = await quietly(backend.presenceList(path, analysisId), null);
+      if (tabOf(key)?.path !== path) return;
+      if (r && r.ok) takeRecords(key, r.notes);
+      if (late) evaluate(key);
+    })();
+    let timer: unknown = null;
+    const cap = new Promise<void>((resolve) => { timer = deps.timers.setTimeout(() => { late = true; resolve(); }, LIMITS_OPEN_NOTES_MS); });
+    await Promise.race([work, cap]);
+    if (!late && timer) deps.timers.clearTimeout(timer);
+  }
+
+  // ── my note (§5.3) ──
+
+  function noteWanted(key: string): WrittenNote | null {
+    const t = tabOf(key);
+    if (!t?.path || !t.analysisId || closingNotes || isCard(t.status) || t.status === "opening" || it(key).pr.gone) return null;
+    if (!sharingOf(key).on) return null;
+    const pr = it(key).pr;
+    const editing = pr.holding;
+    const live = new Set(foreignNotes(key).map((n) => pkey({ device_id: n.device_id, epoch: n.epoch })));
+    const sup = editing ? pr.supersedes.filter((x) => live.has(pkey(x))).slice(0, 32) : [];
+    return {
+      path: t.path, analysisId: t.analysisId, state: editing ? "editing" : "idle", head: t.baseRevision, base: editing ? t.baseRevision : null,
+      epoch: pr.epoch, supersedes: sup, names: `${device?.device_name ?? ""}\u0000${device?.user_name ?? ""}\u0000${device?.device_id ?? ""}`, off: false,
+    };
+  }
+
+  const sameNote = (a: WrittenNote, b: WrittenNote) =>
+    a.path === b.path && a.analysisId === b.analysisId && a.state === b.state && a.head === b.head && a.base === b.base && a.epoch === b.epoch
+    && a.names === b.names && JSON.stringify(a.supersedes) === JSON.stringify(b.supersedes);
+
+  /** Bring my note in line with the facts: written only when something differs (never on a timer; the
+   *  backend keeps it beating). Fire and forget: no person's action waits for it. */
+  function sync(key: string, opts: { input?: boolean; force?: boolean } = {}): void {
+    const t = tabOf(key);
+    if (!t) return;
+    const pr = it(key).pr;
+    const want = noteWanted(key);
+    if (!want) {
+      const old = pr.written?.path ?? (pr.leftover ? t.path : null);
+      pr.written = null;
+      pr.leftover = false;
+      if (old && !closingNotes) void quietly(backend.presenceClear(old), undefined);
+      return;
+    }
+    if (!opts.force && pr.written && sameNote(want, pr.written)) return;
+    const old = pr.written;
+    pr.written = want;
+    pr.leftover = false;
+    const seq = ++pr.writeSeq;
+    if (opts.input) pr.lastPingAt = now();
+    void backend.presenceSet({
+      docPath: want.path, analysisId: want.analysisId, state: want.state, head: want.head, baseRevision: want.base, epoch: want.epoch,
+      supersedes: want.supersedes, input: !!opts.input,
+    }).then((r) => {
+      // The note at the old path goes, always (fixer VS-2): after Save As "the same analysis" under a new name both
+      // files exist and nothing else removes it. presence_clear never takes a note registered for another
+      // document path, so the new note (which may apply to the old path by the sole-id rule) stays.
+      if (old && old.path !== want.path) void quietly(backend.presenceClear(old.path), undefined);
+      if (pr.writeSeq !== seq) return;
+      if (!r.ok) { pr.written = null; return; }           // tried again at the next sync, never shown
+      if (r.kind === "off") pr.written = { ...want, off: true };
+      if (tabOf(key)) refreshPresence(key);
+    }, () => { if (pr.writeSeq === seq) pr.written = null; });
+    if (t.path) rememberEpoch(t.path, want.epoch);
+  }
+
+  function rememberEpoch(path: string, epoch: number): void {
+    epochByPath.set(path, Math.max(epochByPath.get(path) ?? 0, epoch));
+  }
+
+  /** "There was input": the linger restarts; Rust hears about it at most every inputPingMs. */
+  function noteInput(key: string): void {
+    const t = tabOf(key);
+    const pr = it(key).pr;
+    pr.lastInputAt = now();
+    pr.editHereHold = false;
+    if (pr.holding) restartLinger(key);
+    if (t?.path && pr.holding && pr.written && !pr.written.off && now() - pr.lastPingAt >= LIMITS_P3.inputPingMs) {
+      pr.lastPingAt = now();
+      backend.presenceInput(t.path);
+    }
+  }
+
+  /** The person changed something on a tab that was not editing: this computer starts editing (§5.3 Claim). */
+  function claim(key: string, opts: { input: boolean; supersedes?: NoteTarget[]; editHere?: boolean }): void {
+    const pr = it(key).pr;
+    const d = pr.decision ?? decideFor(key);
+    const notes = foreignNotes(key);
+    pr.editHereHold = !!opts.editHere;
+    pr.claimSeen = new Set([...notes.filter((n) => n.state === "editing").map(pkey), ...pr.overrides.map(pkey), ...(opts.supersedes ?? []).map(pkey)]);
+    const quietMine = d.peers.filter((p) => p.state === "editing" && p.freshness === "quiet" && p.basedOn === "myVersion")
+      .map((p) => notes.find((n) => n.device_id === p.deviceId))
+      .filter((n): n is NoteJson => !!n).map((n) => ({ device_id: n.device_id, epoch: n.epoch }));
+    const sup = new Map<string, NoteTarget>();
+    for (const x of [...pr.overrides, ...(opts.supersedes ?? []), ...quietMine]) sup.set(pkey(x), x);
+    pr.holding = true;
+    pr.resume = null;
+    clearResumeTimer(key);
+    nextEpoch(key);
+    pr.supersedes = [...sup.values()];
+    pr.lastInputAt = now();
+    restartLinger(key);
+    evaluate(key, { input: opts.input });
+  }
+
+  /** The note returns to idle (D6), or the hold simply ends. */
+  function release(key: string): void {
+    const pr = it(key).pr;
+    if (!pr.holding) return;
+    pr.holding = false;
+    pr.supersedes = [];
+    // fixer VP-2: "Edit here" lasts as long as this computer is editing. Once it stops, the other computer's
+    // ongoing claim makes this clean tab read-only again (until that computer saves and stops).
+    pr.overrides = [];
+    pr.editHereHold = false;
+    pr.claimSeen = new Set();
+    pr.resume = null;
+    clearResumeTimer(key);
+    clearLinger(key);
+    evaluate(key);
+  }
+
+  /** Release at once (D6 b, c) when the tab is clean. */
+  function releaseIfClean(key: string): void {
+    if (tabOf(key) && it(key).pr.holding && !tabDirty(key)) release(key);
+  }
+
+  function clearLinger(key: string): void {
+    const pr = it(key).pr;
+    if (pr.lingerTimer) { deps.timers.clearTimeout(pr.lingerTimer); pr.lingerTimer = null; }
+  }
+
+  function restartLinger(key: string): void {
+    const pr = it(key).pr;
+    if (!pr.holding) { clearLinger(key); return; }
+    // fixer round 2 (RV-4): an Edit here hold without an edit or a save is not ended by the 30 s rule.
+    if (pr.editHereHold) { clearLinger(key); return; }
+    // A running timer that fires no later than the new end is kept: lingerCheck looks again at the real end.
+    if (pr.lingerTimer) return;
+    const since = Math.max(pr.lastSaveAt, pr.lastInputAt);
+    const left = Math.max(0, since + LIMITS_P3.lingerMs - now());
+    pr.lingerTimer = deps.timers.setTimeout(() => { pr.lingerTimer = null; lingerCheck(key); }, left);
+  }
+
+  function lingerCheck(key: string): void {
+    if (!tabOf(key)) return;
+    const pr = it(key).pr;
+    if (!pr.holding || tabDirty(key) || pr.editHereHold) return; // unsaved changes never release: the note goes quiet by itself
+    const since = Math.max(pr.lastSaveAt, pr.lastInputAt);
+    if (now() - since < LIMITS_P3.lingerMs) { restartLinger(key); return; }
+    release(key);
+  }
+
+  // ── the guard (§5.4 step 3) ──
+
+  /** Bring the store's guard in line. false: a claim happened meanwhile (the tab was re-evaluated). */
+  function applyGuard(key: string, wanted: EditGuardReason | null, mySeq: number): boolean {
+    const pr = it(key).pr;
+    if (pr.guardRetry) { deps.timers.clearTimeout(pr.guardRetry); pr.guardRetry = null; }
+    if (!isLoaded(key)) { pr.guard = wanted; return true; }
+    const s = graph.getState();
+    const cur = s.guard?.reason ?? null;
+    if (cur === wanted) { pr.guard = wanted; return true; }
+    if (wanted === null) {
+      graph.getState().setGuard(null);
+      pr.guard = null;
+      onGuardCleared(key);
+      return true;
+    }
+    if (wanted === "tooNew" || wanted === "resuming" || (cur !== null && READ_ONLY_GUARDS.includes(cur))) {
+      // An open Scratchpad cell entry is committed first: under the guard it could not be committed any more and
+      // would be lost when the Scratchpad closes (fixer VS-6). The tab has unsaved changes already; it stays so.
+      if (wanted === "resuming" && cur === null) {
+        deps.flushScratch({ commitEdit: true });
+        if (mySeq !== evalSeq) return false;
+      }
+      graph.getState().setGuard({ reason: wanted });
+      pr.guard = wanted;
+      return true;
+    }
+    // Becoming read-only: an open Scratchpad edit is committed first (it may be a claim), never in the middle of
+    // a typed value, never with unsaved changes.
+    const serial0 = s.userEditSerial;
+    deps.flushScratch({ commitEdit: true });
+    if (mySeq !== evalSeq) return false;
+    const s1 = graph.getState();
+    if (s1.userEditSerial !== serial0 || isDirty(s1)) { if (mySeq === evalSeq) evaluate(key); return false; }
+    if (quietBool(() => deps.interactionBusy())) {
+      pr.guardRetry = deps.timers.setTimeout(() => { pr.guardRetry = null; if (tabOf(key)) evaluate(key); }, LIMITS_P3.applyHoldRetryMs);
+      return true;
+    }
+    graph.getState().setGuard({ reason: wanted });
+    pr.guard = wanted;
+    return true;
+  }
+
+  /** The guard went: an automatic combine that waited is looked at again. */
+  function onGuardCleared(key: string): void {
+    const i = it(key);
+    const w = i.pr.autoWaiting;
+    if (!w) return;
+    i.pr.autoWaiting = null;
+    void Promise.resolve().then(() => { if (tabOf(key)) void autoRecheck(key, w.ctx, w.expected); });
+  }
+
+  /** The guard of a tab (the store's for the loaded tab, the wanted one for a background tab). */
+  const guardOf = (key: string): EditGuardReason | null => (isLoaded(key) ? graph.getState().guard?.reason ?? null : it(key).pr.guard);
+  const readOnlyNow = (key: string) => { const g = guardOf(key); return !!g && READ_ONLY_GUARDS.includes(g); };
+
+  /** A writer refused while the tab is read-only (§5.5): the attempt is counted. */
+  function presenceBlocks(key: string, action: string): boolean {
+    if (!tabOf(key) || !readOnlyNow(key)) return false;
+    reportAttempt(key, "command", action);
+    return true;
+  }
+
+  function reportAttempt(key: string, path: EditPath, action: string): void {
+    if (isLoaded(key)) { graph.getState().noteBlockedEdit(path, action); return; }
+    const pr = it(key).pr;
+    pr.attempt++;
+    refreshPresence(key);
+  }
+
+  // ── evaluating a tab (§5.4) ──
+
+  function peerTarget(key: string, deviceId: string): NoteTarget | null {
+    const n = foreignNotes(key).find((x) => x.device_id === deviceId);
+    return n ? { device_id: n.device_id, epoch: n.epoch } : null;
+  }
+
+  function evaluate(key: string, opts: { input?: boolean } = {}): void {
+    const t = tabOf(key);
+    if (!t) return;
+    const mySeq = ++evalSeq;
+    const i = it(key);
+    const pr = i.pr;
+    if (!t.path || !t.analysisId || isCard(t.status) || t.status === "opening") {
+      if (t.path === null && t.presence) patchTab(key, { presence: undefined });
+      if (isCard(t.status)) sync(key);
+      return;
+    }
+    if (pr.listedPath !== t.path) {
+      // A new path (Save As, a separate copy, Find it…): where it is and the notes beside it, then again.
+      const path = t.path, aid = t.analysisId;
+      if (pr.listedPath !== null && parentDir(pr.listedPath) !== parentDir(path)) { pr.cloud = null; pr.records = []; pr.obs = emptyObs(); }
+      void presenceOpen(key, path, aid).then(() => { if (tabOf(key)?.path === path) evaluate(key); });
+    }
+    let d = decideFor(key);
+    if (d.yieldedTo) {
+      // Another computer took over my claim ("Edit here" there).
+      if (pr.resume) { pr.resume = null; clearResumeTimer(key); pr.forceSync = true; d = decideFor(key); }
+      if (d.yieldedTo && !tabDirty(key) && pr.holding) {
+        pr.holding = false;
+        pr.supersedes = [];
+        pr.overrides = [];
+        pr.editHereHold = false;
+        pr.claimSeen = new Set();
+        clearLinger(key);
+        d = decideFor(key);
+      }
+    }
+    if (pr.holding && !pr.resume && !tabDirty(key) && newerClaim(key, d)) {
+      // fixer round 2 (RV-4): another computer started editing this version after my claim (it did not see my note
+      // yet, or it claimed again): a clean tab's hold ends, as when that computer presses Edit here.
+      pr.holding = false;
+      pr.supersedes = [];
+      pr.overrides = [];
+      pr.editHereHold = false;
+      pr.claimSeen = new Set();
+      clearLinger(key);
+      d = decideFor(key);
+    }
+    pr.decision = d;
+    const wanted: EditGuardReason | null = t.readOnly === "tooNew" ? "tooNew"
+      : d.mode === "readOnly" ? (d.checking ? "checking" : "editingElsewhere")
+        : d.mode === "waiting" ? "waiting" : d.mode === "resuming" ? "resuming" : null;
+    if (!applyGuard(key, wanted, mySeq)) return;
+    if (mySeq !== evalSeq) return;
+    syncBanners(key, d);
+    const force = pr.forceSync;
+    pr.forceSync = false;
+    sync(key, { input: opts.input, force });
+    refreshPresence(key);
+    if (d.mode === "waiting") backend.pollNow();
+    // The next moment the answer can change by itself (one timer, moved only when that moment moves).
+    const nextAt = pr.handoverUntil !== null && (d.nextCheckAt === null || pr.handoverUntil < d.nextCheckAt) ? pr.handoverUntil : d.nextCheckAt;
+    if (nextAt !== pr.checkAt || !pr.checkTimer) {
+      if (pr.checkTimer) { deps.timers.clearTimeout(pr.checkTimer); pr.checkTimer = null; }
+      pr.checkAt = nextAt;
+      if (nextAt !== null) {
+        const ms = Math.max(0, nextAt - now()) + 1;
+        pr.checkTimer = deps.timers.setTimeout(() => { pr.checkTimer = null; pr.checkAt = null; if (tabOf(key)) evaluate(key); }, ms);
+      }
+    }
+    if (pr.holding && !tabDirty(key) && !pr.lingerTimer) restartLinger(key);
+  }
+
+  /** fixer round 2 (RV-4): a live editing claim on this tab's version that was not known when my hold began. */
+  function newerClaim(key: string, d: PresenceDecision): boolean {
+    const pr = it(key).pr;
+    const notes = foreignNotes(key);
+    return d.peers.some((p) => {
+      if (p.state !== "editing" || p.freshness === "quiet" || p.freshness === "checking" || p.basedOn !== "myVersion") return false;
+      const n = notes.find((x) => x.device_id === p.deviceId);
+      return !!n && !pr.claimSeen.has(pkey(n));
+    });
+  }
+
+  /** fixer round 2 (RV-2): the tab's file is at another path now — Find it…, a rename followed (same-folder search or
+   *  the poll's move by identity), a save that followed the file, Save As (the same or a new analysis), a combine
+   *  into the other copy. The one place the note follows the file: the "gone" mark of the old path no longer
+   *  applies, unsaved changes hold the document as on Open (§5.3), and evaluate lists the notes beside the new
+   *  path, writes my note there and removes the one at the old path (sync). */
+  function presenceRepath(key: string, from: string | null, to: string): void {
+    if (from === to || !tabOf(key)) return;
+    const pr = it(key).pr;
+    pr.gone = false;
+    if (tabOf(key)?.analysisId && tabDirty(key) && !pr.holding) claim(key, { input: false });
+    else evaluate(key);
+  }
+
+  /** Who the status line names for version `id`: its author when that is another computer; for an automatic
+   *  combine (it has no author) the newest person's version it combined — none when one of those is mine (my save
+   *  combined it: "All changes saved"). null: nothing to say (fixer F2). */
+  function statusWho(m: Manifest, id: string): VersionInfo | null {
+    const visited = new Set<string>();
+    const stack = [id];
+    let best: VersionInfo | null = null;
+    while (stack.length && visited.size < 64) {
+      const x = stack.pop()!;
+      if (visited.has(x)) continue;
+      visited.add(x);
+      const r = revisionOf(m, x);
+      if (!r) continue;
+      if (r.device_id) {
+        const v = vi(m, x);
+        if (v.mine) return null;
+        if (!best || v.time > best.time) best = v;
+        continue;
+      }
+      stack.push(...r.parents);
+    }
+    return best;
+  }
+
+  /** tab.presence from the last decision (left as it is when nothing changed). */
+  function refreshPresence(key: string): void {
+    const t = tabOf(key);
+    if (!t?.path) return;
+    const i = it(key);
+    const pr = i.pr;
+    const d = pr.decision;
+    const guard = guardOf(key);
+    let status: StatusLine | null = null;
+    if (!tabDirty(key) && i.manifest && t.baseRevision && revisionOf(i.manifest, t.baseRevision)) {
+      const who = statusWho(i.manifest, t.baseRevision);
+      if (who) status = { kind: "upToDate", who, seenAt: seen.analyses[i.manifest.analysis_id]?.[t.baseRevision] ?? null };
+    }
+    const presence: TabPresence = {
+      mode: d?.mode ?? "editable", readOnly: !!guard && READ_ONLY_GUARDS.includes(guard), guard,
+      peers: d?.peers ?? [], mine: pr.written && !pr.written.off ? pr.written.state : "none", sharing: sharingOf(key), status, attempt: pr.attempt,
+    };
+    if (JSON.stringify(presence) === JSON.stringify(t.presence ?? null)) return;
+    patchTab(key, { presence });
+    const dlg = get().dialog;
+    if (dlg?.kind === "sharing" && dlg.tabKey === key && JSON.stringify(dlg.sharing) !== JSON.stringify(presence.sharing)) {
+      set({ dialog: { ...dlg, sharing: presence.sharing } });
+    }
+  }
+
+  function syncBanners(key: string, d: PresenceDecision): void {
+    const t = tabOf(key)!;
+    const i = it(key);
+    const pr = i.pr;
+    const byId = new Map(d.peers.map((p) => [p.deviceId, p] as const));
+    const about = d.about.map((id) => byId.get(id)).filter((p): p is PeerView => !!p);
+    const closed = (peers: PeerView[]) => peers.length > 0 && peers.every((p) => { const x = peerTarget(key, p.deviceId); return !!x && pr.dismissed.has(pkey(x)); });
+    const out: TabBanner[] = [];
+    const mk = (kind: BannerKind, actions: BannerAction[], dismissible: boolean, more: Partial<TabBanner> = {}): TabBanner =>
+      ({ id: kind, kind, actions, dismissible, ...more });
+    switch (d.mode) {
+      case "readOnly":
+        if (d.checking) out.push(mk("editingElsewhere", [], false, { peers: about, checking: true }));
+        else out.push(mk("editingElsewhere", [about.every((p) => p.sameUser) ? "editHere" : "editAnyway"], false, { peers: about }));
+        break;
+      case "waiting": {
+        const p = d.waiting ? byId.get(d.waiting.deviceId) : undefined;
+        out.push(mk("waitingNewer", [], false, { peers: p ? [p] : about }));
+        break;
+      }
+      case "info": {
+        if (closed(about)) break;
+        const quietMine = about.some((p) => p.state === "editing" && p.freshness === "quiet" && p.basedOn === "myVersion");
+        out.push(mk("editingInfo", quietMine ? ["editHere", "dismiss"] : ["dismiss"], true, { peers: about }));
+        break;
+      }
+      case "bothEditing":
+        if (d.yieldedTo) {
+          const p = byId.get(d.yieldedTo);
+          if (!closed(p ? [p] : [])) out.push(mk("continuedElsewhere", ["keepEditing", "saveCopy"], false, { peers: p ? [p] : [] }));
+        } else if (!closed(about)) out.push(mk("bothEditing", ["keepEditing", "saveCopy"], false, { peers: about }));
+        break;
+      case "resuming":
+        out.push(mk("resuming", ["keepEditing"], false, { peers: about }));
+        break;
+      case "editable":
+        break;
+    }
+    if (d.unconfirmed && d.mode !== "waiting" && pr.unconfirmedClosed !== (t.baseRevision ?? "")) out.push(mk("unconfirmed", [], true));
+    const m = i.manifest;
+    const op = m ? olderPeer(m, device?.device_id ?? "", foreignNotes(key)) : null;
+    if (op && m && pr.olderPeerClosed !== m.head) {
+      const user = op.userName.trim();
+      out.push(mk("olderPeer", ["dismiss"], true, {
+        peers: [{
+          deviceId: op.deviceId, deviceName: op.deviceName, userName: op.userName, sameUser: user !== "" && user === me().userName.trim(),
+          state: "idle", freshness: "quiet", basedOn: null, updatedAt: "", editingSince: null, changedAt: 0, superseded: false, supersedesMe: false,
+        }],
+      }));
+    }
+    const cur = t.banners.filter((b) => isPresenceKind(b.kind));
+    const same = cur.length === out.length && out.every((b) => JSON.stringify(cur.find((c) => c.id === b.id) ?? null) === JSON.stringify(b));
+    if (same) return;
+    patchTab(key, { banners: [...t.banners.filter((b) => !isPresenceKind(b.kind)), ...out] });
+  }
+
+  /** × or OK on a presence banner: it stays away (until another peer / epoch, the base or the head changes). */
+  function dismissPresence(key: string, b: TabBanner): void {
+    const t = tabOf(key);
+    if (!t) return;
+    const pr = it(key).pr;
+    if (b.kind === "unconfirmed") pr.unconfirmedClosed = t.baseRevision ?? "";
+    else if (b.kind === "olderPeer") pr.olderPeerClosed = it(key).manifest?.head ?? null;
+    else for (const p of b.peers ?? []) { const x = peerTarget(key, p.deviceId); if (x) pr.dismissed.add(pkey(x)); }
+    removeBanners(key, (x) => x.id === b.id);
+    evaluate(key);
+  }
+
+  // ── Edit here, both editing (§5.5) ──
+
+  async function editHereImpl(key: string, confirmed?: boolean): Promise<boolean> {
+    const t = tabOf(key);
+    if (!t?.path) return false;
+    const pr = it(key).pr;
+    let d = decideFor(key);
+    if (d.mode === "readOnly" && !d.checking) {
+      const byId = new Map(d.peers.map((p) => [p.deviceId, p] as const));
+      const about = d.about.map((id) => byId.get(id)).filter((p): p is PeerView => !!p);
+      if (about.some((p) => !p.sameUser) && confirmed !== true) {
+        const a = await ask({ kind: "editAnyway", tabKey: key, title: t.title, peers: about });
+        if (get().dialog?.kind === "editAnyway") set({ dialog: null });
+        if (a.kind !== "editAnyway" || a.choice !== "edit") return false;
+        if (!tabOf(key)) return false;
+        const d2 = decideFor(key);
+        if (d2.mode !== "readOnly") return d2.mode !== "waiting";
+        d = d2;
+      }
+      // One synchronous step: nothing waits for the other computer or the disk (D10).
+      for (const b of d.blockers) { if (!pr.overrides.some((x) => pkey(x) === pkey(b))) pr.overrides = [...pr.overrides, b]; pr.dismissed.add(pkey(b)); }
+      if (isLoaded(key)) graph.getState().setGuard(null);
+      pr.guard = null;
+      claim(key, { input: true, supersedes: d.blockers, editHere: true });
+      return true;
+    }
+    if (d.mode === "info") {
+      const notes = foreignNotes(key);
+      const quiet = d.peers.filter((p) => p.state === "editing" && p.freshness === "quiet" && p.basedOn === "myVersion")
+        .map((p) => notes.find((n) => n.device_id === p.deviceId)).filter((n): n is NoteJson => !!n)
+        .map((n) => ({ device_id: n.device_id, epoch: n.epoch }));
+      if (!quiet.length) return false;
+      for (const b of quiet) { if (!pr.overrides.some((x) => pkey(x) === pkey(b))) pr.overrides = [...pr.overrides, b]; pr.dismissed.add(pkey(b)); }
+      claim(key, { input: true, supersedes: quiet, editHere: true });
+      return true;
+    }
+    return false;
+  }
+
+  function keepEditingImpl(key: string): void {
+    const t = tabOf(key);
+    if (!t) return;
+    const pr = it(key).pr;
+    if (pr.resume) { endResume(key, "go"); return; }
+    for (const b of t.banners) {
+      if (b.kind !== "bothEditing" && b.kind !== "continuedElsewhere") continue;
+      for (const p of b.peers ?? []) { const x = peerTarget(key, p.deviceId); if (x) pr.dismissed.add(pkey(x)); }
+    }
+    removeBanners(key, (b) => b.kind === "bothEditing" || b.kind === "continuedElsewhere");
+    evaluate(key);
+  }
+
+  /** "Save my changes as a separate copy…" (the phase 1 separate-copy path): this file is left as it is. */
+  async function saveAsSeparateCopyImpl(key: string): Promise<SaveOutcome> {
+    const t = tabOf(key);
+    if (!t?.path || !t.analysisId) return { ok: false, reason: "nothing" };
+    if (get().activeKey !== key) await switchTabImpl(key);
+    if (!isLoaded(key)) return { ok: false, reason: "nothing" };
+    deps.flushScratch({ commitEdit: true });
+    const picked = await pickPath({ mode: "save", title: "Save my changes as a separate copy", suggestedName: `${safeFileName(`${t.title} (my copy)`)}.lag`, startDir: parentDir(t.path) });
+    if (!picked) return { ok: false, reason: "cancelled" };
+    const path = withGraphExt(picked);
+    const other = tabByPath(path);
+    if (path === t.path || (other && other.key !== key)) {
+      addBanner(key, { kind: "saveFailed", message: "That file is open in another tab. Choose another name." });
+      return { ok: false, reason: "failed" };
+    }
+    const c = content();
+    const serial = graph.getState().editSerial;
+    const aid = newAnalysisId();
+    const forked = t.baseRevision ? { analysis_id: t.analysisId, revision_id: t.baseRevision } : null;
+    const file = await buildNewFile({ content: c, analysisId: aid, forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
+    const res = await backend.save({ path, expectedHead: null, replaceExisting: true, analysisId: aid, docKey: key, manifest: file.manifest, newParts: file.parts });
+    if (!res.ok) {
+      addBanner(key, { kind: "saveFailed", message: res.kind === "error" ? saveFailedMessage(res.code) : saveFailedMessage("Io") });
+      return { ok: false, reason: "failed" };
+    }
+    const i = it(key);
+    if (t.baseRevision && !i.settled.includes(t.baseRevision)) i.settled = [...i.settled, t.baseRevision];
+    rememberTab(key);
+    i.lastSource = null;
+    await moveTabToNewFile(key, res.path, res.head, file.manifest, c, serial, true);
+    return { ok: true, path: res.path };
+  }
+
+  // ── sleep and wake (§5.6) ──
+
+  function clearResumeTimer(key: string): void {
+    const pr = it(key).pr;
+    if (pr.resumeTimer) { deps.timers.clearTimeout(pr.resumeTimer); pr.resumeTimer = null; }
+  }
+
+  /** The after-sleep window ends: "yield" (another computer took over: my note stays as it is and beats again),
+   *  else a re-claim with a new epoch. */
+  function endResume(key: string, why: "yield" | "go" | "newer" | "timeout"): void {
+    const pr = it(key).pr;
+    if (!pr.resume) return;
+    pr.resume = null;
+    clearResumeTimer(key);
+    if (why === "yield") { pr.forceSync = true; evaluate(key); return; }
+    pr.holding = true;
+    pr.editHereHold = false;
+    pr.claimSeen = new Set([...foreignNotes(key).filter((n) => n.state === "editing").map(pkey), ...pr.overrides.map(pkey)]);
+    nextEpoch(key);
+    pr.supersedes = [];
+    pr.forceSync = true;
+    evaluate(key);
+  }
+
+  function onGap(): void {
+    const t0 = now();
+    for (const t of get().tabs) {
+      if (!t.path || !t.analysisId) continue;
+      const pr = it(t.key).pr;
+      pr.obs = markGap(pr.obs, t0);
+      if (pr.holding) {
+        if (!tabDirty(t.key)) { pr.holding = false; pr.supersedes = []; pr.overrides = []; clearLinger(t.key); }
+        else {
+          pr.resume = { since: t0 };
+          clearResumeTimer(t.key);
+          const key = t.key;
+          pr.resumeTimer = deps.timers.setTimeout(() => { pr.resumeTimer = null; if (tabOf(key)) endResume(key, "timeout"); }, LIMITS_P3.resumeMs);
+        }
+      }
+      evaluate(t.key);
+    }
+    backend.pollNow();
+    for (const t of get().tabs) {
+      if (!t.path || !t.analysisId || isCard(t.status)) continue;
+      const key = t.key;
+      const path = t.path;
+      void quietly(backend.presenceList(path, t.analysisId), null).then((r) => {
+        if (!r || !r.ok || tabOf(key)?.path !== path) return;
+        takeRecords(key, r.notes);
+        evaluate(key);
+      });
+    }
+  }
+
+  async function resumeAsk(key: string, what: "save" | "edit"): Promise<boolean> {
+    const t = tabOf(key);
+    if (!t || !it(key).pr.resume) return true;
+    if (get().dialog?.kind === "resumeConfirm") return false;
+    const a = await ask({ kind: "resumeConfirm", tabKey: key, title: t.title, what });
+    if (get().dialog?.kind === "resumeConfirm") set({ dialog: null });
+    if (a.kind !== "resumeConfirm" || a.choice !== "go") return false;
+    endResume(key, "go");
+    return true;
+  }
+
+  // ── the presence timer ──
+
+  function presenceTick(): void {
+    presenceTimer = deps.timers.setTimeout(presenceTick, LIMITS_P3.tickMs);
+    const t = now();
+    const prev = lastTickAt;
+    lastTickAt = t;
+    if (!nativeWake() && prev && gapDetected(prev, t, LIMITS_P3.tickMs)) { onGap(); return; }
+    // Input in the window (keys, clicks) while the active tab is editing WITH unsaved changes and the graphs are
+    // shown: it keeps the note up to date. A clean tab's 30 s after Save are counted from real edits only, so
+    // clicks elsewhere (results, exports, another tool) never keep other computers read-only (fixer VS-1, D6).
+    const key = get().activeKey;
+    if (key && tabOf(key)) {
+      const pr = it(key).pr;
+      const act = quietNum(() => deps.lastActivity());
+      if (act > pr.lastActivitySeen) {
+        pr.lastActivitySeen = act;
+        if (pr.holding && tabDirty(key) && quietBool(() => deps.graphsVisible())) noteInput(key);
+      }
+    }
+    for (const tab of get().tabs) {
+      const pr = internal.get(tab.key)?.pr;
+      if (pr?.decision?.mode === "waiting") { backend.pollNow(); break; }
+    }
+  }
+  function quietNum(f: () => number): number { try { const v = f(); return Number.isFinite(v) ? v : Number.NEGATIVE_INFINITY; } catch { return Number.NEGATIVE_INFINITY; } }
+
+  function startPresence(): void {
+    if (presenceTimer) return;
+    lastTickAt = now();
+    presenceTimer = deps.timers.setTimeout(presenceTick, LIMITS_P3.tickMs);
+  }
+
+  // ── events ──
+
+  function onPresenceEvent(path: string, notes: NoteRecord[]): void {
+    const t = tabByPath(path);
+    if (!t) return;
+    takeRecords(t.key, notes);
+    evaluate(t.key);
+  }
+
+  function onWakeEvent(): void {
+    if (!nativeWake()) return;
+    onGap();
+  }
+
+  // ── "Show others when I'm editing" (§5.9) ──
+
+  function openSharingImpl(key?: string): void {
+    const k = key ?? get().activeKey;
+    const t = tabOf(k);
+    if (!k || !t?.path) return;
+    set({ dialog: { kind: "sharing", tabKey: k, title: t.title, sharing: sharingOf(k) } });
+  }
+
+  async function setSharingImpl(key: string, choice: ShareMode | null): Promise<void> {
+    const t = tabOf(key);
+    if (!t?.path) return;
+    it(key).pr.share = choice;
+    evaluate(key);
+    await saveSession();
+  }
+
+  async function setSharingDefaultImpl(mode: ShareMode): Promise<void> {
+    shareDefault = mode;
+    const s = get().settings;
+    if (s) set({ settings: { ...s, shareDefault: mode } });
+    for (const t of get().tabs) evaluate(t.key);
+    await saveSession();
+  }
+
+  /** The notes this computer knows of for an analysis (own and foreign), for retention (§5.8). */
+  function noteHeadsFor(analysisId: string): string[] {
+    const notes: NoteJson[] = [];
+    for (const t of get().tabs) {
+      if (t.analysisId !== analysisId) continue;
+      for (const r of it(t.key).pr.records) if (r.applies) notes.push(r.note);
+    }
+    return liveNoteHeads(notes);
+  }
+
+  /** The file is missing or another analysis is at the path: my note goes (written again when it is back). */
+  function presenceGone(key: string): void {
+    const pr = it(key).pr;
+    pr.gone = true;
+    pr.holding = false;
+    pr.supersedes = [];
+    pr.overrides = [];
+    clearLinger(key);
+    sync(key);
+    evaluate(key);
+  }
+
+  /** A tab is closed for good: its timers stop and its note is removed. */
+  function disposePresence(key: string, path: string | null): void {
+    const pr = internal.get(key)?.pr;
+    if (!pr) return;
+    for (const h of [pr.lingerTimer, pr.resumeTimer, pr.guardRetry, pr.checkTimer]) if (h) deps.timers.clearTimeout(h);
+    pr.lingerTimer = pr.resumeTimer = pr.guardRetry = pr.checkTimer = null;
+    pr.holding = false;
+    pr.writeSeq++;
+    const old = pr.written?.path ?? path;
+    pr.written = null;
+    if (old) rememberEpoch(old, pr.epoch);
+    if (old && !closingNotes) void quietly(backend.presenceClear(old), undefined);
+  }
+
+  /** The preview's simulated quit: every note of this computer goes; none is written any more. */
+  function clearAllNotes(): void {
+    for (const t of get().tabs) {
+      const pr = internal.get(t.key)?.pr;
+      const p = pr?.written?.path ?? t.path;
+      if (pr) { pr.written = null; pr.writeSeq++; }
+      if (p) void quietly(backend.presenceClear(p), undefined);
+    }
+    closingNotes = true;
+  }
+
+  /** A change was refused on the loaded tab (§5.5): the banner's button pulses; after a sleep it asks. */
+  function onBlocked(key: string): void {
+    const pr = it(key).pr;
+    pr.attempt++;
+    refreshPresence(key);
+    if (graph.getState().guard?.reason === "resuming") void resumeAsk(key, "edit");
+  }
+
+  async function presenceBannerAction(key: string, b: TabBanner, action: BannerAction): Promise<void> {
+    switch (action) {
+      case "editHere": {
+        const allSame = (b.peers ?? []).every((p) => p.sameUser);
+        await editHereImpl(key, allSame ? true : undefined);
+        return;
+      }
+      case "editAnyway": await editHereImpl(key, false); return;
+      case "keepEditing": keepEditingImpl(key); return;
+      case "saveCopy": await saveAsSeparateCopyImpl(key); return;
+      case "dismiss": case "later": dismissPresence(key, b); return;
+      default: return;
+    }
+  }
+
   // ── banner actions ──
 
   async function bannerActionImpl(key: string, bannerId: string, action: BannerAction): Promise<void> {
@@ -3613,6 +4703,10 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (!t || !b) return;
     const i = it(key);
     const drop = () => removeBanners(key, (x) => x.id === bannerId);
+    if (isPresenceKind(b.kind) || action === "editHere" || action === "editAnyway" || action === "keepEditing" || action === "saveCopy") {
+      await presenceBannerAction(key, b, action);
+      return;
+    }
     if ((b.kind === "extraCopy" || b.kind === "copyQuestion") && b.path && action !== "dismiss" && action !== "later") {
       // The copy may have been removed or combined on another computer since the banner appeared.
       const h = await quietly(backend.header(b.path), null);
@@ -3692,6 +4786,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         return;
       }
       case "updateMine": {
+        if (presenceBlocks(key, "updateMine")) return;
         if (b.kind === "extraCopy") { if (b.path) await takeNewerCopy(key, bannerId, b.path); return; }
         const q = b.path;
         if (!q || !t.path || !t.analysisId) return;
@@ -3721,6 +4816,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         const dk = i.bannerData.get(bannerId);
         drop();
         if (dk) await quietly(backend.deleteDraft(dk), undefined);
+        releaseIfClean(key);
         return;
       }
     }
@@ -3764,6 +4860,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   async function restore(): Promise<number> {
     const session = await quietly(backend.readSession(), { v: 1, tabs: [] } as GraphSession);
     fileMemo.clear();
+    const sd = session.share_default;
+    shareDefault = sd === "always" || sd === "never" || sd === "auto" ? sd : "auto";
     if (session.files && typeof session.files === "object") {
       for (const [p, m] of Object.entries(session.files)) {
         if (!m || typeof m !== "object" || typeof m.analysis_id !== "string") continue;
@@ -3771,6 +4869,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         fileMemo.set(p, {
           analysis_id: m.analysis_id, settled_heads: strs(m.settled_heads), carry_heads: strs(m.carry_heads),
           accepted_head: typeof m.accepted_head === "string" ? m.accepted_head : null,
+          ...(m.share === "auto" || m.share === "always" || m.share === "never" ? { share: m.share } : {}),
+          ...(typeof m.note_epoch === "number" && Number.isFinite(m.note_epoch) && m.note_epoch > 0 ? { note_epoch: Math.floor(m.note_epoch) } : {}),
         });
       }
     }
@@ -3812,6 +4912,11 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         patchTab(t.key, { status: "ready" });
         // Watched from now on (10 s looks), so a rename or a change is noticed before the tab is visited.
         backend.track(t.path, { active: false });
+        // Phase 3: who has it open; a background tab with unsaved changes holds it (its note says "editing").
+        const aid = t.analysisId ?? h.header.analysis_id;
+        if (!t.analysisId) patchTab(t.key, { analysisId: aid });
+        await presenceOpen(t.key, t.path, aid);
+        if (tabOf(t.key)?.dirty && !it(t.key).pr.holding) claim(t.key, { input: false }); else evaluate(t.key);
       } else await readErrorCard(t.key, h.ok ? "NotFound" : h.code, "restore");
     }
     let restored = 0;
@@ -3886,6 +4991,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         const p = await deps.makePreviewBackend!();
         backend = p.backend;
         persistNow = p.persistNow;
+        // Phase 3: the preview's controller runs on the simulated clock (the simulator's "+5 min" and sleeps).
+        if (p.now) deps.now = p.now;
+        if (p.timers) deps.timers = p.timers;
       }
     }
     set({ desktop });
@@ -3904,6 +5012,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     recentEntries = await quietly(backend.readRecent(), [] as RecentEntry[]);
     set({ recent: recentItems() });
     const restored = await restore();
+    { const st = get().settings; if (st) set({ settings: { ...st, shareDefault } }); }
     const hadTabs = get().tabs.length > 0;
     if (restored > 0) toast({ tone: "success", kind: "restoredDrafts", count: restored });
     if (desktop) {
@@ -3919,7 +5028,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
         document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") retryHeldNow(); });
       }
-      w.addEventListener("blur", () => { void writeActiveDraft(false); });
+      w.addEventListener("blur", () => {
+        void writeActiveDraft(false);
+        // Phase 3 (D6): leaving the window ends the hold of a clean tab at once.
+        for (const t of get().tabs) releaseIfClean(t.key);
+      });
+      w.addEventListener("focus", () => { for (const t of get().tabs) evaluate(t.key); });
+      for (const ev of ["keydown", "pointerdown"]) w.addEventListener(ev, () => { activity.at = now(); }, true);
       if (!desktop) {
         w.addEventListener("beforeunload", () => {
           // Synchronous: the memory backend's calls complete before their first await.
@@ -3931,6 +5046,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
     set({ ready: true, recent: recentItems() });
     pushMenu();
+    startPresence();
   }
 
   async function openPaths(paths: string[]): Promise<void> {
@@ -3971,7 +5087,11 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         }
       }
       return true;
-    })().finally(() => { quitPromise = null; });
+    })().then((ok) => {
+      // Phase 3: the preview's (and the tests') simulated quit removes this computer's notes; on the desktop Rust does.
+      if (ok && !desktop && source !== "update") clearAllNotes();
+      return ok;
+    }).finally(() => { quitPromise = null; });
     return quitPromise;
   }
 
@@ -4049,6 +5169,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       case MENU.exportLibrary: focusGraphs(); await openExportImpl(); return;
       case MENU.oldLibrary: focusGraphs(); set({ dialog: { kind: "oldLibrary" } }); return;
       case MENU.settings: set({ dialog: { kind: "settings" } }); return;
+      case MENU.sharing: if (!deps.graphsVisible()) focusGraphs(); openSharingImpl(); return;
       case MENU.about: set({ aboutSerial: get().aboutSerial + 1 }); return;
       case MENU.quit: if (!desktop) await quitRoutineImpl("menu"); return;
     }
@@ -4056,7 +5177,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
 
   // ── the store ──
 
-  const base = create<FileSessionStateP2>(() => ({
+  const base = create<FileSessionStateP3>(() => ({
     ready: false, desktop: false, tabs: [], activeKey: null, cards: [], recent: [], dialog: null, pathPicker: null, toasts: [],
     settings: null, oldLibrary: null, focusSerial: 0, aboutSerial: 0, busy: false, versions: null,
 
@@ -4088,6 +5209,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       it(k).manifest = r.file.manifest;
       patchTab(k, { baseRevision: r.file.manifest.head, dirty: false, readOnly: r.readOnly });
       removeKinds(k, ["newerOnDisk"]);
+      releaseIfClean(k);          // phase 3 (D6): revert ends the hold at once
       await saveSession();
       return true;
     },
@@ -4112,7 +5234,11 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     },
 
     bannerAction: (key, bannerId, action) => bannerActionImpl(key, bannerId, action),
-    dismissBanner: (key, bannerId) => removeBanners(key, (b) => b.id === bannerId),
+    dismissBanner: (key, bannerId) => {
+      const b = tabOf(key)?.banners.find((x) => x.id === bannerId);
+      if (b && isPresenceKind(b.kind)) { dismissPresence(key, b); return; }
+      removeBanners(key, (x) => x.id === bannerId);
+    },
     resolveConflict: (choice) => resolveConflictImpl(choice),
 
     answerDialog: (answer) => {
@@ -4133,6 +5259,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       }
       if (d.kind === "find") { get().cancelFind(); return; }
       if (d.kind === "combine") { cancelCombineImpl(); return; }
+      if (d.kind === "editAnyway") { get().answerDialog({ kind: "editAnyway", choice: "cancel" }); if (get().dialog?.kind === "editAnyway") set({ dialog: null }); return; }
+      if (d.kind === "resumeConfirm") { get().answerDialog({ kind: "resumeConfirm", choice: "wait" }); if (get().dialog?.kind === "resumeConfirm") set({ dialog: null }); return; }
       if (d.kind === "bringBackDirty") { get().answerDialog({ kind: "bringBackDirty", choice: "cancel" }); return; }
       if (d.kind === "export" && d.state.phase === "running") return;
       set({ dialog: null });
@@ -4146,12 +5274,17 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     dismissToast: (id) => set({ toasts: get().toasts.filter((t) => t.id !== id) }),
     openSettings: () => set({ dialog: { kind: "settings" } }),
     setSettings: async (patch: Partial<FileSettings>) => {
-      const d = await backend.setDevice({
-        ...(patch.userName !== undefined ? { userName: patch.userName } : {}),
-        ...(patch.deviceName !== undefined ? { deviceName: patch.deviceName } : {}),
-      });
-      device = { ...d, session_id: device?.session_id ?? d.session_id };
-      set({ settings: { userName: d.user_name, deviceName: d.device_name } });
+      if (patch.shareDefault && patch.shareDefault !== shareDefault) await setSharingDefaultImpl(patch.shareDefault);
+      if (patch.userName !== undefined || patch.deviceName !== undefined) {
+        const d = await backend.setDevice({
+          ...(patch.userName !== undefined ? { userName: patch.userName } : {}),
+          ...(patch.deviceName !== undefined ? { deviceName: patch.deviceName } : {}),
+        });
+        device = { ...d, session_id: device?.session_id ?? d.session_id };
+        set({ settings: { userName: d.user_name, deviceName: d.device_name, shareDefault } });
+        // Phase 3: the notes are written again with the new names.
+        for (const t of get().tabs) evaluate(t.key);
+      }
       if (get().dialog?.kind === "settings") set({ dialog: null });
     },
     openPrivacySettings: () => openPrivacySettingsImpl(),
@@ -4189,6 +5322,15 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     useEarlierVersion: (key) => useEarlierImpl(key),
     goBackToMyLatest: (key) => goBackToMyLatestImpl(key),
     holdReplace: (reason) => holdReplaceImpl(reason),
+
+    // ── phase 3 ──
+    editHere: (key, confirmed) => editHereImpl(key ?? get().activeKey ?? "", confirmed),
+    keepEditing: (key) => keepEditingImpl(key ?? get().activeKey ?? ""),
+    saveAsSeparateCopy: (key) => saveAsSeparateCopyImpl(key ?? get().activeKey ?? ""),
+    reportEditAttempt: (path, action, key) => { const k = key ?? get().activeKey; if (k && tabOf(k)) reportAttempt(k, path, action); },
+    openSharing: (key) => openSharingImpl(key),
+    setSharing: (key, choice) => setSharingImpl(key, choice),
+    setSharingDefault: (mode) => setSharingDefaultImpl(mode),
   }));
 
   store = Object.assign(base, {
@@ -4204,6 +5346,16 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       settled: (key: string) => [...(internal.get(key)?.settled ?? [])],
       seen: () => JSON.parse(JSON.stringify(seen)) as SeenMap,
       flushSeenNow: () => { seenDirty = true; return flushSeen(); },
+      presence: (key: string) => {
+        const pr = internal.get(key)?.pr;
+        if (!pr) return null;
+        return {
+          records: pr.records, holding: pr.holding, epoch: pr.epoch, overrides: [...pr.overrides], supersedes: [...pr.supersedes], resume: pr.resume,
+          written: pr.written ? { state: pr.written.state, head: pr.written.head, base: pr.written.base, epoch: pr.written.epoch, path: pr.written.path, off: pr.written.off } : null,
+          decision: pr.decision, obs: pr.obs, hadForeignNote: pr.hadForeignNote,
+        };
+      },
+      presenceTick: () => presenceTick(),
     },
   });
 
@@ -4217,6 +5369,32 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const dirty = isDirty(s);
     if (t.dirty !== dirty) patchTab(key, { dirty });
     if (s.editSerial !== prev.editSerial) scheduleDraft();
+  });
+
+  // Phase 3: the claim hook (§4.1) and refused edits (§5.5), on the loaded tab.
+  graph.subscribe((s, prev) => {
+    const key = s.file?.docKey;
+    if (!key || !tabOf(key) || !s.doc) return;
+    if (s.userEditSerial !== prev.userEditSerial) {
+      if (it(key).pr.holding) noteInput(key);
+      else if (tabOf(key)?.path) claim(key, { input: true });
+    }
+    if (s.blocked && s.blocked !== prev.blocked && prev.file?.docKey === key) onBlocked(key);
+  });
+
+  // Phase 3: a tab whose base, unsaved state, status or path changed is evaluated again (in a moment).
+  const evalQueue = new Set<string>();
+  store.subscribe((s, prev) => {
+    if (s.tabs === prev.tabs) return;
+    const before = new Map(prev.tabs.map((t) => [t.key, t] as const));
+    for (const t of s.tabs) {
+      const p = before.get(t.key);
+      if (!p || p.baseRevision !== t.baseRevision || p.dirty !== t.dirty || p.readOnly !== t.readOnly || p.status !== t.status || p.path !== t.path || p.analysisId !== t.analysisId) {
+        if (evalQueue.has(t.key)) continue;
+        evalQueue.add(t.key);
+        void Promise.resolve().then(() => { evalQueue.delete(t.key); if (tabOf(t.key)) evaluate(t.key); });
+      }
+    }
   });
 
   // Menu state follows the active tab, Recent and the old library.

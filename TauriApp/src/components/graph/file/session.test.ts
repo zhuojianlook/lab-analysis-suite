@@ -609,13 +609,14 @@ describe("settings", () => {
     await seedFile(w, a.dev, A);
     await a.ses.getState().open(A);
     await a.ses.getState().setSettings({ userName: "  Zhuo Jian  ", deviceName: "Lab Mac" });
-    expect(a.ses.getState().settings).toEqual({ userName: "Zhuo Jian", deviceName: "Lab Mac" });
+    // Phase 3: the settings also carry the "Show others when I'm editing" default.
+    expect(a.ses.getState().settings).toEqual({ userName: "Zhuo Jian", deviceName: "Lab Mac", shareDefault: "auto" });
     a.graph.getState().setCell(0, 0, 0, "n");
     await a.ses.getState().save();
     const f = a.dev.localFile(A)!;
     const head = f.manifest.revisions.find((r) => r.id === f.manifest.head)!;
     expect(head).toMatchObject({ user_name: "Zhuo Jian", device_name: "Lab Mac", device_id: "d-a" });
     const a2 = await a.restart();
-    expect(a2.ses.getState().settings).toEqual({ userName: "Zhuo Jian", deviceName: "Lab Mac" });
+    expect(a2.ses.getState().settings).toEqual({ userName: "Zhuo Jian", deviceName: "Lab Mac", shareDefault: "auto" });
   });
 });

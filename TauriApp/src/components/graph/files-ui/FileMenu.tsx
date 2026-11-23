@@ -18,7 +18,8 @@ export function FileMenu({ variant = "text" }: { variant?: "text" | "outlined" }
   const oldLibrary = useFileSession((s) => s.oldLibrary);
 
   const hasDoc = activeKey !== null;
-  const canSave = hasDoc && !!tab && !tab.readOnly && !tab.saving && tab.status === "ready";
+  // Read-only (too new, or another computer is editing): Save is off; Save As still makes a new analysis.
+  const canSave = hasDoc && !!tab && !tab.readOnly && !tab.presence?.readOnly && !tab.saving && tab.status === "ready";
   const hasOld = (oldLibrary?.total ?? 0) > 0;
   const unexported = oldLibrary?.unexported ?? 0;
 
@@ -30,8 +31,8 @@ export function FileMenu({ variant = "text" }: { variant?: "text" | "outlined" }
     void useFileSession.getState().menu(id, path ?? null);
   };
 
-  const item = (id: MenuId, label: string, opts: { disabled?: boolean; key?: string; shift?: boolean; badge?: number } = {}) => (
-    <MenuItem key={id} dense disabled={opts.disabled} onClick={() => run(id)} onMouseEnter={() => setRecentAnchor(null)} data-testid={`menu-${id}`}>
+  const item = (id: MenuId, label: string, opts: { disabled?: boolean; key?: string; shift?: boolean; badge?: number; testId?: string } = {}) => (
+    <MenuItem key={id} dense disabled={opts.disabled} onClick={() => run(id)} onMouseEnter={() => setRecentAnchor(null)} data-testid={opts.testId ?? `menu-${id}`}>
       <ListItemText primary={
         opts.badge ? (
           <Badge color="primary" variant="dot" sx={{ "& .MuiBadge-dot": { right: -8, top: 6 } }}>{label}</Badge>
@@ -68,6 +69,7 @@ export function FileMenu({ variant = "text" }: { variant?: "text" | "outlined" }
         <Divider />
         {item(MENU.closeTab, MENU_TEXT.closeTab, { key: "w", disabled: !hasDoc })}
         {item(MENU.versions, MENU_TEXT.versions, { disabled: !hasDoc || !tab?.path })}
+        {item(MENU.sharing, MENU_TEXT.sharing, { disabled: !hasDoc || !tab?.path, testId: "menu-sharing" })}
         <Divider />
         {item(MENU.recover, MENU_TEXT.recover)}
         {item(MENU.oldLibrary, MENU_TEXT.oldLibrary, { disabled: !hasOld })}

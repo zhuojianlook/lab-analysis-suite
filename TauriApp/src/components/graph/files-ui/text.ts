@@ -4,7 +4,8 @@
    "draft", "sibling", "displaced" or "analysis id" (contract §5.5, checklist 46). */
 
 import type {
-  BannerAction, BannerKind, FileSettings, RestoreCard, SessionToast, TabBanner, VersionChip, VersionInfo,
+  BannerAction, BannerKind, FileSettings, FileTab, PeerView, RestoreCard, SessionToast, ShareMode, SharingView, StatusLine, TabBanner, TabPresence,
+  VersionChip, VersionInfo,
 } from "../file/contract";
 import { SECTION_PHRASE } from "../file/contract";
 import { SECTION_NAMES, type SectionName } from "../file/format";
@@ -86,6 +87,9 @@ const SEVERITY: Record<BannerKind, Severity> = {
   saveFailed: "error", notSaved: "warning", savedAside: "warning", savedOver: "warning", savedDisplaced: "warning",
   tookTheirs: "info", combined: "success", draftMismatch: "warning", copyQuestion: "info", extraCopy: "info", tempLocation: "info",
   rolledBack: "warning", newerOnDisk: "info", newerCopy: "info", olderCopy: "info", recovered: "success",
+  // Phase 3 (who is editing): severities only, so the baseline compiles; the texts are the ui implementer's (phase3-contract.md §6).
+  resuming: "info", continuedElsewhere: "info", bothEditing: "warning", waitingNewer: "info", editingElsewhere: "info",
+  editingInfo: "info", unconfirmed: "info", olderPeer: "warning",
 };
 
 export function bannerSeverity(b: TabBanner): Severity {
@@ -148,8 +152,128 @@ export function bannerText(b: TabBanner, settings: FileSettings | null): string 
       return `A newer version${when ? ` (saved ${when})` : ""} is in ${folder}.`;
     }
     case "recovered": return `Unsaved changes from ${whenText(b.when) || "your last session"} restored.`;
+    // Phase 3 (who is editing; phase3-contract.md §6.2).
+    case "resuming": return "Checking for changes made while this computer was asleep…";
+    case "continuedElsewhere": {
+      const p = b.peers?.[0];
+      const at = p?.editingSince != null ? ` at ${clockText(p.editingSince)}` : "";
+      return `${p?.sameUser ? "You" : peerUser(p)} continued on ${peerDevice(p)}${at}. Your unsaved changes here are kept and will be combined.`;
+    }
+    case "bothEditing": {
+      const peers = b.peers ?? [];
+      const list = joinNames(peers.map((p) => `${peerDevice(p)} (${p.sameUser ? "your other computer" : peerUser(p)})`));
+      return `Also being edited on ${list || "another computer"}. Nothing is lost — the ${peers.length > 1 ? "versions are" : "two versions are"} combined when you save.`;
+    }
+    case "waitingNewer": return `${cap(peerDevice(b.peers?.[0]))} saved a newer version — loading it…`;
+    case "editingElsewhere": {
+      if (b.checking) return "Checking who is editing…";
+      const peers = b.peers ?? [];
+      const p = peers[0];
+      if (peers.length <= 1) {
+        if (p?.sameUser) return `You have this open on ${peerDevice(p)} with changes not yet saved there. Both sets of changes will be combined when that computer saves.`;
+        const ago = p ? agoText(p.changedAt) : "";
+        return `${peerUser(p)} is editing on ${peerDevice(p)}${ago ? ` (note updated ${ago})` : ""}. You'll see their changes each time they save.`;
+      }
+      const devices = joinNames(peers.map(peerDevice));
+      if (peers.every((x) => x.sameUser)) {
+        return `You have this open on ${devices} with changes not yet saved there. Both sets of changes will be combined when those computers save.`;
+      }
+      const users = uniq(peers.map((x) => (x.sameUser ? "you" : peerUser(x))));
+      return `${cap(joinNames(users))} ${users.length > 1 ? "are" : "is"} editing this version on ${devices}. You'll see their changes each time they save.`;
+    }
+    case "editingInfo": {
+      const peers = b.peers ?? [];
+      const quiet = peers.filter((x) => x.state === "editing" && x.freshness === "quiet" && x.basedOn === "myVersion");
+      const group = quiet.length ? quiet : peers;
+      const allMe = group.length > 0 && group.every((x) => x.sameUser);
+      const who = allMe ? "You" : cap(joinNames(uniq(group.map((x) => (x.sameUser ? "you" : peerUser(x))))));
+      const devices = joinNames(group.map(peerDevice)) || "another computer";
+      const one = group.length === 1 ? group[0] : null;
+      const t = one ? noteClock(one.updatedAt) : null;
+      if (quiet.length) {
+        const when = t ? ` ${t.today ? "at" : "on"} ${t.text}` : "";
+        return `${who} started editing on ${devices}${when} and may have unsaved changes there.`;
+      }
+      const from = t ? ` from ${t.text}` : "";
+      if (allMe) return `You have unsaved changes on ${devices}${from}; they will be combined when ${group.length > 1 ? "those computers save" : "that computer saves"}.`;
+      const plural = uniq(group.map((x) => (x.sameUser ? "you" : peerUser(x)))).length > 1 || allMe;
+      const named = one && !one.sameUser && one.userName.trim() ? one.userName.trim() : null;
+      const saver = named ? `${named} saves` : group.length > 1 ? "those computers save" : "that computer saves";
+      return `${who} ${plural ? "have" : "has"} unsaved changes on ${devices}${from}; they will be combined when ${saver}.`;
+    }
+    case "unconfirmed": return "Couldn't confirm the newest version yet.";
+    case "olderPeer": {
+      const p = b.peers?.[0];
+      const device = p?.deviceName.trim();
+      return `${device ? device : "The other computer"} runs an older version that doesn't show who is editing — update it.`;
+    }
   }
   return "";
+}
+
+const peerDevice = (p: PeerView | undefined) => p?.deviceName.trim() || "another computer";
+const peerUser = (p: PeerView | undefined) => p?.userName.trim() || "Someone";
+const uniq = (xs: string[]) => xs.filter((x, i) => xs.indexOf(x) === i);
+
+/** "Alice" · "Alice and Bob" · "Alice, Bob and 1 other" · "Alice, Bob and 2 others". */
+export function joinNames(names: readonly string[]): string {
+  const n = names.filter((x) => x !== "");
+  if (n.length <= 1) return n[0] ?? "";
+  if (n.length === 2) return `${n[0]} and ${n[1]}`;
+  const rest = n.length - 2;
+  return `${n[0]}, ${n[1]} and ${rest} other${rest === 1 ? "" : "s"}`;
+}
+
+/** Where "now" comes from for texts: this computer's clock (the browser preview's simulator swaps in its own). */
+let nowSource: () => number = () => Date.now();
+export function setUiNow(fn: (() => number) | null): void { nowSource = fn ?? (() => Date.now()); }
+export const uiNow = (): number => nowSource();
+
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const two = (n: number) => String(n).padStart(2, "0");
+
+/** A moment on this computer's clock: "19:40" today, "Fri 18:02" within the last 7 days, "12 Nov 18:02" before that
+ *  (with the year when it isn't this year). "" when it isn't a time. */
+export function clockText(ms: number, now: number = uiNow()): string {
+  if (!Number.isFinite(ms)) return "";
+  const d = new Date(ms);
+  const today = new Date(now);
+  const hm = `${two(d.getHours())}:${two(d.getMinutes())}`;
+  if (d.toDateString() === today.toDateString()) return hm;
+  const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  if (ms < startToday && startToday - ms < 6 * 86_400_000) return `${DAYS[d.getDay()]} ${hm}`;
+  const day = `${d.getDate()} ${MONTHS[d.getMonth()]}`;
+  return `${d.getFullYear() === today.getFullYear() ? day : `${day} ${d.getFullYear()}`} ${hm}`;
+}
+
+/** A note's own time (the other computer's clock; display only). null when it doesn't parse. */
+function noteClock(iso: string): { text: string; today: boolean } | null {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  const text = clockText(t);
+  return text ? { text, today: !text.includes(" ") } : null;
+}
+
+/** whenText for a time on this computer's clock (ms). */
+export function agoText(ms: number | null | undefined, now: number = uiNow()): string {
+  if (ms == null || !Number.isFinite(ms)) return "";
+  return whenText(new Date(ms).toISOString(), now);
+}
+
+/** The kind of banner a refused edit points at (its button pulses), for a tab's guard. */
+export const PRESENCE_KINDS: readonly BannerKind[] = [
+  "resuming", "continuedElsewhere", "bothEditing", "waitingNewer", "editingElsewhere", "editingInfo", "unconfirmed", "olderPeer",
+];
+export function attemptBannerOf(tab: { banners: TabBanner[]; presence?: { guard: string | null } | undefined; readOnly: "tooNew" | null }): TabBanner | null {
+  const g = tab.presence?.guard ?? (tab.readOnly ? "tooNew" : null);
+  const want: BannerKind[] =
+    g === "editingElsewhere" || g === "checking" ? ["editingElsewhere"]
+      : g === "waiting" ? ["waitingNewer"]
+        : g === "resuming" ? ["resuming"]
+          : g === "tooNew" ? ["tooNew"] : [];
+  for (const k of want) { const b = tab.banners.find((x) => x.kind === k); if (b) return b; }
+  return tab.banners.find((x) => PRESENCE_KINDS.includes(x.kind) && x.actions.some((a) => a !== "dismiss"))
+    ?? tab.banners.find((x) => PRESENCE_KINDS.includes(x.kind) || x.kind === "tooNew") ?? null;
 }
 
 export function bannerActionLabel(kind: BannerKind, action: BannerAction): string {
@@ -179,6 +303,11 @@ export function bannerActionLabel(kind: BannerKind, action: BannerAction): strin
     case "keep": return "Keep";
     case "whatChanged": return "What changed";
     case "undo": return "Undo";
+    // Phase 3
+    case "editHere": return "Edit here";
+    case "editAnyway": return "Edit anyway…";
+    case "keepEditing": return "Keep editing";
+    case "saveCopy": return "Save my changes as a separate copy…";
   }
   return action;
 }
@@ -225,6 +354,7 @@ export function toastText(t: SessionToast, settings: FileSettings | null): strin
     case "broughtBack": return `Brought back the version from ${whenText(t.version?.time) || "earlier"}`;
     case "copyRemoved": return `Removed '${t.name ?? ""}'. The app keeps it for 30 days.`;
     case "savedAsNew": return `Saved as a new analysis: '${t.name ?? ""}'`;
+    case "deviceIdChanged": return "This computer was using the same identity as another one. It now has its own.";
   }
   return t.message ?? "";
 }
@@ -237,9 +367,41 @@ export const STATUS = {
   dirty: "Unsaved changes",
   saved: "All changes saved",
   untitled: "Not saved to a file yet",
-  readOnly: "Read only",
+  readOnly: "Read-only",
   opening: "Opening…",
+  /** The Save button's tooltip while the tab is read-only. */
+  readOnlySave: "Read-only right now",
 } as const;
+
+interface DocStatusInput {
+  status: FileTab["status"];
+  saving: boolean;
+  notSaved: boolean;
+  readOnly: FileTab["readOnly"];
+  dirty: boolean;
+  path: string | null;
+  presence?: TabPresence;
+}
+
+/** The status text of the document bar (phase 3 contract §6.4): the first that applies. */
+export function docStatusText(tab: DocStatusInput, settings: FileSettings | null, now: number = uiNow()): string {
+  if (tab.status === "opening") return STATUS.opening;
+  if (tab.saving) return STATUS.saving;
+  if (tab.notSaved) return STATUS.notSaved;
+  const st = tab.presence?.status ?? null;
+  const saved = st ? `${cap(whoText(st.who, settings))} saved${savedWhen(st, now)}` : "";
+  // Read-only: the chip beside the title says so; the status line says who saved (short enough to stay visible
+  // beside a banner; fixer F4).
+  if (tab.readOnly || tab.presence?.readOnly) return saved || STATUS.readOnly;
+  if (tab.dirty) return STATUS.dirty;
+  if (st) return `Up to date · ${saved}`;
+  return tab.path ? STATUS.saved : "";
+}
+
+function savedWhen(st: StatusLine, now: number): string {
+  const w = st.seenAt != null ? agoText(st.seenAt, now) : whenText(st.who.time, now);
+  return w ? ` ${w}` : "";
+}
 
 // ── dialogs (contract §5.5) ────────────────────────────────────────────────
 
@@ -260,6 +422,8 @@ export const T = {
   saveAsNewSub: "It gets its own identity. Use this when you start a new experiment from this one.",
   saveAsSame: "The same analysis in a new place",
   saveAsSameSub: "It stays connected to the original, with its history. Use this to move a file you received.",
+  /** fixer F5: the "same analysis" choice while the tab is read-only. */
+  saveAsSameReadOnly: "Not available right now: this analysis is read-only while it is edited on another computer.",
 
   closeDirty: (title: string) => `Save changes to '${title}' before closing?`,
   closeDirtySub: "Your changes are lost if you don't save them.",
@@ -312,7 +476,55 @@ export const T = {
   recentOpened: (when: string) => `opened ${when}`,
   recentRemove: "Remove from this list",
   oldLibraryLinePrefix: "Analyses saved before files:",
+
+  // Phase 3 (phase3-contract.md §6.5)
+  editAnywayTitle: "Edit anyway?",
+  editAnywayBody: (users: string) => `${users} may have unsaved changes. If you both edit, the two versions are combined on save. Continue?`,
+  editAnywayGo: "Edit anyway",
+  cancel: "Cancel",
+  resumeSaveTitle: "Save now?",
+  resumeSaveBody: "This computer was asleep. Changes made on another computer may not have arrived yet. If someone else saved meanwhile, the two versions are combined.",
+  resumeSaveGo: "Save now",
+  resumeEditTitle: "Keep editing?",
+  resumeEditBody: "This computer was asleep. Changes made on another computer may not have arrived yet. If you both edit, the two versions are combined on save.",
+  resumeEditGo: "Keep editing",
+  resumeWait: "Wait",
+  sharingTitle: "Show others when I'm editing this file",
+  sharingDefault: (name: string) => `Use my default (${name})`,
+  sharingHelp: "While you edit, other computers that have this file open show it as read-only until you save. The note file is small and safe to delete. Dropbox also has its own \u201cLock editing\u201d (paid plans); you can use it as well.",
+  sharingClose: "Close",
+  settingsShare: "Show others when I'm editing",
+  settingsShareHelp: "Used for files that have no choice of their own.",
 } as const;
+
+/** "Show others when I'm editing": the three modes as choices (§6.5). */
+export const SHARE_LABEL: Record<ShareMode, string> = {
+  auto: "Automatically (in cloud folders)",
+  always: "Always",
+  never: "Never",
+};
+/** The short name of a mode, for "Use my default (…)". */
+export const SHARE_SHORT: Record<ShareMode, string> = { auto: "Automatically", always: "Always", never: "Never" };
+
+/** The status line of the sharing dialog, from SharingView.why. */
+export function sharingStatusText(v: Pick<SharingView, "why" | "service">): string {
+  switch (v.why) {
+    case "cloud": return `On. This file is in ${v.service ?? "a cloud folder"}, so a small note file is kept next to it while it is open here.`;
+    case "otherComputers": return "On. This file has been used on another computer.";
+    case "always": return "On. A small note file is kept next to this file while it is open here.";
+    case "local": return "Off. This file is not in a cloud folder and has only been used on this computer.";
+    case "never": return "Off. Other computers can't see when you are editing this file.";
+    case "untitled": return "Save the analysis to a file first.";
+  }
+  return "";
+}
+
+/** "Alice" / "Alice and Bob" for the Edit anyway dialog: the people (not me) the tab is read-only for. */
+export function editAnywayText(peers: readonly PeerView[]): string {
+  const users = uniq(peers.map((p) => (p.sameUser ? "you" : peerUser(p))).filter((u) => u !== "you"));
+  const all = users.length ? users : uniq(peers.map((p) => peerUser(p)));
+  return T.editAnywayBody(cap(joinNames(all)) || "Someone");
+}
 
 /** Menu labels, in the order of the native File menu (contract §6.1). */
 export const MENU_TEXT = {
@@ -326,6 +538,7 @@ export const MENU_TEXT = {
   duplicate: "Duplicate as a New Analysis…",
   closeTab: "Close Tab",
   versions: "Versions",
+  sharing: "Show Others When I'm Editing…",
   recover: "Recover Unsaved Work…",
   oldLibrary: "Old Library…",
   exportLibrary: "Export Library to Files…",
@@ -387,7 +600,7 @@ export const V = {
   thisComputer: "this computer",
   autoDevice: "Combined automatically",
   tooOldFooter: "Older versions are listed but can no longer be opened.",
-  readOnly: "Read only",
+  readOnly: "Read-only",
   previewTitle: (summary: string, who: string, when: string) => `${summary} — ${[who, when].filter(Boolean).join(", ")}`,
   tooOldBody: "This version is too old to open. Its entry is kept so you can see who saved it and when.",
   loadingVersion: "Opening this version…",

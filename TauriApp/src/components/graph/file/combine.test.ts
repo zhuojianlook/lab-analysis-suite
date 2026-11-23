@@ -210,7 +210,8 @@ describe("S5–S7: automatic combines (clean tab, device-ordered delay)", () => 
   });
 
   it("S6: two clean computers, same pair: the shorter delay writes, the other finds it and writes nothing", async () => {
-    const s = await pair(500, "lww");
+    // Phase 3: no notes — with them the computer that just saved holds the file and the other one is read-only.
+    const s = await pair(500, "lww", { notes: false });
     const { a, b } = s;
     await editCell(a, "X");
     await a.ses.getState().save();
@@ -231,7 +232,7 @@ describe("S5–S7: automatic combines (clean tab, device-ordered delay)", () => 
 
   it("S6: forced to write at the same moment, both produce the same version id: one combine", async () => {
     const same = { combineDelayMs: async () => 3000 };
-    const s = await pair(500, "lww", { depsA: same, depsB: same });
+    const s = await pair(500, "lww", { depsA: same, depsB: same, notes: false });
     const { a, b } = s;
     await editCell(a, "X");
     await a.ses.getState().save();

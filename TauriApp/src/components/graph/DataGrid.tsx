@@ -1,10 +1,11 @@
-import { memo, useCallback, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
+import { memo, useCallback, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent } from "react";
 import { Box, Divider, IconButton, Menu, MenuItem, Typography } from "@mui/material";
 import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
 import { useGraphStore } from "../../store/graphStore";
 import {
   MAX_COLS, MAX_ROWS, colHasData, isMultiPaste, leadCols, parseCell, rowHasData, type PasteResult,
 } from "./graphModel";
+import { reportBlocked, useReadOnly } from "./RailGuard";
 
 const GUTTER = 38;
 const LEAD_W = 120;
@@ -15,10 +16,13 @@ const H2 = 22;
 const DataCell = memo(function DataCell({ r, c, k, fc, w }: { r: number; c: number; k: number; fc: number; w: number }) {
   const value = useGraphStore((s) => s.doc?.cells[r]?.[c]?.[k] ?? "");
   const setCell = useGraphStore((s) => s.setCell);
+  const ro = useReadOnly();
   const invalid = value !== "" && parseCell(value).invalid;
   return (
     <td>
       <input
+        readOnly={ro}
+        aria-readonly={ro || undefined}
         data-gr={r}
         data-gc={fc}
         className={invalid ? "invalid" : undefined}
@@ -37,10 +41,13 @@ const LeadCell = memo(function LeadCell({ r, kind }: { r: number; kind: "x" | "r
   const value = useGraphStore((s) => (kind === "x" ? s.doc?.x[r] : s.doc?.row_titles[r]) ?? "");
   const setX = useGraphStore((s) => s.setX);
   const setRowTitle = useGraphStore((s) => s.setRowTitle);
+  const ro = useReadOnly();
   const invalid = kind === "x" && value !== "" && parseCell(value).invalid;
   return (
     <td className="lead">
       <input
+        readOnly={ro}
+        aria-readonly={ro || undefined}
         data-gr={r}
         data-gc={0}
         className={invalid ? "invalid" : undefined}
@@ -57,9 +64,12 @@ const LeadCell = memo(function LeadCell({ r, kind }: { r: number; kind: "x" | "r
 const ColTitle = memo(function ColTitle({ c, fc, onMenu }: { c: number; fc: number; onMenu: (el: HTMLElement, c: number) => void }) {
   const value = useGraphStore((s) => s.doc?.col_titles[c] ?? "");
   const setColTitle = useGraphStore((s) => s.setColTitle);
+  const ro = useReadOnly();
   return (
     <Box sx={{ display: "flex", alignItems: "center", gap: 0.25 }}>
       <input
+        readOnly={ro}
+        aria-readonly={ro || undefined}
         data-gr={-1}
         data-gc={fc}
         className="title"
@@ -78,8 +88,9 @@ const ColTitle = memo(function ColTitle({ c, fc, onMenu }: { c: number; fc: numb
 const XTitle = memo(function XTitle() {
   const value = useGraphStore((s) => s.doc?.x_title ?? "");
   const setXTitle = useGraphStore((s) => s.setXTitle);
+  const ro = useReadOnly();
   return (
-    <input data-gr={-1} data-gc={0} className="title" aria-label="Title of the X column" value={value}
+    <input readOnly={ro} aria-readonly={ro || undefined} data-gr={-1} data-gc={0} className="title" aria-label="Title of the X column" value={value}
       onChange={(e) => setXTitle(e.target.value)} style={{ width: LEAD_W - 8 }} />
   );
 });
@@ -118,7 +129,11 @@ export function DataGrid({ onPasted, maxHeight }: { onPasted: (r: PasteResult) =
   const nCols = useGraphStore((s) => s.doc?.col_titles.length ?? 0);
   const nRows = useGraphStore((s) => s.doc?.cells.length ?? 0);
   const store = useGraphStore;
+  /** Phase 3: another computer is editing — the inputs are readOnly, every change is refused and reported. */
+  const ro = useReadOnly();
   const boxRef = useRef<HTMLDivElement>(null);
+  /** When a refused keystroke was last reported (its beforeinput, if the browser sends one, is not reported again). */
+  const typedAt = useRef(Number.NEGATIVE_INFINITY);
   const [colMenu, setColMenu] = useState<MenuState>(null);
   const [rowMenu, setRowMenu] = useState<MenuState>(null);
   const openColMenu = useCallback((el: HTMLElement, index: number) => setColMenu({ el, index, confirm: false }), []);
@@ -153,7 +168,14 @@ export function DataGrid({ onPasted, maxHeight }: { onPasted: (r: PasteResult) =
     const r = Number(input.dataset.gr), fc = Number(input.dataset.gc);
     const mod = e.metaKey || e.ctrlKey;
     if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "z") {
-      if (store.getState().undo()) e.preventDefault();
+      // Read-only: the store refuses the undo and reports it; the input's own undo must not run either.
+      if (store.getState().undo() || store.getState().guard) e.preventDefault();
+      return;
+    }
+    if (!mod && store.getState().guard && !e.nativeEvent.isComposing
+      && (e.key.length === 1 || e.key === "Backspace" || e.key === "Delete")) {
+      typedAt.current = e.timeStamp;
+      reportBlocked("table", "type");
       return;
     }
     if (mod || e.altKey) return;
@@ -174,9 +196,29 @@ export function DataGrid({ onPasted, maxHeight }: { onPasted: (r: PasteResult) =
     if (moved) e.preventDefault();
   };
 
+  const isGridInput = (t: EventTarget) => (t as HTMLElement).tagName === "INPUT" && (t as HTMLElement).dataset.gr !== undefined;
+
+  /** Read-only: a change that the input would make by itself (paste, cut, drop, input methods) is prevented. */
+  const refuse = (e: { target: EventTarget; preventDefault(): void }, action: string | null) => {
+    if (!store.getState().guard || !isGridInput(e.target)) return false;
+    e.preventDefault();
+    if (action) reportBlocked("table", action);
+    return true;
+  };
+
+  const onCut = (e: ClipboardEvent<HTMLDivElement>) => {
+    if (!store.getState().guard || !isGridInput(e.target)) return;
+    // The copy half of a cut still works.
+    const el = e.target as HTMLInputElement;
+    const text = el.value.slice(el.selectionStart ?? 0, el.selectionEnd ?? 0);
+    if (text) e.clipboardData.setData("text/plain", text);
+    refuse(e, "cut");
+  };
+
   const onPaste = (e: ClipboardEvent<HTMLDivElement>) => {
     const el = e.target as HTMLElement;
     if (el.tagName !== "INPUT" || el.dataset.gr === undefined) return;
+    if (refuse(e, "paste")) return;
     const text = e.clipboardData.getData("text/plain");
     if (!isMultiPaste(text)) return; // a single value pastes normally
     e.preventDefault();
@@ -206,8 +248,15 @@ export function DataGrid({ onPasted, maxHeight }: { onPasted: (r: PasteResult) =
   return (
     <Box
       ref={boxRef}
+      data-readonly={ro ? "true" : "false"}
       onKeyDown={onKeyDown}
       onPaste={onPaste}
+      onCut={onCut}
+      onDrop={(e: DragEvent<HTMLDivElement>) => { refuse(e, "drop"); }}
+      onBeforeInput={(e: FormEvent<HTMLDivElement>) => {
+        // Text that arrives without a keystroke (an input method, dictation, autofill) is refused and reported too.
+        refuse(e, e.timeStamp - typedAt.current < 100 ? null : "type");
+      }}
       sx={{
         overflow: "auto",
         maxHeight,
@@ -228,6 +277,9 @@ export function DataGrid({ onPasted, maxHeight }: { onPasted: (r: PasteResult) =
           bgcolor: "transparent", color: "text.primary", font: "inherit", fontVariantNumeric: "tabular-nums",
         },
         "& input:focus": { borderColor: "primary.main", bgcolor: "#2a3442" },
+        // Read-only: the focused cell is still shown (copying works), in a neutral colour.
+        "& input[readonly]": { cursor: "default" },
+        "& input[readonly]:focus": { borderColor: "text.disabled", bgcolor: "action.hover" },
         "& input.invalid": { borderColor: "#ff453a", color: "#ff8a80" },
         "& input.title": { fontWeight: 600, textAlign: "left" },
         "& .rownum": {
@@ -259,11 +311,11 @@ export function DataGrid({ onPasted, maxHeight }: { onPasted: (r: PasteResult) =
 
       <Menu anchorEl={cm?.el} open={!!cm} onClose={() => setColMenu(null)}>
         {cm && !cm.confirm && [
-          <MenuItem key="l" dense disabled={nCols >= MAX_COLS} onClick={() => colAction(() => st.insertCol(cm.index))}>Insert column left</MenuItem>,
-          <MenuItem key="r" dense disabled={nCols >= MAX_COLS} onClick={() => colAction(() => st.insertCol(cm.index + 1))}>Insert column right</MenuItem>,
+          <MenuItem key="l" dense disabled={ro || nCols >= MAX_COLS} onClick={() => colAction(() => st.insertCol(cm.index))}>Insert column left</MenuItem>,
+          <MenuItem key="r" dense disabled={ro || nCols >= MAX_COLS} onClick={() => colAction(() => st.insertCol(cm.index + 1))}>Insert column right</MenuItem>,
           <Divider key="d" />,
-          <MenuItem key="c" dense disabled={!colHasData(doc(), cm.index)} onClick={() => colAction(() => st.clearCol(cm.index))}>Clear values</MenuItem>,
-          <MenuItem key="x" dense disabled={nCols <= 1} sx={{ color: "error.main" }}
+          <MenuItem key="c" dense disabled={ro || !colHasData(doc(), cm.index)} onClick={() => colAction(() => st.clearCol(cm.index))}>Clear values</MenuItem>,
+          <MenuItem key="x" dense disabled={ro || nCols <= 1} sx={{ color: "error.main" }}
             onClick={() => (colHasData(doc(), cm.index) ? setColMenu({ ...cm, confirm: true }) : colAction(() => st.deleteCol(cm.index)))}>
             Delete column
           </MenuItem>,
@@ -272,18 +324,18 @@ export function DataGrid({ onPasted, maxHeight }: { onPasted: (r: PasteResult) =
           <MenuItem key="q" dense disabled sx={{ "&.Mui-disabled": { opacity: 1 } }}>
             Delete “{doc().col_titles[cm.index] || `column ${cm.index + 1}`}” and its {countCol(cm.index)} values?
           </MenuItem>,
-          <MenuItem key="y" dense sx={{ color: "error.main" }} onClick={() => colAction(() => st.deleteCol(cm.index))}>Delete</MenuItem>,
+          <MenuItem key="y" dense disabled={ro} sx={{ color: "error.main" }} onClick={() => colAction(() => st.deleteCol(cm.index))}>Delete</MenuItem>,
           <MenuItem key="n" dense onClick={() => setColMenu(null)}>Cancel</MenuItem>,
         ]}
       </Menu>
 
       <Menu anchorEl={rm?.el} open={!!rm} onClose={() => setRowMenu(null)}>
         {rm && !rm.confirm && [
-          <MenuItem key="a" dense disabled={nRows >= MAX_ROWS} onClick={() => rowAction(() => st.insertRow(rm.index))}>Insert row above</MenuItem>,
-          <MenuItem key="b" dense disabled={nRows >= MAX_ROWS} onClick={() => rowAction(() => st.insertRow(rm.index + 1))}>Insert row below</MenuItem>,
+          <MenuItem key="a" dense disabled={ro || nRows >= MAX_ROWS} onClick={() => rowAction(() => st.insertRow(rm.index))}>Insert row above</MenuItem>,
+          <MenuItem key="b" dense disabled={ro || nRows >= MAX_ROWS} onClick={() => rowAction(() => st.insertRow(rm.index + 1))}>Insert row below</MenuItem>,
           <Divider key="d" />,
-          <MenuItem key="c" dense disabled={!rowHasData(doc(), rm.index)} onClick={() => rowAction(() => st.clearRow(rm.index))}>Clear row</MenuItem>,
-          <MenuItem key="x" dense sx={{ color: "error.main" }}
+          <MenuItem key="c" dense disabled={ro || !rowHasData(doc(), rm.index)} onClick={() => rowAction(() => st.clearRow(rm.index))}>Clear row</MenuItem>,
+          <MenuItem key="x" dense disabled={ro} sx={{ color: "error.main" }}
             onClick={() => (rowHasData(doc(), rm.index) ? setRowMenu({ ...rm, confirm: true }) : rowAction(() => st.deleteRow(rm.index)))}>
             Delete row
           </MenuItem>,
@@ -292,7 +344,7 @@ export function DataGrid({ onPasted, maxHeight }: { onPasted: (r: PasteResult) =
           <MenuItem key="q" dense disabled sx={{ "&.Mui-disabled": { opacity: 1 } }}>
             Delete row {rm.index + 1} and its {countRow(rm.index)} values?
           </MenuItem>,
-          <MenuItem key="y" dense sx={{ color: "error.main" }} onClick={() => rowAction(() => st.deleteRow(rm.index))}>Delete</MenuItem>,
+          <MenuItem key="y" dense disabled={ro} sx={{ color: "error.main" }} onClick={() => rowAction(() => st.deleteRow(rm.index))}>Delete</MenuItem>,
           <MenuItem key="n" dense onClick={() => setRowMenu(null)}>Cancel</MenuItem>,
         ]}
       </Menu>

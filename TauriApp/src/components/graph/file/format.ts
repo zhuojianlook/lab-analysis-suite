@@ -15,7 +15,7 @@ export const FORMAT_VERSION = 1;
 /** The newest format this build reads; a file whose min_reader_version is higher opens read-only. */
 export const READER_VERSION = 1;
 /** 1 = files; 2 = shows who is editing (beacons). */
-export const FEATURES = 1;
+export const FEATURES = 2;
 
 export type SectionName = "table" | "analysis" | "figure" | "scratchpad";
 export const SECTION_NAMES: readonly SectionName[] = ["table", "analysis", "figure", "scratchpad"];

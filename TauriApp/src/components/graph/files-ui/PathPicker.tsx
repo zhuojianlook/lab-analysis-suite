@@ -6,11 +6,11 @@ import FolderOutlinedIcon from "@mui/icons-material/FolderOutlined";
 import InsertDriveFileOutlinedIcon from "@mui/icons-material/InsertDriveFileOutlined";
 import CloudOffOutlinedIcon from "@mui/icons-material/CloudOffOutlined";
 import { useFileSession } from "../file/session";
-import type { DevSimApiP2, PathPickerRequest, SimFile } from "../file/contract";
+import type { DevSimApiP3, PathPickerRequest, SimFile } from "../file/contract";
 import { baseName } from "./text";
 
 /** The simulated disk of the browser preview (the simulator in dev builds; the same world, without the panel, otherwise). */
-export async function previewDisk(): Promise<DevSimApiP2> {
+export async function previewDisk(): Promise<DevSimApiP3> {
   const m = await import("../file/devSim");
   const sim = m.devSim();
   if (sim) return sim;
@@ -19,8 +19,8 @@ export async function previewDisk(): Promise<DevSimApiP2> {
 }
 
 /** Keeps a list of the simulated disk's folders and files, live. */
-export function useDisk(): { disk: DevSimApiP2 | null; folders: string[]; files: SimFile[] } {
-  const [disk, setDisk] = useState<DevSimApiP2 | null>(null);
+export function useDisk(): { disk: DevSimApiP3 | null; folders: string[]; files: SimFile[] } {
+  const [disk, setDisk] = useState<DevSimApiP3 | null>(null);
   const [, setTick] = useState(0);
   useEffect(() => {
     let off: (() => void) | null = null;
@@ -32,7 +32,8 @@ export function useDisk(): { disk: DevSimApiP2 | null; folders: string[]; files:
     });
     return () => { alive = false; off?.(); };
   }, []);
-  return { disk, folders: disk?.folders() ?? [], files: disk?.files() ?? [] };
+  // Note files (".laguse", and the sync services' copies of them) are never shown as files (phase 3 contract §1.6).
+  return { disk, folders: disk?.folders() ?? [], files: (disk?.files() ?? []).filter((f) => !/\.laguse$/i.test(f.name)) };
 }
 
 const HOME = "/Users/me";

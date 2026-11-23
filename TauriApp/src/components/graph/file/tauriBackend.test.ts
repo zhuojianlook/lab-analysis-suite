@@ -202,3 +202,85 @@ describe("tauriBackend mapping, phase 2", () => {
     expect(last(fk.calls)).toEqual({ cmd: "appstate_write_seen", args: { seen: { v: 1, analyses: {} } } });
   });
 });
+
+describe("tauriBackend mapping, phase 3 (S22)", () => {
+  const NOTE = {
+    format: "lasgraph-presence", v: 1, analysis_id: "a-1", document_name: "a.lag", device_id: "d-1", session_id: "s-1", device_name: "Mac",
+    user_name: "Zhuo", state: "editing", head: "r-1", base_revision: "r-1", epoch: 1, seq: 2, supersedes: null, updated_at: "2026-11-22T10:00:00.000Z",
+    request_to: null, handover_to: null, features: 2,
+  };
+  const REQ = { docPath: "/d/a.lag", analysisId: "a-1", state: "editing" as const, head: "r-1", baseRevision: "r-1", epoch: 1, supersedes: [{ device_id: "d-2", epoch: 3 }], input: true };
+
+  it("every command, its reply and its errors", async () => {
+    let setReplies: unknown[] = [{ kind: "written", file: "/d/a (in use on Mac, 0001).laguse", note: NOTE }, { kind: "off", reason: "debugRoot" }];
+    const fk = fake((cmd, args) => {
+      switch (cmd) {
+        case "presence_set": { const r = setReplies.shift(); if (!r) throw { kind: "PermissionDenied", message: "no", data: null }; return r; }
+        case "presence_clear": throw { kind: "Io", message: "gone", data: null };
+        case "presence_input": return null;
+        case "presence_list": if ((args.docPath as string).startsWith("/x")) throw { kind: "NotFound", message: "no folder", data: null }; return { notes: [], truncated: true };
+        case "presence_remove_foreign": return (args.req as { file: string }).file.endsWith("1.laguse") ? { kind: "removed" } : { kind: "kept", reason: "changed" };
+        case "graphfile_cloud_info": if (args.path === "/bad") throw { kind: "Invalid", message: "relative", data: null }; return { cloud: true, service: "Dropbox", root: "/Users/me/Dropbox" };
+        case "appstate_new_device_id": return { device_id: "d-new", device_name: "Mac", user_name: "Zhuo", session_id: "s-new" };
+      }
+      return null;
+    });
+    const be = createTauriBackend(fk);
+    expect(await be.presenceSet(REQ)).toEqual({ ok: true, kind: "written", file: "/d/a (in use on Mac, 0001).laguse", note: NOTE });
+    expect(fk.calls[0]).toEqual({ cmd: "presence_set", args: { req: REQ } });
+    expect(await be.presenceSet(REQ)).toEqual({ ok: true, kind: "off", reason: "debugRoot" });
+    expect(await be.presenceSet(REQ)).toEqual({ ok: false, code: "PermissionDenied", message: "no" });
+    await expect(be.presenceClear("/d/a.lag")).resolves.toBeUndefined();     // errors swallowed
+    be.presenceInput("/d/a.lag");
+    await Promise.resolve();
+    expect(fk.calls.some((c) => c.cmd === "presence_input" && c.args.docPath === "/d/a.lag")).toBe(true);
+    expect(await be.presenceList("/d/a.lag", "a-1")).toEqual({ ok: true, notes: [], truncated: true });
+    expect(await be.presenceList("/x/a.lag", "a-1")).toEqual({ ok: false, code: "NotFound", message: "no folder" });
+    expect(await be.presenceRemoveForeign({ file: "/d/n1.laguse", sha: "s" })).toBe(true);
+    expect(await be.presenceRemoveForeign({ file: "/d/n2.laguse", sha: "s" })).toBe(false);
+    expect(await be.cloudInfo("/Users/me/Dropbox/a.lag")).toEqual({ cloud: true, service: "Dropbox", root: "/Users/me/Dropbox" });
+    expect(await be.cloudInfo("/bad")).toEqual({ cloud: false, service: null, root: null });
+    expect(await be.newDeviceId()).toMatchObject({ device_id: "d-new", session_id: "s-new" });
+    setReplies = [];
+  });
+
+  it("calls for one document run one at a time, in order; another document is not held up", async () => {
+    const order: string[] = [];
+    const gates = new Map<string, () => void>();
+    const fk = fake((cmd, args) => {
+      const doc = cmd === "presence_set" ? (args.req as { docPath: string }).docPath : (args.docPath as string);
+      const tag = `${cmd}:${doc}:${cmd === "presence_set" ? (args.req as { state: string }).state : ""}`;
+      order.push(`start ${tag}`);
+      return new Promise((resolve) => gates.set(tag, () => { order.push(`end ${tag}`); resolve(cmd === "presence_set" ? { kind: "off", reason: "closing" } : null); }));
+    });
+    const be = createTauriBackend(fk);
+    const p1 = be.presenceSet({ ...REQ, state: "idle" });
+    const p2 = be.presenceSet({ ...REQ, state: "editing" });
+    const p3 = be.presenceClear("/d/a.lag");
+    const q = be.presenceSet({ ...REQ, docPath: "/d/b.lag", state: "idle" });
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(order).toEqual(["start presence_set:/d/a.lag:idle", "start presence_set:/d/b.lag:idle"]);
+    gates.get("presence_set:/d/a.lag:idle")!();
+    await p1;
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(last(order)).toBe("start presence_set:/d/a.lag:editing");
+    gates.get("presence_set:/d/a.lag:editing")!();
+    await p2;
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(last(order)).toBe("start presence_clear:/d/a.lag:");
+    gates.get("presence_clear:/d/a.lag:")!();
+    gates.get("presence_set:/d/b.lag:idle")!();
+    await Promise.all([p3, q]);
+  });
+
+  it("the presence and wake events pass through subscribe", async () => {
+    const fk = fake(() => null);
+    const be = createTauriBackend(fk);
+    const got: FileEvent[] = [];
+    be.subscribe((e) => got.push(e));
+    await Promise.resolve();
+    fk.emit("graphfile://event", { type: "presence", path: "/d/a.lag", notes: [] });
+    fk.emit("graphfile://event", { type: "wake", gapMs: 120000 });
+    expect(got).toEqual([{ type: "presence", path: "/d/a.lag", notes: [] }, { type: "wake", gapMs: 120000 }]);
+  });
+});

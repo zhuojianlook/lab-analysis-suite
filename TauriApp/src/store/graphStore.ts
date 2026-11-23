@@ -2,6 +2,7 @@ import { create, type StoreApi, type UseBoundStore } from "zustand";
 import type { GraphAnalysis, GraphDoc, GraphFigure, Template } from "../api/graph";
 import * as M from "../components/graph/graphModel";
 import { sanitizeScratch, type ScratchDoc } from "../components/graph/scratchpad/scratchModel";
+import type { BlockedEdit, EditGuard, EditPath, StoreGuardApi } from "../components/graph/file/contract";
 
 /** What one undo step restores: the table, plus — for structural steps that
  *  move columns/rows around — everything indexed by column/row. */
@@ -48,7 +49,7 @@ export interface DocContent {
   scratch: string;
 }
 
-export interface GraphState {
+export interface GraphState extends StoreGuardApi {
   /** The open document; null = start screen. */
   doc: GraphDoc | null;
   analysis: GraphAnalysis;
@@ -235,18 +236,64 @@ export function openContent(p: { doc: GraphDoc; analysis?: Partial<GraphAnalysis
 
 const CONTENT_KEYS = ["doc", "analysis", "figure", "scratch"] as const;
 
+/** The next refused change (phase 3 contract §4.1). */
+const nextBlocked = (s: Pick<GraphState, "blocked">, path: EditPath, action: string): BlockedEdit =>
+  ({ serial: (s.blocked?.serial ?? 0) + 1, path, action });
+
+/** Same keys with identical values: a settings change that changes nothing is not a change. */
+function sameFields<T extends object>(a: T, b: T): boolean {
+  if (a === b) return true;
+  const ka = Object.keys(a), kb = Object.keys(b);
+  return ka.length === kb.length && ka.every((k) => Object.is((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
+
+/** Reset by every action that opens or closes a document: the controller sets the new tab's guard. */
+const NO_GUARD = { guard: null, blocked: null } as const;
+
 export type GraphStoreApi = UseBoundStore<StoreApi<GraphState>>;
 
 /** A graph store (the app has one, `useGraphStore`; tests make one per simulated computer). */
 export function createGraphStore(): GraphStoreApi {
   return create<GraphState>((rawSet, get) => {
-    /** Every update that changes the content bumps editSerial. */
-    const set: typeof rawSet = ((partial: unknown, replace?: boolean) => rawSet((s: GraphState) => {
-      const p = (typeof partial === "function" ? (partial as (s: GraphState) => Partial<GraphState>)(s) : partial) as Partial<GraphState> | null;
-      if (!p) return {};
-      const changed = CONTENT_KEYS.some((k) => k in p && p[k] !== s[k]);
-      return changed && !("editSerial" in p) ? { ...p, editSerial: s.editSerial + 1 } : p;
-    }, replace as false | undefined)) as typeof rawSet;
+    /** Depth of the user action running now (phase 3: its changes bump userEditSerial). */
+    let userDepth = 0;
+    /** An update is being applied: updates made meanwhile (by store listeners) are never the person's. */
+    let applying = false;
+
+    /** Every update that changes the content bumps editSerial; the update a user action makes also bumps
+     *  userEditSerial when it changes the content or the name (the controller's "the person changed something"). */
+    const set: typeof rawSet = ((partial: unknown, replace?: boolean) => {
+      const byUser = userDepth > 0 && !applying;
+      const was = applying;
+      applying = true;
+      try {
+        rawSet((s: GraphState) => {
+          const p = (typeof partial === "function" ? (partial as (s: GraphState) => Partial<GraphState>)(s) : partial) as Partial<GraphState> | null;
+          if (!p) return {};
+          const changed = CONTENT_KEYS.some((k) => k in p && p[k] !== s[k]);
+          const out = changed && !("editSerial" in p) ? { ...p, editSerial: s.editSerial + 1 } : p;
+          return byUser && (changed || ("name" in p && p.name !== s.name)) ? { ...out, userEditSerial: s.userEditSerial + 1 } : out;
+        }, replace as false | undefined);
+      } finally {
+        applying = was;
+      }
+    }) as typeof rawSet;
+
+    /** A change made by the person (phase 3 contract §4.1). While a guard is set it changes nothing, records
+     *  the refusal in `blocked` (editSerial, the undo stack and lastEditKey untouched) and returns `nothing`.
+     *  `noop`: arguments that would change nothing anyway are neither applied nor reported. */
+    const user = <A extends unknown[], R>(
+      path: EditPath, action: string, nothing: R, fn: (...a: A) => R, noop?: (s: GraphState, ...a: A) => boolean,
+    ) => (...a: A): R => {
+      const s = get();
+      if (s.guard) {
+        if (!noop?.(s, ...a)) rawSet((st) => ({ blocked: nextBlocked(st, path, action) }));
+        return nothing;
+      }
+      userDepth++;
+      try { return fn(...a); } finally { userDepth--; }
+    };
+    const tableEdit = <A extends unknown[], R>(action: string, nothing: R, fn: (...a: A) => R) => user("table", action, nothing, fn);
 
     /** Apply a change to the open document, recording an undo step. */
     const edit = (fn: (s: GraphState) => Partial<GraphState> | null) =>
@@ -285,6 +332,9 @@ export function createGraphStore(): GraphStoreApi {
       savedScratch: null,
       file: null,
       editSerial: 0,
+      guard: null,
+      userEditSerial: 0,
+      blocked: null,
 
       newDoc: (t, sample) => {
         const doc = sample ? M.sampleDoc(t) : M.emptyDoc(t);
@@ -293,7 +343,7 @@ export function createGraphStore(): GraphStoreApi {
         // A fresh document only counts as changed once it is edited.
         set((s) => ({
           ...next, savedName: "", currentId: null, savedSnapshot: snapshotKey(next), undoStack: [], lastEditKey: null,
-          docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new", scratch: "", savedScratch: "", file: null,
+          docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new", scratch: "", savedScratch: "", file: null, ...NO_GUARD,
         }));
       },
 
@@ -306,16 +356,16 @@ export function createGraphStore(): GraphStoreApi {
         set((s) => ({
           ...next, savedName: saved ? name : null, currentId: id, savedSnapshot: saved ? snapshotKey(next) : null,
           undoStack: [], lastEditKey: null,
-          docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft", scratch: sc, savedScratch: saved ? sc : null, file: null,
+          docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft", scratch: sc, savedScratch: saved ? sc : null, file: null, ...NO_GUARD,
         }));
       },
 
       close: () => set((s) => ({
         doc: null, name: "", savedName: null, currentId: null, savedSnapshot: null, undoStack: [], lastEditKey: null, docSerial: s.docSerial + 1,
-        scratch: "", savedScratch: null, file: null,
+        scratch: "", savedScratch: null, file: null, ...NO_GUARD,
       })),
 
-      setName: (name) => set({ name }),
+      setName: user("name", "setName", undefined, (name: string) => set({ name })),
 
       markSaved: (id, name, sent) => set({
         name, savedName: name, currentId: id, savedSnapshot: snapshotKey(sent), savedScratch: sent.scratch,
@@ -327,15 +377,18 @@ export function createGraphStore(): GraphStoreApi {
       // The open document's library record was deleted: keep it on screen, unsaved.
       detach: () => set({ currentId: null, savedSnapshot: null, savedScratch: null, savedName: null }),
 
-      setScratch: (text) => set((s) => (s.scratch === text ? {} : { scratch: text })),
+      setScratch: user("scratchpad", "setScratch", undefined,
+        (text: string) => set((s) => (s.scratch === text ? {} : { scratch: text })),
+        (s, text) => s.scratch === text),
 
+      // Neither a user action nor a load: under a guard it does nothing (and reports nothing).
       normalize: () => set((s) => {
-        if (!s.doc) return {};
+        if (!s.doc || s.guard) return {};
         const n = M.normalizeSettings(s.doc, s.analysis, s.figure);
         return n.analysis === s.analysis && n.figure === s.figure ? {} : n;
       }),
 
-      setCell: (r, c, k, v) =>
+      setCell: tableEdit("setCell", undefined, (r: number, c: number, k: number, v: string) =>
         type(`c:${r}:${c}:${k}`, (doc) => {
           const cells = [...doc.cells];
           const row = [...cells[r]];
@@ -344,49 +397,49 @@ export function createGraphStore(): GraphStoreApi {
           row[c] = reps;
           cells[r] = row;
           return M.ensureRows({ ...doc, cells });
-        }),
+        })),
 
-      setX: (r, v) =>
+      setX: tableEdit("setX", undefined, (r: number, v: string) =>
         type(`x:${r}`, (doc) => {
           const x = [...doc.x];
           x[r] = v;
           return M.ensureRows({ ...doc, x });
-        }),
+        })),
 
-      setRowTitle: (r, v) =>
+      setRowTitle: tableEdit("setRowTitle", undefined, (r: number, v: string) =>
         type(`rt:${r}`, (doc) => {
           const row_titles = [...doc.row_titles];
           row_titles[r] = v;
           return M.ensureRows({ ...doc, row_titles });
-        }),
+        })),
 
-      setColTitle: (c, v) =>
+      setColTitle: tableEdit("setColTitle", undefined, (c: number, v: string) =>
         type(`ct:${c}`, (doc) => {
           const col_titles = [...doc.col_titles];
           col_titles[c] = v;
           return { ...doc, col_titles };
-        }),
+        })),
 
       // The X axis label follows the X column title until it is edited separately.
-      setXTitle: (v) =>
+      setXTitle: tableEdit("setXTitle", undefined, (v: string) =>
         type("xt", (doc) => ({ ...doc, x_title: v }), (s) => {
           const figure = M.followXLabel(s.figure, s.doc!.x_title, v);
           return figure === s.figure ? {} : { figure };
-        }),
+        })),
 
-      setNRep: (n) => edit((s) => {
+      setNRep: tableEdit("setNRep", undefined, (n: number) => edit((s) => {
         const doc = M.setNRep(s.doc!, n);
         return doc === s.doc ? null : { doc };
-      }),
+      })),
 
-      insertCol: (at) => edit((s) => {
+      insertCol: tableEdit("insertCol", undefined, (at: number) => edit((s) => {
         const doc = M.insertCol(s.doc!, at);
         if (doc === s.doc) return null;
         const op: M.IndexOp = { type: "insert", at };
         return { doc, analysis: M.remapAnalysis(s.analysis, doc.template, "col", op), figure: M.remapFigure(s.figure, op) };
-      }),
+      })),
 
-      deleteCol: (c) => edit((s) => {
+      deleteCol: tableEdit("deleteCol", undefined, (c: number) => edit((s) => {
         if (s.doc!.col_titles.length <= 1) return { doc: M.clearCol(s.doc!, c) };
         const op: M.IndexOp = { type: "delete", at: c };
         return {
@@ -394,24 +447,24 @@ export function createGraphStore(): GraphStoreApi {
           analysis: M.remapAnalysis(s.analysis, s.doc!.template, "col", op),
           figure: M.remapFigure(s.figure, op),
         };
-      }),
+      })),
 
-      clearCol: (c) => edit((s) => ({ doc: M.clearCol(s.doc!, c) })),
+      clearCol: tableEdit("clearCol", undefined, (c: number) => edit((s) => ({ doc: M.clearCol(s.doc!, c) }))),
 
-      insertRow: (at) => edit((s) => {
+      insertRow: tableEdit("insertRow", undefined, (at: number) => edit((s) => {
         const doc = M.insertRow(s.doc!, at);
         if (doc === s.doc) return null;
         return { doc, analysis: M.remapAnalysis(s.analysis, doc.template, "row", { type: "insert", at }) };
-      }),
-
-      deleteRow: (r) => edit((s) => ({
-        doc: M.deleteRow(s.doc!, r),
-        analysis: M.remapAnalysis(s.analysis, s.doc!.template, "row", { type: "delete", at: r }),
       })),
 
-      clearRow: (r) => edit((s) => ({ doc: M.clearRow(s.doc!, r) })),
+      deleteRow: tableEdit("deleteRow", undefined, (r: number) => edit((s) => ({
+        doc: M.deleteRow(s.doc!, r),
+        analysis: M.remapAnalysis(s.analysis, s.doc!.template, "row", { type: "delete", at: r }),
+      }))),
 
-      paste: (anchor, text) => {
+      clearRow: tableEdit("clearRow", undefined, (r: number) => edit((s) => ({ doc: M.clearRow(s.doc!, r) }))),
+
+      paste: tableEdit("paste", null, (anchor: M.PasteAnchor, text: string): M.PasteResult | null => {
         const s = get();
         if (!s.doc) return null;
         const res = M.applyPaste(s.doc, anchor, text);
@@ -420,9 +473,9 @@ export function createGraphStore(): GraphStoreApi {
         const figure = M.followXLabel(M.resizeSeries(s.figure, res.doc.col_titles.length), s.doc.x_title, res.doc.x_title);
         set({ doc: res.doc, figure, undoStack: pushUndo(s, true), lastEditKey: null });
         return res;
-      },
+      }),
 
-      sendBlock: (anchor, text, clearFirst) => {
+      sendBlock: tableEdit("sendBlock", null, (anchor: M.PasteAnchor, text: string, clearFirst: boolean): M.PasteResult | null => {
         const s = get();
         if (!s.doc) return null;
         const res = M.applyPaste(clearFirst ? M.clearValues(s.doc) : s.doc, anchor, text);
@@ -430,9 +483,9 @@ export function createGraphStore(): GraphStoreApi {
         const figure = M.followXLabel(M.resizeSeries(s.figure, res.doc.col_titles.length), s.doc.x_title, res.doc.x_title);
         set({ doc: res.doc, figure, undoStack: pushUndo(s, true), lastEditKey: null });
         return res;
-      },
+      }),
 
-      undo: () => {
+      undo: user("undo", "undo", false, (): boolean => {
         const s = get();
         const prev = s.undoStack[s.undoStack.length - 1];
         if (!prev || !s.doc) return false;
@@ -455,14 +508,17 @@ export function createGraphStore(): GraphStoreApi {
           lastEditKey: null,
         });
         return true;
-      },
-
-      setAnalysis: (patch) => set((s) => {
-        const analysis = typeof patch === "function" ? patch(s.analysis) : { ...s.analysis, ...patch };
-        return analysis === s.analysis ? {} : { analysis };
       }),
 
-      setFigure: (patch) => set((s) => ({ figure: typeof patch === "function" ? patch(s.figure) : { ...s.figure, ...patch } })),
+      setAnalysis: user("analysis", "setAnalysis", undefined, (patch: Partial<GraphAnalysis> | ((a: GraphAnalysis) => GraphAnalysis)) => set((s) => {
+        const analysis = typeof patch === "function" ? patch(s.analysis) : { ...s.analysis, ...patch };
+        return sameFields(analysis, s.analysis) ? {} : { analysis };
+      })),
+
+      setFigure: user("figure", "setFigure", undefined, (patch: Partial<GraphFigure> | ((f: GraphFigure) => GraphFigure)) => set((s) => {
+        const figure = typeof patch === "function" ? patch(s.figure) : { ...s.figure, ...patch };
+        return sameFields(figure, s.figure) ? {} : { figure };
+      })),
 
       loadFile: ({ file, name, doc, analysis, figure, scratch, saved, inPlace }) => {
         const c = openContent({ doc, analysis, figure, scratch });
@@ -470,7 +526,7 @@ export function createGraphStore(): GraphStoreApi {
           ...c, name, savedName: name, currentId: null, file: { ...file },
           savedSnapshot: saved ? snapshotKey(c) : null, savedScratch: saved ? c.scratch : null,
           undoStack: [], lastEditKey: null,
-          docSerial: inPlace ? s.docSerial : s.docSerial + 1, openedAs: saved ? "saved" : "draft",
+          docSerial: inPlace ? s.docSerial : s.docSerial + 1, openedAs: saved ? "saved" : "draft", ...NO_GUARD,
         }));
       },
 
@@ -514,6 +570,15 @@ export function createGraphStore(): GraphStoreApi {
         });
         return true;
       },
+
+      // ── phase 3: read-only guard ──
+      setGuard: (g: EditGuard | null) => {
+        const cur = get().guard;
+        if ((cur?.reason ?? null) === (g?.reason ?? null)) return;
+        rawSet({ guard: g ? { reason: g.reason } : null });
+      },
+
+      noteBlockedEdit: (path: EditPath, action: string) => rawSet((s) => ({ blocked: nextBlocked(s, path, action) })),
 
       undoLabel: () => {
         const st = get().undoStack;

@@ -3,15 +3,19 @@ import { Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, FormCon
 import { useFileSession } from "../file/session";
 import type { SessionDialog } from "../file/contract";
 import { T } from "./text";
+import { isReadOnlyTab } from "./DocBar";
 
 type D = Extract<SessionDialog, { kind: "saveAsKind" }>;
 
 /** Save As: "a new analysis, or the same analysis in a new place?" (decision D7). */
 export function SaveAsKindDialog({ d }: { d: D }) {
-  const [choice, setChoice] = useState<"new" | "same">(d.preselect);
+  // Read-only (another computer is editing): "the same analysis" would write into it, so it is not offered (fixer F5).
+  const readOnly = useFileSession((s) => { const t = s.tabs.find((x) => x.key === s.activeKey); return !!t && isReadOnlyTab(t); });
+  const [picked, setChoice] = useState<"new" | "same">(d.preselect);
+  const choice = readOnly ? "new" : picked;
   const answer = (c: "new" | "same" | "cancel") => useFileSession.getState().answerDialog({ kind: "saveAsKind", choice: c });
-  const option = (value: "new" | "same", title: string, sub: string) => (
-    <FormControlLabel value={value} data-testid={`saveas-${value}`} sx={{ alignItems: "flex-start", mt: 1, mr: 0 }}
+  const option = (value: "new" | "same", title: string, sub: string, disabled = false) => (
+    <FormControlLabel value={value} data-testid={`saveas-${value}`} sx={{ alignItems: "flex-start", mt: 1, mr: 0 }} disabled={disabled}
       control={<Radio size="small" sx={{ mt: -0.5 }} />}
       label={
         <Box>
@@ -28,7 +32,7 @@ export function SaveAsKindDialog({ d }: { d: D }) {
         <Typography variant="body2" sx={{ mt: 1.5 }}>{T.saveAsQuestion}</Typography>
         <RadioGroup value={choice} onChange={(e) => setChoice(e.target.value as "new" | "same")} sx={{ mt: 0.5 }}>
           {option("new", T.saveAsNew, T.saveAsNewSub)}
-          {option("same", T.saveAsSame, T.saveAsSameSub)}
+          {option("same", T.saveAsSame, readOnly ? T.saveAsSameReadOnly : T.saveAsSameSub, readOnly)}
         </RadioGroup>
       </DialogContent>
       <DialogActions>

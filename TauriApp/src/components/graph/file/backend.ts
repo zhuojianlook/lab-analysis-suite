@@ -4,9 +4,9 @@
    tests, including simulated other computers. Not wired to the UI yet. */
 
 import type { FileHeader, GraphFileData, Manifest } from "./format";
-import type { FileEventP1, FileBackendP1, FileBackendP2 } from "./contract";
+import type { FileEventP3, FileBackendP1, FileBackendP2, FileBackendP3, ShareMode } from "./contract";
 
-export type { FileBackendP1, FileBackendP2 };
+export type { FileBackendP1, FileBackendP2, FileBackendP3 };
 
 /** Typed errors (plan §4.1). */
 export type FileErrorCode =
@@ -142,6 +142,8 @@ export interface GraphSession {
   /** Phase 2 (fixer): what this computer decided about a file, kept after its tab is closed (path → record),
    *  so a closed and reopened tab does not ask again about a version already handled. */
   files?: Record<string, FileMemo>;
+  /** Phase 3: "Show others when I'm editing" for files without a choice of their own. Absent = "auto". */
+  share_default?: ShareMode;
 }
 
 /** Phase 2: per file (by path) — the heads of this computer's saved copies that were handled (combined, kept as
@@ -152,6 +154,11 @@ export interface FileMemo {
   settled_heads?: string[];
   accepted_head?: string | null;
   carry_heads?: string[];
+  /** Phase 3: this file's own "Show others when I'm editing" choice (absent = it follows the default). */
+  share?: ShareMode;
+  /** Phase 3: the highest epoch this computer's note used for the file, so a later claim never repeats one
+   *  another computer may have overridden ("Edit here"). */
+  note_epoch?: number;
 }
 
 /** Unsaved work of one document (drafts/<doc_key>.json). */
@@ -223,7 +230,7 @@ export interface ExportMap {
 export const emptyExportMap = (): ExportMap => ({ v: 1, rows: {} });
 
 /** Change notifications for tracked files (plan §5.1; phase 1: contract §2.1). */
-export type FileEvent = FileEventP1;
+export type FileEvent = FileEventP3;
 
 export interface FileBackend {
   device(): Promise<DeviceIdentity>;

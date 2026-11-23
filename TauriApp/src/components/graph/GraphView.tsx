@@ -30,6 +30,7 @@ import { GraphFigureControls, TitleFields } from "./GraphFigureControls";
 import { FigureTextPanel, readTextPanelOpen, writeTextPanelOpen } from "./FigureTextPanel";
 import { GraphResults } from "./GraphResults";
 import { flushScratch, scratchController, useScratchUi } from "./scratchpad/scratchBridge";
+import { BlockedClick, RailGuard, useReadOnly } from "./RailGuard";
 import {
   MAX_COLS, MAX_REP, MAX_ROWS, POSTHOC_LABELS, TEST_LABELS, colHasData, countInvalid, defaultColTitle,
   effectiveAnalysis, effectiveFigure, formatP, hasNumbers, hasPosthoc, templateInfo, toNumericTable, usedCols,
@@ -146,7 +147,9 @@ function ScratchCaption() {
 function ScratchRail() {
   const ready = useScratchUi((s) => s.ready);
   const cells = useScratchUi((s) => s.cells);
+  const readOnly = useReadOnly();
   const [confirmClear, setConfirmClear] = useState(false);
+  useEffect(() => { if (readOnly) setConfirmClear(false); }, [readOnly]);
   const run = (fn: (c: NonNullable<ReturnType<typeof scratchController>>) => void) => { const c = scratchController(); if (c) fn(c); };
   return (
     <RailSection step={0} icon={<CalculateOutlinedIcon sx={{ fontSize: 20 }} />} title="Scratchpad"
@@ -157,11 +160,15 @@ function ScratchRail() {
         (=SUM(A1:A5), $A$1, IF, VLOOKUP, T.TEST …). It is saved with this analysis and never affects the statistics or the graph.
       </Typography>
       <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mt: 1.5 }}>
-        <Button size="small" variant="contained" disabled={!ready} onClick={() => run((c) => c.openSend())}>Send selection to Data…</Button>
+        <BlockedClick on={readOnly} path="scratchpad" action="sendToData">
+          <Button size="small" variant="contained" disabled={!ready || readOnly} onClick={() => run((c) => c.openSend())}>Send selection to Data…</Button>
+        </BlockedClick>
         <Button size="small" variant="outlined" disabled={!ready} onClick={() => run((c) => c.copy())}>Copy values</Button>
-        <Button size="small" color="error" disabled={!ready || cells === 0} onClick={() => setConfirmClear(true)}>Clear scratchpad…</Button>
+        <BlockedClick on={readOnly} path="scratchpad" action="clearAll">
+          <Button size="small" color="error" disabled={!ready || cells === 0 || readOnly} onClick={() => setConfirmClear(true)}>Clear scratchpad…</Button>
+        </BlockedClick>
       </Stack>
-      {confirmClear && (
+      {confirmClear && !readOnly && (
         <Alert severity="warning" sx={{ mt: 1 }}
           action={
             <Stack direction="row" spacing={0.5}>
@@ -182,7 +189,7 @@ function ScratchRail() {
       <Typography variant="caption" color="text.secondary" component="div">
         One sheet; US number and date formats (1,234.5 and m/d/yyyy). Fractions typed as 1 1/2 are shown as 1.5, and =TIME()
         results as a decimal unless a time format is chosen. The intersection ( ) and union ((A1:A2,B1:B2)) operators, @,
-        AGGREGATE and GROWTH aren't available; a formula Excel would refuse (or shows as #ERROR!) is refused. COUNT and
+        AGGREGATE isn't available; a formula Excel would refuse (or shows as #ERROR!) is refused. COUNT and
         ISNUMBER don't look inside array expressions, so COUNT over one is refused. Circular references show #CIRC!.
         Formulas over 500 operators or 64 levels deep are refused. Cutting a cell onto one that a formula refers to keeps
         that formula (Excel turns it into #REF!). Formula results that change by themselves (TODAY, RAND) are recalculated
@@ -206,6 +213,10 @@ function GraphEditor() {
   const setAnalysis = useGraphStore((s) => s.setAnalysis);
   const setFigure = useGraphStore((s) => s.setFigure);
   const store = useGraphStore;
+  /** Phase 3: read-only while another computer is editing (or a newer version is on its way). The store
+   *  refuses every change; here the controls look unavailable and a click on them is reported. */
+  const guard = useGraphStore((s) => s.guard);
+  const readOnly = !!guard;
 
   const name = useGraphStore((s) => s.name);
   /** Newer content of the file waits until the cell editor / drag / menu / export is done (phase 2 §5.7). */
@@ -233,6 +244,13 @@ function GraphEditor() {
   const anSeq = useRef(0);
   const plotSeq = useRef(0);
   const plotKeyRendered = useRef<string | null>(null);
+
+  // A confirmation that is open when the analysis becomes read-only closes (its action would be refused).
+  useEffect(() => {
+    if (!readOnly) return;
+    setRepConfirm(null);
+    setColConfirm(false);
+  }, [readOnly]);
 
   // ── per-document view state ───────────────────────────────────────────────
   useEffect(() => {
@@ -385,6 +403,7 @@ function GraphEditor() {
 
   const tableSection = (
     <RailSection step={1} title="Table" summary={tableSummary} done={hasData} expanded={open.table} onToggle={toggle("table")}>
+      <RailGuard on={readOnly} path="table">
       <Typography variant="body2" color="text.secondary">{info.blurb}</Typography>
 
       {template !== "column" && (
@@ -396,7 +415,7 @@ function GraphEditor() {
               {template === "grouped" ? "Replicate values per row and group." : "Replicate Y values per X."}
             </Typography>
           </Stack>
-          {repConfirm && (
+          {repConfirm && !readOnly && (
             <Alert severity="warning" sx={{ mt: 1 }}
               action={
                 <Stack direction="row" spacing={0.5}>
@@ -424,7 +443,7 @@ function GraphEditor() {
           Row
         </Button>
       </Stack>
-      {colConfirm && (
+      {colConfirm && !readOnly && (
         <Alert severity="warning" sx={{ mt: 1 }}
           action={
             <Stack direction="row" spacing={0.5}>
@@ -444,6 +463,7 @@ function GraphEditor() {
           {invalid} cell{invalid === 1 ? " is" : "s are"} not {invalid === 1 ? "a number" : "numbers"} and {invalid === 1 ? "was" : "were"} ignored.
         </Typography>
       )}
+      </RailGuard>
     </RailSection>
   );
 
@@ -457,8 +477,10 @@ function GraphEditor() {
 
   const analysisSection = (
     <RailSection step={2} title="Analysis" summary={resultSummary} done={!!result?.test || !!result?.regression?.length} expanded={open.analysis} onToggle={toggle("analysis")}>
-      <GraphAnalysisControls template={template} analysis={analysis} setAnalysis={setAnalysis}
-        entities={entities} nGroups={nGroups} nRows={nRows} result={result} />
+      <RailGuard on={readOnly} path="analysis">
+        <GraphAnalysisControls template={template} analysis={analysis} setAnalysis={setAnalysis}
+          entities={entities} nGroups={nGroups} nRows={nRows} result={result} />
+      </RailGuard>
       {analyzing && <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 1 }}>Updating statistics…</Typography>}
       {anError && <Alert severity="error" sx={{ mt: 1.5 }}>{anError}</Alert>}
     </RailSection>
@@ -470,9 +492,11 @@ function GraphEditor() {
     <RailSection step={3} title="Graph" done={!!plot?.success}
       summary={`${info.graphs.find((g) => g.id === figure.graph_type)?.label ?? figure.graph_type} · ${figure.theme}${ylabelText ? ` · Y: “${ylabelText}”` : ""}`}
       expanded={open.graph} onToggle={toggle("graph")}>
-      <GraphFigureControls template={template} figure={figure} setFigure={setFigure} seriesTitles={colNames} nRep={doc.n_rep}
-        hasComparisons={result ? (result.comparisons?.length ?? 0) > 0
-          : effAnalysis.test !== "none" && (hasPosthoc(effAnalysis.test) ? effAnalysis.posthoc !== "none" : template === "column")} />
+      <RailGuard on={readOnly} path="figure">
+        <GraphFigureControls template={template} figure={figure} setFigure={setFigure} seriesTitles={colNames} nRep={doc.n_rep}
+          hasComparisons={result ? (result.comparisons?.length ?? 0) > 0
+            : effAnalysis.test !== "none" && (hasPosthoc(effAnalysis.test) ? effAnalysis.posthoc !== "none" : template === "column")} />
+      </RailGuard>
     </RailSection>
   );
 
@@ -555,12 +579,14 @@ function GraphEditor() {
         error={resultFresh ? anError : null} renderFailed={!plot.success} side={side} panelWidth={panelWidth} open={textOpen}
         onToggle={(o) => { setTextOpen(o); writeTextPanelOpen(o); }}
         figLabel={typeof figure.fig_label === "string" ? figure.fig_label : "Fig. 1"}
-        unit={typeof figure.n_unit === "string" ? figure.n_unit : ""} onLegendFields={(patch) => setFigure(patch)} />
+        unit={typeof figure.n_unit === "string" ? figure.n_unit : ""} onLegendFields={(patch) => setFigure(patch)} readOnly={readOnly} />
     );
     return (
       <Box ref={canvasRef} sx={{ display: "flex", flexDirection: side ? "row" : "column", gap: 2, alignItems: side ? "flex-start" : "stretch", minHeight: 0 }}>
         <Stack spacing={1.5} sx={{ minHeight: 0, minWidth: 0, flex: side ? "1 1 0" : "0 0 auto" }}>
-          <TitleFields dense figure={figure} setFigure={setFigure} template={template} />
+          <RailGuard on={readOnly} path="figure">
+            <TitleFields dense figure={figure} setFigure={setFigure} template={template} />
+          </RailGuard>
           {plotWarnings.length > 0 && <Alert severity="warning">{plotWarnings.map((w) => <div key={w}>{w}</div>)}</Alert>}
           {plotStale && !liveUpdate && (
             <Alert severity="info" action={<Button color="inherit" size="small" onClick={() => void renderPlot()}>Re-render</Button>}>
@@ -605,6 +631,7 @@ function GraphEditor() {
   const tabSx = { minHeight: 44 };
 
   return (
+    <Box data-testid="graph-editor" data-readonly={readOnly ? "true" : "false"} data-guard={guard?.reason ?? ""} sx={{ height: "100%" }}>
     <Workspace rail={<>{canvasTab === "scratch" && <ScratchRail />}{tableSection}{analysisSection}{graphSection}</>} railFooter={railFooter} onKeyDown={onKeyDown}>
       <Box sx={{ display: "flex", alignItems: "center", px: 2, borderBottom: 1, borderColor: "divider", flexShrink: 0, minHeight: 44 }}>
         <Tabs value={canvasTab} onChange={(_, v) => setCanvasTab(v)} variant="scrollable" scrollButtons={false} sx={{ ...tabSx, flexShrink: 0 }}>
@@ -617,12 +644,14 @@ function GraphEditor() {
         {undoLabel && (
           // The canvas tabs keep their width; this button gives way (down to its icon) when there is no room.
           <Tooltip title={`${undoTooltip(undoLabel)} (${MOD_KEY} + Z)`}>
-            <Button size="small" color="inherit" startIcon={<UndoIcon sx={{ fontSize: 16 }} />} data-testid="graph-undo-combine"
-              aria-label={undoLabel}
-              onClick={() => { store.getState().undo(); }}
-              sx={{ mr: 1.5, flexShrink: 1, minWidth: 32, maxWidth: 340, overflow: "hidden", color: "text.secondary", "& .MuiButton-startIcon": { mr: 0.5, ml: 0 } }}>
-              <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{undoLabel}</Box>
-            </Button>
+            <BlockedClick on={readOnly} path="undo" action="undoCombine" sx={{ mr: 1.5, flexShrink: 1, maxWidth: 340 }}>
+              <Button size="small" color="inherit" startIcon={<UndoIcon sx={{ fontSize: 16 }} />} data-testid="graph-undo-combine"
+                aria-label={undoLabel} disabled={readOnly}
+                onClick={() => { store.getState().undo(); }}
+                sx={{ flexShrink: 1, minWidth: 32, maxWidth: 340, overflow: "hidden", color: "text.secondary", "& .MuiButton-startIcon": { mr: 0.5, ml: 0 } }}>
+                <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{undoLabel}</Box>
+              </Button>
+            </BlockedClick>
           </Tooltip>
         )}
         {updating ? (
@@ -660,6 +689,7 @@ function GraphEditor() {
         )}
       </Box>
     </Workspace>
+    </Box>
   );
 }
 

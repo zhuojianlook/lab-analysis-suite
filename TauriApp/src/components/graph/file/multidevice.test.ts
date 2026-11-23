@@ -29,8 +29,9 @@ const P = `${DBX}/Dose response.lag`;
 
 interface Setup { w: ReturnType<typeof makeWorld>; a: Computer; b: Computer; delay: number }
 
-async function twoComputers(delay = 2000, mode: ConflictMode = "dropbox", extra: { skewB?: number; sameId?: boolean; partialB?: number } = {}): Promise<Setup> {
-  const w = makeWorld(mode);
+async function twoComputers(delay = 2000, mode: ConflictMode = "dropbox", extra: { skewB?: number; sameId?: boolean; partialB?: number; notes?: boolean } = {}): Promise<Setup> {
+  // Phase 3: `notes: false` — edits made on both computers within a few seconds (with notes the second one is read-only).
+  const w = makeWorld(mode, undefined, { notes: extra.notes });
   const a = await start(await computer(w, { device_id: "d-a", device_name: "Mac mini", uploadDelayMs: delay, downloadDelayMs: delay }));
   const b = await start(await computer(w, {
     device_id: extra.sameId ? "d-a" : "d-b", device_name: "MacBook", uploadDelayMs: delay, downloadDelayMs: delay, partialDeliveryMs: extra.partialB,
@@ -63,7 +64,7 @@ function expectAllOnDisk(w: Setup["w"], heads: string[]) {
 
 describe("the other computer saved", () => {
   it("a clean tab reloads in place, says who saved, and undo can't undo their change", async () => {
-    const s = await twoComputers();
+    const s = await twoComputers(2000, "dropbox", { notes: false });
     const { a, b } = s;
     await edit(b, "b-before");
     await b.ses.getState().save();                 // b has undo history now
@@ -82,7 +83,7 @@ describe("the other computer saved", () => {
   });
 
   it("a tab with unsaved changes keeps them and shows 'saved a newer version'", async () => {
-    const s = await twoComputers();
+    const s = await twoComputers(2000, "dropbox", { notes: false });
     const { a, b } = s;
     await edit(b, "mine");
     await edit(a, "theirs");
@@ -100,7 +101,7 @@ describe("the other computer saved", () => {
   });
 
   it("an edit made while the new version is being read is not lost", async () => {
-    const s = await twoComputers();
+    const s = await twoComputers(2000, "dropbox", { notes: false });
     const { a, b } = s;
     const orig = b.dev.read.bind(b.dev);
     let hook: (() => void) | null = null;
@@ -228,7 +229,7 @@ describe("the conflict sheet (phase 2: the fallback when combining is not possib
 
 describe("the journal check", () => {
   async function threeSaves() {
-    const s = await twoComputers();
+    const s = await twoComputers(2000, "dropbox", { notes: false });
     const { a } = s;
     await edit(a, "r2");
     await a.ses.getState().save();
@@ -352,7 +353,7 @@ describe("save outcomes", () => {
   });
 
   it("a file that is online-only shows 'Downloading…'; when back, a changed version loads", async () => {
-    const s = await twoComputers();
+    const s = await twoComputers(2000, "dropbox", { notes: false });
     const { a, b } = s;
     b.dev.makeDataless(P);
     await flush();
@@ -454,7 +455,7 @@ describe("multi-device scenarios (plan §13)", () => {
   });
 
   it("partial delivery: an incomplete file is never a new version; the tab updates once it is whole", async () => {
-    const s = await twoComputers(1000, "dropbox", { partialB: 4000 });
+    const s = await twoComputers(1000, "dropbox", { partialB: 4000, notes: false });
     const { a, b } = s;
     await edit(a, "big");
     await a.ses.getState().save();

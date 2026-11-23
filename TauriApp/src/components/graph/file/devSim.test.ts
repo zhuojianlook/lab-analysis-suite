@@ -212,3 +212,124 @@ describe("simulator, phase 2 (§6.6)", () => {
     expect(f.head).toBe(app.ses.getState().tabs[0].baseRevision);
   });
 });
+
+// ── phase 3: the simulator's other computers keep notes (phase3-contract.md §6.6, U2–U14 at the controller) ──
+
+describe("simulator, phase 3 (who is editing)", () => {
+  const tab = (app: Awaited<ReturnType<typeof preview>>["app"]) => app.ses.getState().tabs[0];
+  const guard = (app: Awaited<ReturnType<typeof preview>>["app"]) => app.graph.getState().guard?.reason ?? null;
+
+  it("open there → an idle note, nothing changes; start editing there (Alice) → read-only; save there, keep editing → refreshed, still read-only; save there (stop) → editable", async () => {
+    const { sim, app, w } = await preview();
+    await app.ses.getState().open(PREVIEW_SAMPLE);
+    await sim.peerOpens(PREVIEW_SAMPLE);
+    await tick(w, 1000);
+    expect(sim.notes(PREVIEW_SAMPLE).map((n) => [n.deviceName, n.state])).toEqual([["Office iMac", "idle"], ["This Mac", "idle"]]);
+    expect(guard(app)).toBe(null);
+    await sim.peerStartsEditing(PREVIEW_SAMPLE);
+    await tick(w, 1000);
+    expect(guard(app)).toBe("editingElsewhere");
+    expect(tab(app).banner).toMatchObject({ kind: "editingElsewhere", actions: ["editAnyway"], peers: [{ userName: "Alice", deviceName: "Office iMac" }] });
+    expect(sim.notes(PREVIEW_SAMPLE).find((n) => n.deviceName === "Office iMac")).toMatchObject({ state: "editing", beating: true });
+    const head = await sim.peerSaves(PREVIEW_SAMPLE, { keepEditing: true });
+    await tick(w, 1000);
+    expect(tab(app).baseRevision).toBe(head);
+    expect(guard(app)).toBe("editingElsewhere");
+    expect(tab(app).presence?.status).toMatchObject({ kind: "upToDate", who: { userName: "Alice" } });
+    await sim.peerSaves(PREVIEW_SAMPLE);
+    await tick(w, 31_000);
+    expect(guard(app)).toBe(null);
+    expect(app.ses.getState().toasts.some((t) => t.kind === "reloaded")).toBe(false);
+  });
+
+  it("as me → Edit here, at once; quit there → editable; crash there → read-only until it goes quiet", async () => {
+    const { sim, app, w } = await preview();
+    await app.ses.getState().open(PREVIEW_SAMPLE);
+    await sim.peerStartsEditing(PREVIEW_SAMPLE, { sameUser: true });
+    await tick(w, 1000);
+    expect(tab(app).banner).toMatchObject({ kind: "editingElsewhere", actions: ["editHere"] });
+    expect(await app.ses.getState().editHere()).toBe(true);
+    expect(guard(app)).toBe(null);
+    await sim.peerQuits(PREVIEW_SAMPLE);
+    await tick(w, 1000);
+    expect(sim.notes(PREVIEW_SAMPLE).some((n) => n.deviceName === "Office iMac")).toBe(false);
+    await sim.peerStartsEditing(PREVIEW_SAMPLE, { who: "third" });
+    await tick(w, 65_000);                     // one heartbeat there
+    expect(guard(app)).toBe("editingElsewhere");
+    await sim.peerCrashes(PREVIEW_SAMPLE, { who: "third" });
+    await tick(w, 60_000);
+    expect(guard(app)).toBe("editingElsewhere");
+    sim.advance(5 * 60_000);
+    await tick(w, 1000);
+    expect(guard(app)).toBe(null);
+    expect(tab(app).banner).toMatchObject({ kind: "editingInfo", actions: ["editHere", "dismiss"] });
+  });
+
+  it("own edit, then start editing there → both editing; Edit here there → continued elsewhere; this computer sleeps → resuming", async () => {
+    const { sim, app, w } = await preview();
+    await app.ses.getState().open(PREVIEW_SAMPLE);
+    app.graph.getState().setCell(0, 0, 0, "mine");
+    await flush();
+    await sim.peerStartsEditing(PREVIEW_SAMPLE);
+    await tick(w, 1000);
+    expect(tab(app).banner).toMatchObject({ kind: "bothEditing", actions: ["keepEditing", "saveCopy"] });
+    expect(guard(app)).toBe(null);
+    await sim.peerEditsHere(PREVIEW_SAMPLE, { who: "third" });
+    await tick(w, 1000);
+    expect(tab(app).banners.some((b) => b.kind === "continuedElsewhere")).toBe(true);
+    expect(app.graph.getState().doc!.cells[0][0][0]).toBe("mine");
+    sim.sleep(3 * 60_000);
+    await tick(w, 6000);
+    expect(tab(app).presence?.mode === "resuming" || tab(app).banners.some((b) => b.kind === "continuedElsewhere")).toBe(true);
+  });
+
+  it("sync delay 60 s → waiting, then the content; offline → after 2 min 'unconfirmed' and editable", async () => {
+    const { sim, app, w } = await preview();
+    await app.ses.getState().open(PREVIEW_SAMPLE);
+    sim.setSyncDelay(60_000);
+    w.devices.find((d) => d.name === "This Mac")!.setSyncDelay(0, "notes");
+    await sim.peerSaves(PREVIEW_SAMPLE);
+    await tick(w, 2000);
+    expect(guard(app)).toBe("waiting");
+    expect(tab(app).banner?.kind).toBe("waitingNewer");
+    await tick(w, 61_000);
+    expect(tab(app).banners.some((b) => b.kind === "waitingNewer")).toBe(false);
+  });
+
+  it("older app there: its save shows the 'older version' banner; a conflict copy of a note changes nothing; the notes list", async () => {
+    const { sim, app, w } = await preview();
+    await app.ses.getState().open(PREVIEW_SAMPLE);
+    sim.setOldApp(true);
+    await sim.peerSaves(PREVIEW_SAMPLE);
+    await tick(w, 2000);
+    expect(tab(app).banners.find((b) => b.kind === "olderPeer")).toMatchObject({ peers: [{ deviceName: "Office iMac" }] });
+    sim.setOldApp(false);
+    await sim.peerOpens(PREVIEW_SAMPLE, { who: "third" });
+    const copy = await sim.noteConflictCopy(PREVIEW_SAMPLE, { who: "third" });
+    await tick(w, 1000);
+    expect(copy).toMatch(/\(conflicted copy\)\.laguse$/);
+    expect(sim.notes(PREVIEW_SAMPLE).filter((n) => n.deviceName === "Lab MacBook")).toHaveLength(2);
+    expect(guard(app)).toBe(null);
+    expect(sim.files().some((f) => f.name.endsWith(".laguse"))).toBe(false);
+    expect(sim.thirdDevice).toBe("Lab MacBook");
+  });
+
+  it("a file in Documents gets no note (Automatically); Always → a note; Never on the Dropbox file → its note goes", async () => {
+    const { sim, app, pw } = await preview();
+    const local = `${PREVIEW_FOLDERS[2]}/Local.lag`;
+    pw.device.place(local, pw.device.localFile(PREVIEW_SAMPLE)!);
+    await app.ses.getState().open(local);
+    await flush();
+    expect(sim.notes(local)).toEqual([]);
+    expect(app.ses.getState().tabs[0].presence?.sharing.why).toBe("local");
+    await app.ses.getState().setSharing(app.ses.getState().tabs[0].key, "always");
+    await flush();
+    expect(sim.notes(local)).toHaveLength(1);
+    await app.ses.getState().open(PREVIEW_SAMPLE);
+    await flush();
+    expect(sim.notes(PREVIEW_SAMPLE).filter((n) => n.deviceName === "This Mac")).toHaveLength(1);
+    await app.ses.getState().setSharing(app.ses.getState().activeKey!, "never");
+    await flush();
+    expect(sim.notes(PREVIEW_SAMPLE).filter((n) => n.deviceName === "This Mac")).toEqual([]);
+  });
+});

@@ -28,6 +28,40 @@ pub const ENGINE_DATA_NAME: &str = "LabAnalysisSuite";
 
 pub const ENV_SIDECAR_PORT: &str = "LAS_SIDECAR_PORT";
 pub const ENV_STATE_DIR: &str = "LAS_STATE_DIR";
+/// Phase 3, debug builds only: notes are written only below these folders
+/// (list separated by `:`, `;` on Windows), so a development app never
+/// leaves a note beside a real file. Unset → no note is written at all.
+pub const ENV_NOTE_ROOTS: &str = "LAS_NOTE_ROOTS";
+/// Phase 3, debug builds only: folders that count as cloud folders (service "Test cloud").
+pub const ENV_CLOUD_ROOTS: &str = "LAS_CLOUD_ROOTS";
+/// Phase 3, debug builds only: the note heartbeat in ms instead of 60 000 (self-test).
+pub const ENV_NOTE_HEARTBEAT_MS: &str = "LAS_NOTE_HEARTBEAT_MS";
+
+/// A list of absolute folders separated by `:` (`;` when `windows`); empty and relative entries are dropped.
+pub fn parse_path_list(raw: &str, windows: bool) -> Vec<PathBuf> {
+    let sep = if windows { ';' } else { ':' };
+    raw.split(sep)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .collect()
+}
+
+/// `LAS_NOTE_ROOTS` of this process (debug builds read it; release builds never call this).
+pub fn note_roots_from_env() -> Vec<PathBuf> {
+    parse_path_list(&std::env::var(ENV_NOTE_ROOTS).unwrap_or_default(), cfg!(windows))
+}
+
+/// `LAS_NOTE_HEARTBEAT_MS` → a heartbeat of at least 200 ms.
+pub fn parse_heartbeat(raw: Option<&str>) -> Option<std::time::Duration> {
+    let ms: u64 = raw?.trim().parse().ok()?;
+    (ms >= 200).then(|| std::time::Duration::from_millis(ms))
+}
+
+pub fn note_heartbeat_from_env() -> Option<std::time::Duration> {
+    parse_heartbeat(std::env::var(ENV_NOTE_HEARTBEAT_MS).ok().as_deref())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct DevEnv {
@@ -307,6 +341,21 @@ mod tests {
             PathBuf::from("C:/Users/u/AppData/Roaming/LabAnalysisSuite"),
         ]);
         assert!(installed_app_dirs("macos", &|_| None).is_empty());
+    }
+
+    #[test]
+    fn phase3_debug_lists() {
+        let (a, c) = if cfg!(windows) { (r"C:\a\b", r"C:\c") } else { ("/a/b", "/c") };
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        assert_eq!(
+            parse_path_list(&format!("{a}{sep} rel {sep}{c}{sep}{sep}"), cfg!(windows)),
+            vec![PathBuf::from(a), PathBuf::from(c)]
+        );
+        assert!(parse_path_list("", false).is_empty());
+        assert_eq!(parse_heartbeat(Some("1500")), Some(std::time::Duration::from_millis(1500)));
+        assert_eq!(parse_heartbeat(Some("5")), None, "too short");
+        assert_eq!(parse_heartbeat(Some("x")), None);
+        assert_eq!(parse_heartbeat(None), None);
     }
 
     #[test]

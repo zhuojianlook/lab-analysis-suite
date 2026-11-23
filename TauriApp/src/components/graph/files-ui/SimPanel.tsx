@@ -1,13 +1,35 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Box, Button, Divider, IconButton, MenuItem, Paper, Stack, TextField, Tooltip, Typography } from "@mui/material";
+import { Box, Button, Divider, FormControlLabel, IconButton, MenuItem, Paper, Stack, Switch, TextField, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from "@mui/material";
 import ComputerIcon from "@mui/icons-material/Computer";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import { useFileSession } from "../file/session";
 import { useDisk } from "./PathPicker";
-import { stemOf } from "./text";
+import { setUiNow, stemOf } from "./text";
+import { useTicker } from "./useTicker";
+import type { SimNote, SimWho } from "../file/contract";
 
 const OPEN_KEY = "las.files.simPanel";
+
+/** "Its clock" choices of the simulator (phase 3 contract §6.6). */
+const SKEWS: { label: string; ms: () => number }[] = [
+  { label: "right", ms: () => 0 },
+  { label: "+2 h", ms: () => 2 * 3600_000 },
+  { label: "−2 h", ms: () => -2 * 3600_000 },
+  { label: "year 2001", ms: () => Date.UTC(2001, 5, 1, 12) - Date.now() },
+];
+const DELAYS = [0, 5000, 60_000];
+
+function NoteLine({ n }: { n: SimNote }) {
+  return (
+    <Box sx={{ py: 0.25, borderTop: 1, borderColor: "divider", "&:first-of-type": { borderTop: 0 } }} data-testid="sim-note-file" data-state={n.state}>
+      <Typography variant="caption" component="div" noWrap title={n.name} sx={{ fontSize: 11 }}>{n.name}</Typography>
+      <Typography variant="caption" component="div" color="text.secondary" sx={{ fontSize: 10.5 }}>
+        {n.state === "editing" ? "editing" : "open, not editing"}{n.beating ? " · kept up to date" : ""} · {n.userName || "no name"} · #{n.seq}
+      </Typography>
+    </Box>
+  );
+}
 
 function SimButton({ id, children, onClick, disabled, off }: { id: string; children: ReactNode; onClick: () => void; disabled?: boolean; off: boolean }) {
   return (
@@ -31,6 +53,21 @@ export function SimPanel() {
   const [denied, setDenied] = useState<string[]>([]);
   const [note, setNote] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  // Phase 3: who acts in "Who is editing", and the simulator switches (per computer where it matters).
+  const [who, setWho] = useState<SimWho>("other");
+  const [sameUser, setSameUser] = useState(false);
+  const [oldApp, setOldApp] = useState<Record<SimWho, boolean>>({ other: false, third: false });
+  const [skew, setSkew] = useState<Record<SimWho, number>>({ other: 0, third: 0 });
+  const [delay, setDelay] = useState(0);
+  const [offline, setOffline] = useState(false);
+  useTicker(1000, open);
+
+  // Texts ("note updated 2 min ago") follow the simulated clock, which "+5 min" and "sleeps" move ahead.
+  useEffect(() => {
+    let alive = true;
+    void import("../file/previewBackend").then((m) => { if (alive) { const pw = m.previewBackend(); setUiNow(() => pw.clock.now()); } });
+    return () => { alive = false; setUiNow(null); };
+  }, []);
 
   // Follow the active tab's file until another file is picked here.
   const path = picked && files.some((f) => f.path === picked) ? picked : activePath && files.some((f) => f.path === activePath) ? activePath : files[0]?.path ?? "";
@@ -58,6 +95,7 @@ export function SimPanel() {
   };
 
   const isDenied = denied.includes(folder);
+  const notes: SimNote[] = (() => { try { return disk && path ? disk.notes(path) : []; } catch { return []; } })();
   const removed = disk?.removed().length ?? 0;
 
   return (
@@ -71,9 +109,9 @@ export function SimPanel() {
         </IconButton>
       </Stack>
       {open && (
-        <Box sx={{ px: 1.25, pb: 1.25, maxHeight: "62vh", overflow: "auto" }}>
+        <Box sx={{ px: 1.25, pb: 1.25, maxHeight: "56vh", overflow: "auto" }}>
           <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
-            Acts as {disk?.otherDevice ?? "the other computer"}, Finder and Dropbox on the simulated disk.
+            Acts as {disk?.otherDevice ?? "the other computer"}{disk?.thirdDevice ? ` and ${disk.thirdDevice}` : ""}, Finder and Dropbox on the simulated disk.
           </Typography>
           <TextField select size="small" fullWidth label="File" value={path} sx={{ "& .MuiSelect-select": { py: "6px", fontSize: 12.5 } }} onChange={(e) => setPicked(e.target.value)}
             slotProps={{ htmlInput: { "data-testid": "sim-file" } }}>
@@ -89,6 +127,54 @@ export function SimPanel() {
             </Typography>
           )}
           <Box sx={{ mt: 1, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0.5, "& > .full": { gridColumn: "1 / -1" } }}>
+            <Typography className="full" variant="overline" color="text.secondary" sx={{ lineHeight: 1.6 }}>Who is editing</Typography>
+            <Stack className="full" direction="row" spacing={1} alignItems="center">
+              <ToggleButtonGroup size="small" exclusive value={who} onChange={(_, v: SimWho | null) => { if (v) setWho(v); }}
+                sx={{ "& .MuiToggleButton-root": { py: 0.1, px: 0.75, fontSize: 11, textTransform: "none" } }}>
+                <ToggleButton value="other" data-testid="sim-who-other">{disk?.otherDevice ?? "Office iMac"} (Alice)</ToggleButton>
+                <ToggleButton value="third" data-testid="sim-who-third">{disk?.thirdDevice ?? "Lab MacBook"} (Bob)</ToggleButton>
+              </ToggleButtonGroup>
+              <FormControlLabel sx={{ ml: 0, mr: 0, "& .MuiFormControlLabel-label": { fontSize: 11 } }} label="as me"
+                control={<Switch size="small" checked={sameUser} onChange={(e) => setSameUser(e.target.checked)} slotProps={{ input: { "data-testid": "sim-same-user" } as object }} />} />
+            </Stack>
+            <SimButton off={busy || !disk} id="sim-peer-open" disabled={!file} onClick={() => void run("Open the file there", () => disk!.peerOpens(path, { who, sameUser }))}>Open the file there</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-edit" disabled={!file} onClick={() => void run("Start editing there", () => disk!.peerStartsEditing(path, { who, sameUser }))}>Start editing there</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-save" disabled={!file} onClick={() => void run("Save there", () => disk!.peerSaves(path, { who }))}>Save there (stop editing)</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-save-keep" disabled={!file} onClick={() => void run("Save there, keep editing", () => disk!.peerSaves(path, { who, keepEditing: true }))}>Save there, keep editing</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-stop" disabled={!file} onClick={() => void run("Stop editing there", () => disk!.peerStops(path, { who }))}>Stop editing there (discard)</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-edit-here" disabled={!file} onClick={() => void run("Press Edit here there", () => disk!.peerEditsHere(path, { who, sameUser }))}>Press “Edit here” there</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-quit" disabled={!file} onClick={() => void run("Quit the app there", () => disk!.peerQuits(path, { who }))}>Quit the app there</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-crash" disabled={!file} onClick={() => void run("Crash there", () => disk!.peerCrashes(path, { who }))}>Crash there (note left behind)</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-sleep" disabled={!file} onClick={() => void run("Sleep there", () => disk!.peerSleeps(path, { who }))}>Sleep there</SimButton>
+            <SimButton off={busy || !disk} id="sim-peer-wake" disabled={!file} onClick={() => void run("Wake there", () => disk!.peerWakes(path, { who }))}>Wake there</SimButton>
+            <SimButton off={busy || !disk} id="sim-note-conflict" disabled={!file} onClick={() => void run("Conflict copy of its note", () => disk!.noteConflictCopy(path, { who }))}>Conflict copy of its note</SimButton>
+            <SimButton off={busy || !disk} id="sim-old-app" onClick={() => void run(`Older app there: ${oldApp[who] ? "off" : "on"}`, () => {
+              disk!.setOldApp(!oldApp[who], who);
+              setOldApp((o) => ({ ...o, [who]: !o[who] }));
+            })}>Older app there: {oldApp[who] ? "on" : "off"}</SimButton>
+            <SimButton off={busy || !disk} id="sim-skew" onClick={() => void run(`Its clock: ${SKEWS[(skew[who] + 1) % SKEWS.length].label}`, () => {
+              const next = (skew[who] + 1) % SKEWS.length;
+              disk!.setClockSkew(SKEWS[next].ms(), who);
+              setSkew((o) => ({ ...o, [who]: next }));
+            })}>Its clock: {SKEWS[skew[who]].label}</SimButton>
+            <SimButton off={busy || !disk} id="sim-delay" onClick={() => void run(`Sync delay: ${DELAYS[(DELAYS.indexOf(delay) + 1) % DELAYS.length] / 1000} s`, () => {
+              const next = DELAYS[(DELAYS.indexOf(delay) + 1) % DELAYS.length];
+              disk!.setSyncDelay(next);
+              setDelay(next);
+            })}>Sync delay: {delay / 1000} s</SimButton>
+            <SimButton off={busy || !disk} id="sim-this-offline" onClick={() => void run(`This computer offline: ${offline ? "off" : "on"}`, () => {
+              disk!.setOffline(!offline);
+              setOffline((o) => !o);
+            })}>This computer offline: {offline ? "on" : "off"}</SimButton>
+            <SimButton off={busy || !disk} id="sim-sleep-3m" onClick={() => void run("This computer slept 3 min", () => disk!.sleep(3 * 60_000))}>This computer sleeps 3 min</SimButton>
+            <SimButton off={busy || !disk} id="sim-sleep-2h" onClick={() => void run("This computer slept 2 h", () => disk!.sleep(2 * 3600_000))}>This computer sleeps 2 h</SimButton>
+            <Box className="full" data-testid="sim-notes" data-count={notes.length}
+              sx={{ border: 1, borderColor: "divider", borderRadius: 1, px: 0.75, py: 0.25, maxHeight: 110, overflow: "auto" }}>
+              {notes.length === 0
+                ? <Typography variant="caption" color="text.secondary" sx={{ fontSize: 11 }}>No note files beside this file.</Typography>
+                : notes.map((n) => <NoteLine key={n.file} n={n} />)}
+            </Box>
+            <Divider className="full" sx={{ my: 0.25 }} />
             <Typography className="full" variant="overline" color="text.secondary" sx={{ lineHeight: 1.6 }}>Other computer</Typography>
             <SimButton off={busy || !disk} id="sim-edit-table" disabled={!file} onClick={() => void run("Edit table and save", () => disk!.remoteEdit(path, { section: "table" }))}>Edit table and save</SimButton>
             <SimButton off={busy || !disk} id="sim-edit-graph" disabled={!file} onClick={() => void run("Edit graph and save", () => disk!.remoteEdit(path, { section: "figure" }))}>Edit graph and save</SimButton>
@@ -139,19 +225,26 @@ export function SimPanel() {
             </SimButton>
             <SimButton off={busy || !disk} id="sim-race" disabled={!file} onClick={() => void run("Race next save", () => disk!.armSaveRace(path))}>Race next save</SimButton>
             <SimButton off={busy || !disk} id="sim-offline" disabled={!file} onClick={() => void run("Offline next save", () => disk!.armOffline(path))}>Offline next save</SimButton>
-            <Divider className="full" sx={{ my: 0.25 }} />
-            <Stack className="full" direction="row" spacing={0.5}>
-              <SimButton off={busy || !disk} id="sim-advance" onClick={() => void run("+10 s", () => disk!.advance(10_000))}>+10 s</SimButton>
-              <Tooltip title="Runs the quit routine, as quitting the app would">
-                <span><SimButton off={busy || !disk} id="sim-quit" onClick={() => void run("Quit", () => useFileSession.getState().quitRoutine("menu"))}>Quit…</SimButton></span>
-              </Tooltip>
-              <SimButton off={busy || !disk} id="sim-reset" onClick={() => disk?.reset()}>Reset</SimButton>
-            </Stack>
           </Box>
-          {note && <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 1 }} data-testid="sim-note">{note}</Typography>}
           <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 0.5 }} data-testid="sim-removed" data-count={removed}>
             Copies removed on this computer: {removed}
           </Typography>
+        </Box>
+      )}
+      {open && (
+        // Always visible (outside the scrolling part): time and the last result.
+        <Box sx={{ px: 1.25, pb: 1, pt: 0.75, borderTop: 1, borderColor: "divider" }}>
+          <Stack direction="row" spacing={0.5}>
+            <SimButton off={busy || !disk} id="sim-advance" onClick={() => void run("+10 s", () => disk!.advance(10_000))}>+10 s</SimButton>
+            <SimButton off={busy || !disk} id="sim-advance-60" onClick={() => void run("+1 min", () => disk!.advance(60_000))}>+1 min</SimButton>
+            <SimButton off={busy || !disk} id="sim-advance-300" onClick={() => void run("+5 min", () => disk!.advance(300_000))}>+5 min</SimButton>
+            <Box sx={{ flexGrow: 1 }} />
+            <Tooltip title="Runs the quit routine, as quitting the app would">
+              <span><SimButton off={busy || !disk} id="sim-quit" onClick={() => void run("Quit", () => useFileSession.getState().quitRoutine("menu"))}>Quit…</SimButton></span>
+            </Tooltip>
+            <SimButton off={busy || !disk} id="sim-reset" onClick={() => disk?.reset()}>Reset</SimButton>
+          </Stack>
+          <Typography variant="caption" color="text.secondary" component="div" noWrap title={note} sx={{ mt: 0.5, minHeight: 18 }} data-testid="sim-note">{note}</Typography>
         </Box>
       )}
     </Paper>

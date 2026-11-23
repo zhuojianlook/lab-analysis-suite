@@ -1,4 +1,5 @@
 mod appstate;
+mod cloud;
 mod devenv;
 mod engine;
 // Debug builds only: the files self-test hook (LAS_E2E_SCRIPT).
@@ -9,6 +10,7 @@ mod graphfile;
 mod graphwatch;
 mod menu;
 mod opens;
+mod presence;
 mod quit;
 #[cfg(target_os = "macos")]
 mod quit_macos;
@@ -474,9 +476,20 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 /// Files opened before the frontend listened; marks the frontend ready (for
 /// open-files events and for the quit handshake).
 #[tauri::command]
-fn take_pending_opens(quit: tauri::State<'_, Arc<QuitDriver>>) -> Vec<String> {
+fn take_pending_opens(quit: tauri::State<'_, Arc<QuitDriver>>, ctx: tauri::State<'_, Arc<FileCtx>>) -> Vec<String> {
     quit.set_frontend_ready();
+    // Phase 3: notes left by an earlier launch (crash) and not taken over by a reopened tab.
+    presence::schedule_sweep(ctx.inner(), presence::SWEEP_DELAY);
     opens::take()
+}
+
+/// Phase 3: delete this computer's notes before the app goes (time-limited; idempotent).
+fn delete_own_notes(app: &tauri::AppHandle) {
+    if let Some(ctx) = app.try_state::<Arc<FileCtx>>() {
+        if !presence::delete_all_own(ctx.inner(), presence::QUIT_DELETE) {
+            log::warn!("[presence] not every note could be deleted in time");
+        }
+    }
 }
 
 #[tauri::command]
@@ -712,6 +725,7 @@ pub fn run() {
         }));
       }
       graphwatch::start(ctx.clone());
+      presence::start(ctx.clone());
       if state_dir.is_some() {
         let c = ctx.clone();
         std::thread::spawn(move || {
@@ -720,6 +734,7 @@ pub fn run() {
           }
         });
       }
+      let notes_ctx = ctx.clone();
       app.manage(ctx);
 
       // App menu (custom Quit / Close Tab).
@@ -736,6 +751,10 @@ pub fn run() {
             let _ = h.emit(quit::EVT_QUIT_REQUESTED, quit::QuitRequest { request_id: id, source });
           }
           Act::Finish(how) => {
+            // Notes first (before the engine is stopped), at most 1.5 s.
+            if !presence::delete_all_own(&notes_ctx, presence::QUIT_DELETE) {
+              log::warn!("[presence] not every note could be deleted in time");
+            }
             eng.stop();
             match how {
               #[cfg(target_os = "macos")]
@@ -818,6 +837,13 @@ pub fn run() {
       graphfile::graphfile_reveal,
       graphfile::graphfile_peek,
       graphfile::graphfile_remove_copy,
+      presence::presence_set,
+      presence::presence_clear,
+      presence::presence_input,
+      presence::presence_list,
+      presence::presence_remove_foreign,
+      cloud::graphfile_cloud_info,
+      appstate::appstate_new_device_id,
       graphwatch::graphfile_track,
       graphwatch::graphfile_untrack,
       graphwatch::graphfile_poll_now,
@@ -842,11 +868,15 @@ pub fn run() {
       };
       match event {
         // Synchronous Rust-only backstop.
-        RunEvent::Exit => stop_engine(),
+        RunEvent::Exit => {
+          delete_own_notes(app_handle);
+          stop_engine()
+        }
         RunEvent::ExitRequested { code, api, .. } => {
           if code == Some(quit::RESTART_EXIT_CODE) {
             // The updater's restart: cannot be prevented; the frontend ran its
             // quit routine before calling relaunch.
+            delete_own_notes(app_handle);
             stop_engine();
             return;
           }
@@ -857,7 +887,10 @@ pub fn run() {
                 q.request(QuitSource::Exit);
               }
             }
-            None => stop_engine(),
+            None => {
+              delete_own_notes(app_handle);
+              stop_engine()
+            }
           }
         }
         RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { api, .. }, .. } if label == "main" => {

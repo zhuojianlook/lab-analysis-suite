@@ -5,9 +5,10 @@ import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import LockOutlinedIcon from "@mui/icons-material/LockOutlined";
 import CloudDownloadOutlinedIcon from "@mui/icons-material/CloudDownloadOutlined";
+import PeopleAltOutlinedIcon from "@mui/icons-material/PeopleAltOutlined";
 import { useFileSession } from "../file/session";
 import type { FileTab } from "../file/contract";
-import { bannerSeverity, shortcutText } from "./text";
+import { STATUS, bannerSeverity, shortcutText } from "./text";
 
 export const FILE_TABS_HEIGHT = 34;
 
@@ -20,8 +21,10 @@ function tabIcon(t: FileTab) {
   if (t.notSaved) return { Icon: WarningAmberIcon, color: "warning.main", label: "Not saved" };
   const sev = t.banner ? bannerSeverity(t.banner) : null;
   if (sev === "error") return { Icon: ErrorOutlineIcon, color: "error.main", label: "Needs attention" };
-  if (sev === "warning") return { Icon: WarningAmberIcon, color: "warning.main", label: "Needs attention" };
-  if (t.readOnly) return { Icon: LockOutlinedIcon, color: "text.secondary", label: "Read only" };
+  // Phase 3: another computer is editing too (my unsaved changes are kept and combined).
+  if (t.presence?.mode === "bothEditing") return { Icon: PeopleAltOutlinedIcon, color: "warning.main", label: "Also being edited on another computer", testId: "tab-both" };
+  if (t.readOnly || t.presence?.readOnly) return { Icon: LockOutlinedIcon, color: "text.secondary", label: STATUS.readOnly, testId: "tab-readonly" };
+  if (sev === "warning" && t.banner?.kind !== "olderPeer") return { Icon: WarningAmberIcon, color: "warning.main", label: "Needs attention" };
   return null;
 }
 
@@ -67,7 +70,8 @@ export function FileTabs() {
               )}
               {icon && (
                 <Tooltip title={icon.label}>
-                  <icon.Icon sx={{ fontSize: 14, color: icon.color, flexShrink: 0 }} />
+                  <icon.Icon data-testid={"testId" in icon ? icon.testId : undefined} aria-label={icon.label}
+                    sx={{ fontSize: 14, color: icon.color, flexShrink: 0 }} />
                 </Tooltip>
               )}
               <Box sx={{ position: "relative", width: 22, height: 22, flexShrink: 0, display: "grid", placeItems: "center" }}>

@@ -25,6 +25,8 @@ pub const EXPORT_LIBRARY: &str = "file.export_library";
 pub const OLD_LIBRARY: &str = "file.old_library";
 /// Phase 2: open / close the Versions panel (phase2-contract.md §4.4).
 pub const VERSIONS: &str = "file.versions";
+/// Phase 3: "Show Others When I'm Editing…" for the active tab (phase3-contract.md §3.10).
+pub const SHARING: &str = "file.sharing";
 const NO_RECENT: &str = "file.open_recent.none";
 
 /// `MenuState` of contract.ts.
@@ -53,13 +55,14 @@ pub struct MenuEvent {
 }
 
 /// Items whose enabled state follows `MenuState`, and the state's value.
-pub fn enabled_flags(s: &MenuState) -> [(&'static str, bool); 7] {
+pub fn enabled_flags(s: &MenuState) -> [(&'static str, bool); 8] {
     [
         (SAVE, s.can_save),
         (SAVE_AS, s.has_doc),
         (DUPLICATE, s.has_doc),
         (CLOSE_TAB, s.has_doc),
         (VERSIONS, s.has_doc),
+        (SHARING, s.has_doc),
         (EXPORT_LIBRARY, s.can_export_library),
         (OLD_LIBRARY, s.has_old_library),
     ]
@@ -79,9 +82,9 @@ pub fn resolve_click(id: &str, recent: &[String]) -> Option<MenuEvent> {
         let i: usize = rest.parse().ok()?;
         return recent.get(i).map(|p| MenuEvent { id: OPEN_RECENT.into(), path: Some(p.clone()) });
     }
-    const IDS: [&str; 15] = [
+    const IDS: [&str; 16] = [
         ABOUT, SETTINGS, QUIT, NEW, OPEN, OPEN_RECENT, CLEAR_RECENT, SAVE, SAVE_AS, DUPLICATE, CLOSE_TAB, RECOVER,
-        EXPORT_LIBRARY, OLD_LIBRARY, VERSIONS,
+        EXPORT_LIBRARY, OLD_LIBRARY, VERSIONS, SHARING,
     ];
     IDS.contains(&id).then(|| MenuEvent { id: id.to_string(), path: None })
 }
@@ -111,6 +114,7 @@ pub fn build<R: Runtime>(h: &AppHandle<R>) -> tauri::Result<(Menu<R>, MenuHandle
     let duplicate = item(h, DUPLICATE, "Duplicate as a New Analysis…", None, false)?;
     let close_tab = item(h, CLOSE_TAB, "Close Tab", Some("CmdOrCtrl+W"), false)?;
     let versions = item(h, VERSIONS, "Versions", None, false)?;
+    let sharing = item(h, SHARING, "Show Others When I'm Editing…", None, false)?;
     let recover = item(h, RECOVER, "Recover Unsaved Work…", None, true)?;
     let old_library = item(h, OLD_LIBRARY, "Old Library…", None, false)?;
     let export = item(h, EXPORT_LIBRARY, "Export Library to Files…", None, false)?;
@@ -135,6 +139,7 @@ pub fn build<R: Runtime>(h: &AppHandle<R>) -> tauri::Result<(Menu<R>, MenuHandle
         .separator()
         .item(&close_tab)
         .item(&versions)
+        .item(&sharing)
         .separator()
         .item(&recover)
         .item(&old_library)
@@ -177,6 +182,7 @@ pub fn build<R: Runtime>(h: &AppHandle<R>) -> tauri::Result<(Menu<R>, MenuHandle
             (DUPLICATE, duplicate),
             (CLOSE_TAB, close_tab),
             (VERSIONS, versions),
+            (SHARING, sharing),
             (EXPORT_LIBRARY, export),
             (OLD_LIBRARY, old_library),
         ],
@@ -242,6 +248,8 @@ mod tests {
         assert_eq!(resolve_click("something-predefined", &recent), None);
         // phase 2
         assert_eq!(resolve_click("file.versions", &recent), Some(MenuEvent { id: "file.versions".into(), path: None }));
+        // phase 3 (R11)
+        assert_eq!(resolve_click("file.sharing", &recent), Some(MenuEvent { id: "file.sharing".into(), path: None }));
         let v = serde_json::to_value(MenuEvent { id: "file.new".into(), path: None }).unwrap();
         assert_eq!(v, serde_json::json!({"id": "file.new", "path": null}));
     }
@@ -257,6 +265,7 @@ mod tests {
         assert!(f.contains(&(SAVE, false)) && f.contains(&(SAVE_AS, true)) && f.contains(&(CLOSE_TAB, true)));
         assert!(f.contains(&(EXPORT_LIBRARY, true)) && f.contains(&(OLD_LIBRARY, false)));
         assert!(f.contains(&(VERSIONS, true)), "Versions follows hasDoc");
+        assert!(f.contains(&(SHARING, true)), "Show Others When I'm Editing… follows hasDoc");
         let r = recent_entries(&s);
         assert_eq!(r.len(), 10);
         assert_eq!(r[3], ("file.open_recent.3".to_string(), "p3 — Lab".to_string()));

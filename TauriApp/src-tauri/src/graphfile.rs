@@ -199,14 +199,14 @@ pub fn has_lag_ext(p: &Path) -> bool {
     p.extension().map(|e| e.to_string_lossy().eq_ignore_ascii_case(EXT)).unwrap_or(false)
 }
 
-fn name_has_ext(name: &str, ext: &str) -> bool {
+pub(crate) fn name_has_ext(name: &str, ext: &str) -> bool {
     match name.rfind('.') {
         Some(i) if i > 0 => name[i + 1..].eq_ignore_ascii_case(ext),
         _ => false,
     }
 }
 
-fn path_str(p: &Path) -> String {
+pub(crate) fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
@@ -829,10 +829,11 @@ impl Default for Tuning {
 type PathHook = Box<dyn FnMut(&Path) -> FResult<()> + Send>;
 
 #[derive(Clone, Copy)]
-enum HookPoint {
+pub(crate) enum HookPoint {
     BeforeDisplace,
     BeforeRename,
     BeforeRemoveMove,
+    BeforeNoteRename,
 }
 
 /// Test seams inside a save (None in the app).
@@ -847,11 +848,14 @@ pub struct Hooks {
     pub before_remove_move: Option<PathHook>,
     /// Remove copy: move by copy + verify + delete, as across volumes.
     pub force_copy_move: bool,
+    /// Phase 3 note write: after the temp file is written, before the rename over the note.
+    pub before_note_rename: Option<PathHook>,
 }
 
 pub struct FileCtx {
     pub state_dir: Option<PathBuf>,
-    pub session_id: String,
+    /// This launch's session id (a new one after `appstate_new_device_id`).
+    session: RwLock<String>,
     pub tuning: Tuning,
     pub locks: PathLocks,
     records: Mutex<HashMap<PathBuf, ValRecord>>,
@@ -868,13 +872,26 @@ pub struct FileCtx {
     /// Drafts: doc_key → sequence number of the last write / delete applied
     /// (the lock also serialises the file operations themselves).
     pub draft_order: Mutex<HashMap<String, u64>>,
+    /// Phase 3: this computer's notes (presence.rs).
+    pub presence: Mutex<crate::presence::PresenceState>,
+    /// Phase 3: what each `.laguse` file read so far contained, by (size, mtime, identity), and the reader
+    /// threads that read them (presence.rs `read_notes`; shared with those threads).
+    pub note_reader: Arc<crate::presence::NoteReader>,
+    /// Phase 3: one note operation per document at a time (separate from the save locks).
+    pub note_locks: PathLocks,
+    /// Phase 3: serialises writes of the two note records in the state folder.
+    pub note_persist: Mutex<()>,
+}
+
+pub fn new_session_id() -> String {
+    format!("s-{}", uuid::Uuid::new_v4())
 }
 
 impl FileCtx {
     pub fn new(state_dir: Option<PathBuf>) -> Self {
         FileCtx {
             state_dir,
-            session_id: format!("s-{}", uuid::Uuid::new_v4()),
+            session: RwLock::new(new_session_id()),
             tuning: Tuning::default(),
             locks: PathLocks::default(),
             records: Mutex::new(HashMap::new()),
@@ -888,7 +905,19 @@ impl FileCtx {
             hooks: Mutex::new(Hooks::default()),
             device_env: Default::default(),
             draft_order: Mutex::new(HashMap::new()),
+            presence: Mutex::new(Default::default()),
+            note_reader: Arc::new(Default::default()),
+            note_locks: PathLocks::default(),
+            note_persist: Mutex::new(()),
         }
+    }
+
+    pub fn session_id(&self) -> String {
+        self.session.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_session_id(&self, s: String) {
+        *self.session.write().unwrap_or_else(|e| e.into_inner()) = s;
     }
 
     pub fn set_emitter(&self, e: Emitter) {
@@ -929,12 +958,13 @@ impl FileCtx {
         );
     }
 
-    fn run_hook(&self, which: HookPoint, p: &Path) -> FResult<()> {
+    pub(crate) fn run_hook(&self, which: HookPoint, p: &Path) -> FResult<()> {
         let mut hooks = lk(&self.hooks);
         let slot = match which {
             HookPoint::BeforeDisplace => &mut hooks.before_displace,
             HookPoint::BeforeRename => &mut hooks.before_rename,
             HookPoint::BeforeRemoveMove => &mut hooks.before_remove_move,
+            HookPoint::BeforeNoteRename => &mut hooks.before_note_rename,
         };
         match slot {
             Some(h) => h(p),
@@ -961,7 +991,7 @@ fn full_sync(f: &fs::File) -> io::Result<()> {
     f.sync_all()
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut f = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     f.write_all(bytes)?;
     full_sync(&f)?;
@@ -1016,7 +1046,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Rename over an existing file. Windows: a sharing violation is retried 5×
 /// over 2 s.
-fn rename_replace(from: &Path, to: &Path) -> FResult<()> {
+pub(crate) fn rename_replace(from: &Path, to: &Path) -> FResult<()> {
     let mut tries = 0;
     loop {
         match fs::rename(from, to) {

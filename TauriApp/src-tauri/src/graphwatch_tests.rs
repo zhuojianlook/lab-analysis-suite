@@ -46,13 +46,16 @@ impl World {
     fn track(&self, p: &Path, head: &str, now: u64) {
         track(&self.ctx, p, true, Some(head.into()), Some("a-w".into()), now, &cfg());
     }
+    /// The phase 1 / 2 events of one round. Phase 3 `presence` events (the notes
+    /// beside the file; one is sent for the new path after every re-key) are
+    /// checked in presence_tests.rs (R7) and left out here.
     fn tick(&self, now: u64) -> Vec<Value> {
         tick(&self.ctx, now, &cfg());
         let mut e = lk(&self.ev);
         let out = e.iter().map(|(n, v)| {
             assert_eq!(n, crate::graphfile::EVT_FILE);
             v.clone()
-        }).collect();
+        }).filter(|v| v["type"] != "presence").collect();
         e.clear();
         out
     }

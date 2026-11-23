@@ -4,7 +4,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useGraphStore } from "../../../store/graphStore";
-import { Box, Button, Chip, CircularProgress, Stack, Tab, Tabs, Typography } from "@mui/material";
+import { Box, Button, Chip, CircularProgress, Stack, Tab, Tabs, Tooltip, Typography } from "@mui/material";
 import CompareArrowsIcon from "@mui/icons-material/CompareArrows";
 import RestoreIcon from "@mui/icons-material/Restore";
 import SaveAsOutlinedIcon from "@mui/icons-material/SaveAsOutlined";
@@ -17,12 +17,14 @@ import { WORKING_ROW, type VersionsState } from "../file/contract";
 import { CompareView } from "./CompareView";
 import { ScratchGrid, VersionGraph, VersionTable } from "./ReadOnlyViews";
 import { rowTimes } from "./VersionsPanel";
-import { V, whenText, whoText } from "./text";
+import { STATUS, V, whenText, whoText } from "./text";
 
 type PreviewTab = "graph" | "table" | "scratch";
 
 export function VersionPreview({ v }: { v: VersionsState }) {
   const settings = useFileSession((s) => s.settings);
+  // Phase 3: while the analysis is read-only, nothing is written into it (viewing and comparing stay).
+  const tabReadOnly = useFileSession((s) => { const t = s.tabs.find((x) => x.key === v.tabKey); return !!t && (!!t.readOnly || !!t.presence?.readOnly); });
   const [tab, setTab] = useState<PreviewTab>("graph");
   // "Compare with current" follows the current content (edits, a version brought back, a combine).
   const doc = useGraphStore((st) => st.doc);
@@ -76,14 +78,18 @@ export function VersionPreview({ v }: { v: VersionsState }) {
           onClick={() => void s().compareWithCurrent()}>
           {V.compare}
         </Button>
-        <Button size="small" variant="outlined" startIcon={busy === "bringBack" ? <CircularProgress size={14} color="inherit" /> : <RestoreIcon />}
-          data-testid="version-bring-back" disabled={!openable || loading || !!busy || isCurrent || isWorking}
-          onClick={() => {
-            // Once it is back, the workspace shows it: the read-only preview closes.
-            void s().bringBack(row.id).then((out) => { if (out.ok && s().versions?.selectedId === row.id) void s().selectVersion(null); });
-          }}>
-          {V.bringBack}
-        </Button>
+        <Tooltip title={tabReadOnly ? STATUS.readOnlySave : ""}>
+          <span onClick={() => { if (tabReadOnly) s().reportEditAttempt("command", "bringBack", v.tabKey); }}>
+            <Button size="small" variant="outlined" startIcon={busy === "bringBack" ? <CircularProgress size={14} color="inherit" /> : <RestoreIcon />}
+              data-testid="version-bring-back" disabled={!openable || loading || !!busy || isCurrent || isWorking || tabReadOnly}
+              onClick={() => {
+                // Once it is back, the workspace shows it: the read-only preview closes.
+                void s().bringBack(row.id).then((out) => { if (out.ok && s().versions?.selectedId === row.id) void s().selectVersion(null); });
+              }}>
+              {V.bringBack}
+            </Button>
+          </span>
+        </Tooltip>
         <Button size="small" variant="outlined" startIcon={busy === "saveAsNew" ? <CircularProgress size={14} color="inherit" /> : <SaveAsOutlinedIcon />}
           data-testid="version-save-as-new" disabled={!openable || loading || !!busy || isWorking}
           onClick={() => void s().saveVersionAsNew(row.id)}>

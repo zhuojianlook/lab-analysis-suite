@@ -1,4 +1,4 @@
-/* FileBackendP1 over the Rust commands and events (contract §1.7). A thin
+/* FileBackendP3 over the Rust commands and events (contract §1.7; phase 3 §5.1). A thin
    mapping: arguments in, replies out, manifest text parsed / written with
    canonicalJson, rejections turned into typed errors. No logic of its own.
 
@@ -12,7 +12,8 @@ import type {
 } from "./backend";
 import {
   CMD, EVT, RUST_ERROR_KINDS,
-  type AppInfo, type Commands, type DevicePatch, type FileBackendP2, type HeaderReply, type PeekResult, type RemoveCopyArgs,
+  type AppInfo, type CloudInfo, type Commands, type DevicePatch, type FileBackendP3, type HeaderReply, type PeekResult, type PresenceListResult,
+  type PresenceSetArgs, type PresenceSetResult, type RemoveCopyArgs, type RemoveNoteArgs,
   type RemoveCopyResult, type SeenMap, type LocateProgress, type LocateReply,
   type LocateResult, type RawFile, type ReadReply, type RustError, type RustErrorKind, type SaveReply, type ScanReply,
 } from "./contract";
@@ -41,7 +42,7 @@ function parseRaw(raw: RawFile): GraphFileData {
   return { manifest: JSON.parse(raw.manifestText) as Manifest, parts: { ...raw.parts } };
 }
 
-export function createTauriBackend(io: { invoke: InvokeFn; listen: ListenFn }): FileBackendP2 {
+export function createTauriBackend(io: { invoke: InvokeFn; listen: ListenFn }): FileBackendP3 {
   const { invoke, listen } = io;
   /** Last head / id this backend saw at a path (sent with graphfile_track). */
   const known = new Map<string, { head: string | null; analysisId: string | null }>();
@@ -72,7 +73,7 @@ export function createTauriBackend(io: { invoke: InvokeFn; listen: ListenFn }): 
     try { return await invoke(cmd, args); } catch (e) { console.warn(`[files] ${cmd} failed:`, rustError(e).message); return undefined; }
   };
 
-  const backend: FileBackendP2 = {
+  const backend: FileBackendP3 = {
     async device(): Promise<DeviceIdentity> {
       return invoke(CMD.device, {});
     },
@@ -260,12 +261,63 @@ export function createTauriBackend(io: { invoke: InvokeFn; listen: ListenFn }): 
     },
     readSeen: (): Promise<SeenMap> => invoke(CMD.readSeen, {}),
     writeSeen: (seen: SeenMap) => inOrder("seen", async () => { await invoke(CMD.writeSeen, { seen }); }),
+
+    // ── phase 3 (who is editing): one chain per document, so its note calls stay in order ──
+    presenceSet: (req: PresenceSetArgs): Promise<PresenceSetResult> => inOrder(`note:${req.docPath}`, async () => {
+      try {
+        const r = await invoke(CMD.presenceSet, {
+          req: {
+            docPath: req.docPath, analysisId: req.analysisId, state: req.state, head: req.head, baseRevision: req.baseRevision,
+            epoch: req.epoch, supersedes: req.supersedes.map((t) => ({ device_id: t.device_id, epoch: t.epoch })), input: req.input,
+          },
+        });
+        if (r && r.kind === "written") return { ok: true, kind: "written", file: r.file, note: r.note };
+        if (r && r.kind === "off") return { ok: true, kind: "off", reason: r.reason };
+        return { ok: false, code: "Io", message: "Unexpected reply." };
+      } catch (e) {
+        const { kind, message } = rustError(e);
+        return { ok: false, code: fileCode(kind), message };
+      }
+    }),
+    presenceClear: (docPath: string): Promise<void> => inOrder(`note:${docPath}`, async () => {
+      await quiet(CMD.presenceClear, { docPath });
+    }),
+    presenceInput(docPath: string): void {
+      void quiet(CMD.presenceInput, { docPath });
+    },
+    async presenceList(docPath: string, analysisId: string): Promise<PresenceListResult> {
+      try {
+        const r = await invoke(CMD.presenceList, { docPath, analysisId });
+        return { ok: true, notes: Array.isArray(r?.notes) ? r.notes : [], truncated: !!r?.truncated };
+      } catch (e) {
+        const { kind, message } = rustError(e);
+        return { ok: false, code: fileCode(kind), message };
+      }
+    },
+    async presenceRemoveForeign(req: RemoveNoteArgs): Promise<boolean> {
+      try {
+        const r = await invoke(CMD.presenceRemoveForeign, { req: { file: req.file, sha: req.sha } });
+        return r?.kind === "removed";
+      } catch (e) {
+        console.warn("[files] presence_remove_foreign failed:", rustError(e).message);
+        return false;
+      }
+    },
+    async cloudInfo(path: string): Promise<CloudInfo> {
+      try {
+        const r = await invoke(CMD.cloudInfo, { path });
+        return { cloud: !!r?.cloud, service: r?.service ?? null, root: r?.root ?? null };
+      } catch {
+        return { cloud: false, service: null, root: null };
+      }
+    },
+    newDeviceId: (): Promise<DeviceIdentity> => invoke(CMD.newDeviceId, {}),
   };
   return backend;
 }
 
 /** The desktop backend, loading @tauri-apps/api on first use. */
-export function tauriBackend(): FileBackendP2 {
+export function tauriBackend(): FileBackendP3 {
   const invoke: InvokeFn = async (cmd, args) => {
     const core = await import("@tauri-apps/api/core");
     return core.invoke(cmd, args as Record<string, unknown>) as Promise<never>;

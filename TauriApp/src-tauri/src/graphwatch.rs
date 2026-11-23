@@ -10,6 +10,11 @@
 //! The safe follow rule (rename in the same folder) never adopts a copy:
 //! every same-id file seen beside the tracked one goes into the track's copy
 //! table and can never be a rename target.
+//!
+//! Phase 3: a look also lists the notes (`.laguse`) beside the tracked file
+//! (presence::scan_notes; a note is read only when its size or mtime changed)
+//! and reports `presence` with the full list when it changed. A sleep gap is
+//! reported as `wake` and stops this computer's note heartbeat.
 
 use crate::graphfile::{
     file_identity, follow_candidates, is_same_file, list_lag_files, lk, read_header, read_validated, request_download,
@@ -51,6 +56,8 @@ pub struct Track {
     /// a look whose snapshot is older is dropped.
     pub gen: u64,
     pub seeded: bool,
+    /// Phase 3: signature of the notes last reported (None: report the next listing whatever it is).
+    pub notes_sig: Option<String>,
 }
 
 impl Track {
@@ -70,6 +77,7 @@ impl Track {
             next_due: now,
             gen: 0,
             seeded: false,
+            notes_sig: Some(crate::presence::empty_sig()),
         }
     }
 }
@@ -188,6 +196,7 @@ pub fn rekey(ctx: &FileCtx, from: &Path, to: &Path, head: &str, st: &FileStat) {
         t.state = TState::Ok;
         t.absent_since = None;
         t.absent_looks = 0;
+        t.notes_sig = None;
         t.gen += 1;
         w.tracks.insert(to.to_path_buf(), t);
     }
@@ -295,7 +304,7 @@ pub struct LookResult {
     pub events: Vec<Value>,
 }
 
-fn cached_header(ctx: &FileCtx, p: &Path, st: &FileStat) -> Option<FileHeader> {
+pub(crate) fn cached_header(ctx: &FileCtx, p: &Path, st: &FileStat) -> Option<FileHeader> {
     if let Some(c) = lk(&ctx.dir_cache).get(p) {
         if c.size == st.size && c.mtime == st.mtime {
             return c.header.clone();
@@ -370,6 +379,7 @@ fn siblings(ctx: &FileCtx, t: &mut Track, ev: &mut Vec<Value>) -> Option<PathBuf
         t.copy_table.remove(&to);
         t.sibling_heads.remove(&to);
         t.path = to.clone();
+        t.notes_sig = None;
         moved_to = Some(to);
     }
     for (p, h) in listing.others {
@@ -505,6 +515,7 @@ fn absent(ctx: &FileCtx, t: &mut Track, others: &BTreeSet<PathBuf>, now: u64, cf
             t.head = Some(v.header.head);
             t.record = Some((st.size, st.mtime));
             t.path = to.clone();
+            t.notes_sig = None;
             Some(to)
         }
         Ok(f) => {
@@ -517,6 +528,19 @@ fn absent(ctx: &FileCtx, t: &mut Track, others: &BTreeSet<PathBuf>, now: u64, cf
             send_missing(t, vec![], ev);
             None
         }
+    }
+}
+
+/// Phase 3 (contract §3.6): the notes beside the tracked file; `presence` with
+/// the full list when their signature changed. Nothing when the folder can't
+/// be listed. Also while the file is missing or unreadable.
+fn notes(ctx: &FileCtx, t: &mut Track, ev: &mut Vec<Value>) {
+    let Some(aid) = t.analysis_id.clone() else { return };
+    let Ok(reply) = crate::presence::scan_notes_within(ctx, &t.path, &aid, crate::presence::READ_WAIT_POLL) else { return };
+    let sig = crate::presence::notes_sig(&reply.notes, &ctx.session_id());
+    if t.notes_sig.as_deref() != Some(sig.as_str()) {
+        t.notes_sig = Some(sig);
+        ev.push(json!({ "type": "presence", "path": ps(&t.path), "notes": reply.notes }));
     }
 }
 
@@ -555,6 +579,7 @@ pub fn look(ctx: &FileCtx, mut t: Track, others: &BTreeSet<PathBuf>, now: u64, c
             }
         }
     }
+    notes(ctx, &mut t, &mut ev);
     Some(LookResult { track: t, rekey_to, events: ev })
 }
 
@@ -639,18 +664,26 @@ pub fn start(ctx: Arc<FileCtx>) {
     let spawned = std::thread::Builder::new().name("graphwatch".into()).spawn(move || {
         let cfg = WatchCfg::default();
         let mut last_wall = wall_ms();
+        // How long the last look took on the monotonic clock (which does not run during sleep): a look that
+        // blocked on a stalled folder is not a sleep (fixer VP-5).
+        let mut busy_ms: i64 = 0;
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let wall = wall_ms();
-            if wall - last_wall > 90_000 {
-                // The computer slept: look at everything now.
+            let gap = wall - last_wall - busy_ms;
+            if gap > 90_000 {
+                // The computer slept: look at everything now, stop the note
+                // heartbeat and tell the frontend (phase 3 `wake`).
                 poll_now(&ctx);
+                crate::presence::on_wake(&ctx, gap);
             }
             last_wall = wall;
             let now = watch_now(&ctx);
+            let t0 = Instant::now();
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tick(&ctx, now, &cfg))).is_err() {
                 log::error!("[graphwatch] a look failed unexpectedly; continuing");
             }
+            busy_ms = i64::try_from(t0.elapsed().as_millis()).unwrap_or(i64::MAX / 2);
         }
     });
     if let Err(e) = spawned {

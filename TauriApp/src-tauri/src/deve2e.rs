@@ -81,10 +81,22 @@ pub fn dev_e2e_log(line: String) {
 /// · menu {path: a menu item id such as "file.versions" → `app://menu` is
 /// emitted exactly as a click on that item does; Quit is refused, use
 /// `dev_e2e_quit`}.
+/// Phase 3: writeText {path, to: the text → written atomically, like a sync
+/// client placing another computer's note} · readText {path → the text, or
+/// null when there is no such file} · wake {path: "<gapMs>" → exactly what
+/// the poll thread does after a sleep gap: the note heartbeat stops and
+/// `graphfile://event {type: "wake", gapMs}` is emitted}. `list` includes
+/// `.laguse` names (it lists every name).
 #[tauri::command]
 pub fn dev_e2e_fs(app: tauri::AppHandle, op: String, path: String, to: Option<String>) -> Result<Value, String> {
     if op == "menu" {
         return menu_click(&app, &path);
+    }
+    if op == "wake" {
+        let gap: i64 = path.trim().parse().map_err(|_| format!("e2e: wake needs the gap in ms, got {path:?}"))?;
+        let ctx = app.try_state::<Arc<crate::graphfile::FileCtx>>().ok_or("e2e: no file context")?;
+        crate::presence::on_wake(&ctx, gap);
+        return Ok(Value::Null);
     }
     let p = allowed(&path)?;
     let target = || -> Result<PathBuf, String> { allowed(to.as_deref().ok_or("e2e: `to` missing")?) };
@@ -109,6 +121,25 @@ pub fn dev_e2e_fs(app: tauri::AppHandle, op: String, path: String, to: Option<St
             std::fs::remove_file(&p).map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
+        "writeText" => {
+            let text = to.as_deref().ok_or("e2e: `to` (the text) missing")?;
+            if text.len() > 64 * 1024 {
+                return Err("e2e: writeText is for small files".into());
+            }
+            let dir = p.parent().ok_or("e2e: no parent")?;
+            let tmp = dir.join(format!(".~e2e-{}.tmp-{:08x}", std::process::id(), rand32()));
+            std::fs::write(&tmp, text.as_bytes()).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, &p).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                e.to_string()
+            })?;
+            Ok(Value::Null)
+        }
+        "readText" => match std::fs::read(&p) {
+            Ok(b) => Ok(Value::from(String::from_utf8_lossy(&b).into_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+            Err(e) => Err(e.to_string()),
+        },
         "list" => {
             let mut names: Vec<String> = std::fs::read_dir(&p)
                 .map_err(|e| e.to_string())?

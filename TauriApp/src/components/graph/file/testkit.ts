@@ -10,7 +10,7 @@ import { buildNewFile, newAnalysisId, newDocKey, openFile, type Author } from ".
 import type { GraphFileData } from "./format";
 import { ManualClock, MemoryWorld, type ConflictMode, type DeviceOptions, type MemoryDevice } from "./memoryBackend";
 import { openContent, type DocContent } from "../../../store/graphStore";
-import { clockTimers, createFileSession, type FileSessionStore, type SessionDeps } from "./session";
+import { createFileSession, type FileSessionStore, type SessionDeps } from "./session";
 
 export const HOME = "/Users/me";
 export const DBX = `${HOME}/Dropbox/Lab`;
@@ -63,8 +63,11 @@ export function addLibraryRow(lib: FakeLibrary, id: number, name: string, update
   });
 }
 
-export function makeWorld(mode: ConflictMode = "dropbox", syncFolders: string[] | undefined = [`${HOME}/Dropbox`]) {
-  return new MemoryWorld({ mode, clock: new ManualClock(Date.UTC(2026, 10, 20, 9, 0, 0)), syncFolders });
+/** A simulated world. Phase 3: `notes: false` makes every app write no note (as phase 1 / 2 apps, or a debug build
+ *  outside LAS_NOTE_ROOTS): the phase 1 / 2 tests of edits made on two computers at nearly the same time use it,
+ *  because with notes the second computer is read-only while the first one edits (phase3-contract.md §5.10). */
+export function makeWorld(mode: ConflictMode = "dropbox", syncFolders: string[] | undefined = [`${HOME}/Dropbox`], opts: { notes?: boolean } = {}) {
+  return new MemoryWorld({ mode, clock: new ManualClock(Date.UTC(2026, 10, 20, 9, 0, 0)), syncFolders, noteRoots: opts.notes === false ? [] : null });
 }
 
 export async function computer(world: MemoryWorld, opts: Partial<DeviceOptions> & { device_id: string; device_name: string }, extra: TestDeps = {}): Promise<Computer> {
@@ -86,7 +89,8 @@ export async function controllerFor(world: MemoryWorld, dev: MemoryDevice, extra
   const ses = createFileSession({
     backend: dev, desktop: false, graph,
     now: () => world.clock.now() + (skewMs ?? 0),
-    timers: clockTimers(world.clock),
+    // Phase 3: the device's timers (late while it sleeps, gone after a crash or quit; the world clock otherwise).
+    timers: dev.timers(),
     flushScratch: () => undefined,
     pickPath: async (req) => { pickRequests.push(req); return picks.length ? picks.shift()! : null; },
     invoke: async (cmd, args) => { invoked.push({ cmd, args }); return cmd === "take_pending_opens" ? [] : null; },
@@ -133,9 +137,9 @@ export async function withAnswer<T>(c: Computer, action: () => Promise<T>, answe
 }
 
 /** Advance simulated time and let the controllers react. */
-export async function tick(world: MemoryWorld, ms: number): Promise<void> {
+export async function tick(world: MemoryWorld, ms: number, stepMs?: number): Promise<void> {
   // In steps, so async reactions run between timer callbacks.
-  const step = ms > 20_000 ? 1000 : 250;
+  const step = stepMs ?? (ms > 20_000 ? 1000 : 250);
   for (let t = 0; t < ms; t += step) {
     world.clock.advance(Math.min(step, ms - t));
     await flush(5);
@@ -194,9 +198,9 @@ export interface Pair { w: MemoryWorld; a: Computer; b: Computer; delay: number 
 
 /** Two computers with the same file open (seeded on `a`, synced to `b`). */
 export async function pair(delay = 2000, mode: ConflictMode = "dropbox", extra: {
-  skewB?: number; sameId?: boolean; partialB?: number; depsA?: TestDeps; depsB?: TestDeps; path?: string;
+  skewB?: number; sameId?: boolean; partialB?: number; depsA?: TestDeps; depsB?: TestDeps; path?: string; notes?: boolean;
 } = {}): Promise<Pair> {
-  const w = makeWorld(mode);
+  const w = makeWorld(mode, undefined, { notes: extra.notes });
   const path = extra.path ?? PFILE;
   const a = await start(await computer(w, { device_id: "d-a", device_name: "Mac mini", uploadDelayMs: delay, downloadDelayMs: delay }, extra.depsA ?? {}));
   const b = await start(await computer(w, {
@@ -255,4 +259,45 @@ export async function pressBanner(c: Computer, kind: string, action: string) {
   if (!b) throw new Error(`no ${kind} banner (have ${t.banners.map((x) => x.kind).join(", ")})`);
   await c.ses.getState().bannerAction(t.key, b.id, action as never);
   await flush();
+}
+
+// ── phase 3 helpers ─────────────────────────────────────────────────────────
+
+/** The note files beside `path` on a computer's disk (parsed). */
+export const notesBeside = (dev: MemoryDevice, path: string) => dev.noteFiles(path.slice(0, path.lastIndexOf("/")));
+/** The parsed notes of one device beside `path` on `dev`'s disk. */
+export const notesOf = (dev: MemoryDevice, path: string, deviceId: string) =>
+  notesBeside(dev, path).filter((n) => n.note?.device_id === deviceId);
+export const guardOf = (c: Computer) => c.graph.getState().guard?.reason ?? null;
+export const presenceOf = (c: Computer) => activeTab(c).presence;
+export const modeOf = (c: Computer) => activeTab(c).presence?.mode ?? "editable";
+
+export interface Group { w: MemoryWorld; cs: Computer[]; delay: number; path: string }
+
+/** Up to three computers ("Mac mini" A, "MacBook" B, "Lab iMac" C) with the same synced file open and clean.
+ *  `users`: user name per computer (default: all "Zhuo" — my own computers). */
+export async function group(n = 2, opts: {
+  delay?: number; noteDelay?: number; users?: string[]; path?: string; mode?: ConflictMode; deps?: TestDeps[]; ids?: string[];
+  syncFolders?: string[];
+} = {}): Promise<Group> {
+  const delay = opts.delay ?? 1000;
+  const w = makeWorld(opts.mode ?? "dropbox", opts.syncFolders);
+  const path = opts.path ?? PFILE;
+  const names = ["Mac mini", "MacBook", "Lab iMac"];
+  const ids = opts.ids ?? ["d-a1a1", "d-b2b2", "d-c3c3"];
+  const cs: Computer[] = [];
+  for (let k = 0; k < n; k++) {
+    cs.push(await start(await computer(w, {
+      device_id: ids[k], device_name: names[k], user_name: opts.users?.[k] ?? "Zhuo", session_id: `s-${ids[k]}-${k}`, uploadDelayMs: delay, downloadDelayMs: delay,
+      noteUploadDelayMs: opts.noteDelay ?? delay, noteDownloadDelayMs: opts.noteDelay ?? delay,
+    }, opts.deps?.[k] ?? {})));
+  }
+  await seedFile(w, cs[0].dev, path);
+  await tick(w, 2 * delay + 500);
+  for (const c of cs) {
+    const o = await c.ses.getState().open(path);
+    if (!o.ok) throw new Error("group: open failed");
+  }
+  await tick(w, 2 * Math.max(delay, opts.noteDelay ?? 0) + 500);
+  return { w, cs, delay, path };
 }

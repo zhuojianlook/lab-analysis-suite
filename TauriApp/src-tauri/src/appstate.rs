@@ -205,8 +205,53 @@ pub fn device(ctx: &FileCtx) -> FResult<DeviceIdentity> {
     let env = ctx.device_env.get();
     let _g = ctx.state_guard();
     let rec = load_device(state, &env)?;
-    Ok(identity_of(&rec, &env, &ctx.session_id))
+    Ok(identity_of(&rec, &env, &ctx.session_id()))
 }
+
+/// The identity plus the earlier ids of this computer (`aliases`). Tests only:
+/// an alias is never "own" for notes (fixer VP-1), it is only a record.
+#[cfg(test)]
+pub fn device_with_aliases(ctx: &FileCtx) -> FResult<(DeviceIdentity, Vec<String>)> {
+    let state = ctx.state()?;
+    let env = ctx.device_env.get();
+    let _g = ctx.state_guard();
+    let rec = load_device(state, &env)?;
+    Ok((identity_of(&rec, &env, &ctx.session_id()), rec.aliases.clone()))
+}
+
+/// `appstate_new_device_id` (phase3-contract.md §3.10): another running app
+/// uses this computer's identity. A new `d-<uuid>`, the old id kept as an
+/// alias, a new session id for this launch; device.json written atomically.
+/// Every registered note is then dropped from the registry, and the note files
+/// written under the old id in this launch (old id + old session id) are deleted;
+/// the controller writes the notes again under the new id. An alias is never
+/// "own" (the other computer still uses it), so nothing else is touched.
+pub fn new_device_identity(ctx: &FileCtx) -> FResult<DeviceIdentity> {
+    let state = ctx.state()?;
+    let env = ctx.device_env.get();
+    let (ident, old, old_session) = {
+        let _g = ctx.state_guard();
+        let mut rec = load_device(state, &env)?;
+        let old = std::mem::replace(&mut rec.device_id, new_device_id());
+        if !rec.aliases.contains(&old) {
+            rec.aliases.push(old.clone());
+        }
+        // Bounded: only a record of earlier ids (fixer VS-5).
+        if rec.aliases.len() > ALIASES_MAX {
+            let extra = rec.aliases.len() - ALIASES_MAX;
+            rec.aliases.drain(..extra);
+        }
+        write_value(&state.join("device.json"), &serde_json::to_value(&rec).map_err(|e| FileErr::io(e.to_string()))?)?;
+        let old_session = ctx.session_id();
+        ctx.set_session_id(crate::graphfile::new_session_id());
+        (identity_of(&rec, &env, &ctx.session_id()), old, old_session)
+    };
+    crate::presence::forget_own(ctx, &old, &old_session);
+    Ok(ident)
+}
+
+/// At most this many earlier device ids are kept in device.json.
+const ALIASES_MAX: usize = 16;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -235,7 +280,7 @@ pub fn set_device(ctx: &FileCtx, patch: &DevicePatch) -> FResult<DeviceIdentity>
         rec.user_name = clean_name(n);
     }
     write_value(&state.join("device.json"), &serde_json::to_value(&rec).map_err(|e| FileErr::io(e.to_string()))?)?;
-    Ok(identity_of(&rec, &env, &ctx.session_id))
+    Ok(identity_of(&rec, &env, &ctx.session_id()))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -555,6 +600,11 @@ pub async fn appstate_device(ctx: tauri::State<'_, Ctx>) -> Result<DeviceIdentit
 }
 
 #[tauri::command]
+pub async fn appstate_new_device_id(ctx: tauri::State<'_, Ctx>) -> Result<DeviceIdentity, FileErr> {
+    cmd!(ctx, |c: &FileCtx| new_device_identity(c))
+}
+
+#[tauri::command]
 pub async fn appstate_set_device(ctx: tauri::State<'_, Ctx>, patch: DevicePatch) -> Result<DeviceIdentity, FileErr> {
     cmd!(ctx, move |c: &FileCtx| set_device(c, &patch))
 }
@@ -717,6 +767,31 @@ mod tests {
         let c3 = FileCtx::new(Some(d.clone()));
         c3.device_env.set(DeviceEnv { hardware_id: None, default_device_name: "X".into(), default_user_name: "Y".into() });
         assert_eq!(device(&c3).unwrap().device_id, n.device_id);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// R11: a new device id keeps the old one as an alias and changes the session id.
+    #[test]
+    fn new_device_id_keeps_alias_and_changes_session() {
+        let d = tmp();
+        let c = ctx_in(&d);
+        let a = device(&c).unwrap();
+        let n = new_device_identity(&c).unwrap();
+        assert_ne!(n.device_id, a.device_id);
+        assert!(n.device_id.starts_with("d-") && valid_id(&n.device_id));
+        assert_ne!(n.session_id, a.session_id, "a new session id for this launch");
+        assert_eq!(n.device_name, a.device_name);
+        assert_eq!(device(&c).unwrap(), n, "stored, and the session id is the launch's from now on");
+        let rec: DeviceFile = serde_json::from_slice(&fs::read(d.join("device.json")).unwrap()).unwrap();
+        assert_eq!(rec.aliases, vec![a.device_id.clone()]);
+        let (_, aliases) = device_with_aliases(&c).unwrap();
+        assert_eq!(aliases, vec![a.device_id.clone()]);
+        let n2 = new_device_identity(&c).unwrap();
+        let rec: DeviceFile = serde_json::from_slice(&fs::read(d.join("device.json")).unwrap()).unwrap();
+        assert_eq!(rec.aliases, vec![a.device_id.clone(), n.device_id.clone()]);
+        assert_eq!(rec.device_id, n2.device_id);
+        assert_eq!(new_device_identity(&FileCtx::new(None)).unwrap_err().kind, crate::graphfile::ErrKind::NoStateDir);
+        assert!(!fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".tmp-")));
         let _ = fs::remove_dir_all(&d);
     }
 

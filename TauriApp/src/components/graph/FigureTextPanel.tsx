@@ -14,6 +14,7 @@ import {
 import {
   buildFigureText, countWords, LEGEND_WORDS_HARD, LEGEND_WORDS_SOFT, normalityApplies, type FigureText, type FigureTextInput,
 } from "./figureText";
+import { RailGuard } from "./RailGuard";
 
 /* Auto-generated figure legend + statistical methods beside the rendered
    figure. The text is a pure function of the document (figureText.ts), so it
@@ -183,7 +184,7 @@ function LegendFields({ figLabel, unit, onChange, stacked }: {
 
 export function FigureTextPanel({
   table, analysis, figure, result, busy, stale, error, renderFailed, side, panelWidth = 340, open, onToggle,
-  figLabel, unit, onLegendFields,
+  figLabel, unit, onLegendFields, readOnly = false,
 }: {
   table: GraphTable;
   /** effectiveAnalysis(...): what was sent to the engine. */
@@ -211,6 +212,8 @@ export function FigureTextPanel({
   /** "Each value is one…" (singular unit of n; "" = not stated). Legend-only, saved with the document. */
   unit: string;
   onLegendFields: (patch: { fig_label?: string; n_unit?: string }) => void;
+  /** Phase 3: the analysis is read-only right now — the two legend fields (saved settings) can't change. */
+  readOnly?: boolean;
 }) {
   const software = useSoftware();
   const [normality, setNormality] = useState(() => readPref(PREF_NORMALITY) === "1");
@@ -284,8 +287,12 @@ export function FigureTextPanel({
       </Stack>
 
       <Stack spacing={1.75} sx={{ p: 1.5 }}>
-        {/* never dimmed or disabled: typing here only changes the text */}
-        {!empty && <LegendFields figLabel={figLabel} unit={unit} onChange={onLegendFields} stacked={side} />}
+        {/* never dimmed while the statistics update: typing here only changes the text (dimmed only while read-only) */}
+        {!empty && (
+          <RailGuard on={readOnly} path="figure">
+            <LegendFields figLabel={figLabel} unit={unit} onChange={onLegendFields} stacked={side} />
+          </RailGuard>
+        )}
         <Stack spacing={1.75} sx={{ opacity: busy ? 0.6 : 1, transition: "opacity 0.15s" }}>
           {renderFailed && (
             <Typography variant="caption" color="error" component="div">

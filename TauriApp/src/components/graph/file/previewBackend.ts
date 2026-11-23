@@ -1,5 +1,6 @@
 /* The browser preview's simulated world (contract §4.14): a Dropbox-like sync
-   service, this computer and one other computer ("Office iMac", Alice), with a
+   service, this computer and two other computers ("Office iMac", Alice; phase 3:
+   "Lab MacBook", Bob), with a
    few folders and a sample analysis. Time runs in real time (a ManualClock
    advanced every 250 ms), and the whole world is kept in localStorage so a page
    reload behaves like quitting and starting the app again. */
@@ -11,6 +12,11 @@ import { buildNewFile, newAnalysisId, newDocKey, type Author } from "./docCodec"
 import { ManualClock, MemoryWorld, type MemoryDevice, type MemoryWorldState } from "./memoryBackend";
 
 export const PREVIEW_STORAGE_KEY = "las.files.preview.v1";
+
+/** The simulator's Reset: nothing is saved any more in this page (its unload handler would write the world back
+ *  after the key was removed; fixer F7). */
+let persistFrozen = false;
+export function freezePreviewPersist(): void { persistFrozen = true; }
 export const PREVIEW_HOME = "/Users/me";
 export const PREVIEW_FOLDERS = [`${PREVIEW_HOME}/Dropbox/Lab`, `${PREVIEW_HOME}/Dropbox/Shared`, `${PREVIEW_HOME}/Documents`, `${PREVIEW_HOME}/Downloads`];
 export const PREVIEW_SAMPLE = `${PREVIEW_HOME}/Dropbox/Lab/Dose response.lag`;
@@ -26,6 +32,8 @@ export interface PreviewWorld {
   device: MemoryDevice;
   /** The other computer. */
   other: MemoryDevice;
+  /** Phase 3: a third computer ("Lab MacBook", Bob). */
+  third: MemoryDevice;
   /** Resolves once a fresh world has its sample file. */
   ready: Promise<void>;
   /** Write the world to localStorage now (page unload). */
@@ -48,6 +56,7 @@ export function createPreviewWorld(opts: { persist?: boolean; drive?: boolean; c
   const common = { appInfo: PREVIEW_APP_INFO, strictFolders: true, folders: PREVIEW_FOLDERS };
   const device = world.addDevice({ device_id: "d-preview-this", device_name: "This Mac", user_name: "Me", session_id: `s-preview-${Date.now().toString(36)}`, ...common });
   const other = world.addDevice({ device_id: "d-preview-other", device_name: "Office iMac", user_name: "Alice", ...common });
+  const third = world.addDevice({ device_id: "d-preview-third", device_name: "Lab MacBook", user_name: "Bob", ...common });
 
   let restored = false;
   const st = persist ? storage() : null;
@@ -59,7 +68,7 @@ export function createPreviewWorld(opts: { persist?: boolean; drive?: boolean; c
   }
 
   const persistNow = () => {
-    if (!st) return;
+    if (!st || persistFrozen) return;
     try { st.setItem(PREVIEW_STORAGE_KEY, JSON.stringify(world.exportState())); } catch (e) { console.warn("[files preview] not saved:", e); }
   };
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -77,6 +86,7 @@ export function createPreviewWorld(opts: { persist?: boolean; drive?: boolean; c
     });
     await device.save({ path: PREVIEW_SAMPLE, expectedHead: null, analysisId: file.manifest.analysis_id, docKey: newDocKey(), manifest: file.manifest, newParts: file.parts });
     clock.advance(0);
+    // A world saved by an earlier preview has no third computer yet: it gets the files the service holds.
     persistNow();
   })();
 
@@ -84,7 +94,8 @@ export function createPreviewWorld(opts: { persist?: boolean; drive?: boolean; c
     const iv = setInterval(() => clock.advance(250), 250);
     (iv as { unref?: () => void }).unref?.();
   }
-  return { world, clock, device, other, ready, persistNow };
+  if (restored) void Promise.resolve().then(() => { for (const p of world.cloudPaths()) world.deliver(third, p); clock.advance(0); });
+  return { world, clock, device, other, third, ready, persistNow };
 }
 
 let instance: PreviewWorld | null = null;

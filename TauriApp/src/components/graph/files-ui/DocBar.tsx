@@ -7,25 +7,26 @@ import { useFileSession } from "../file/session";
 import type { FileTab } from "../file/contract";
 import { BannerSlot } from "./BannerSlot";
 import { FileMenu } from "./FileMenu";
-import { REVEAL_LABEL, STATUS, V, shortcutText } from "./text";
+import { REVEAL_LABEL, STATUS, V, attemptBannerOf, bannerText, docStatusText, shortcutText } from "./text";
+import { useTicker } from "./useTicker";
 
 /** Height of the document bar. Fixed, so a banner appearing in it never moves the workspace. */
 export const DOC_BAR_HEIGHT = 60;
 
-function statusOf(tab: FileTab): string {
-  if (tab.status === "opening") return STATUS.opening;
-  if (tab.saving) return STATUS.saving;
-  if (tab.notSaved) return STATUS.notSaved;
-  if (tab.readOnly) return STATUS.readOnly;
-  if (tab.dirty) return STATUS.dirty;
-  return tab.path ? STATUS.saved : "";
-}
+/** Read-only because the file is too new, or because another computer is editing / a newer version is loading. */
+export const isReadOnlyTab = (tab: FileTab) => !!tab.readOnly || !!tab.presence?.readOnly;
 
 /** Title (the file name), the folder line with Show in Finder, the banner slot,
  *  the save state, Save and the File menu (contract §5.1 DocBar + BannerSlot). */
 export function DocBar({ tab }: { tab: FileTab }) {
-  const status = statusOf(tab);
-  const canSave = !tab.readOnly && !tab.saving && tab.status === "ready";
+  const settings = useFileSession((s) => s.settings);
+  // "Up to date · Alice saved 2 min ago" stays current.
+  const now = useTicker(30_000, !!tab.presence?.status);
+  const status = docStatusText(tab, settings, now);
+  const readOnly = isReadOnlyTab(tab);
+  const canSave = !readOnly && !tab.saving && tab.status === "ready";
+  const roBanner = readOnly ? attemptBannerOf(tab) : null;
+  const roWhy = roBanner ? bannerText(roBanner, settings) : "";
   const save = () => void useFileSession.getState().save(tab.key);
   const reveal = () => void useFileSession.getState().reveal(tab.key);
   const hasBanner = !!tab.banner;
@@ -39,7 +40,7 @@ export function DocBar({ tab }: { tab: FileTab }) {
   return (
     <Stack direction="row" alignItems="center" spacing={1.5} data-testid="doc-bar"
       sx={{ height: DOC_BAR_HEIGHT, flexShrink: 0, px: 2, py: 0.75, borderBottom: 1, borderColor: "divider", bgcolor: "background.default", minWidth: 0 }}>
-      <Box sx={{ minWidth: 120, maxWidth: hasBanner ? "26%" : "45%", flexShrink: 1 }}>
+      <Box sx={{ minWidth: 120, maxWidth: hasBanner ? "26%" : "45%", flexShrink: 0 }}>
         <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
           <Typography variant="subtitle1" noWrap data-testid="doc-title" title={tab.title}
             sx={{ fontWeight: 600, lineHeight: 1.25, minWidth: 0 }}>
@@ -50,7 +51,12 @@ export function DocBar({ tab }: { tab: FileTab }) {
               <Box aria-label={STATUS.dirty} sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: "warning.main", flexShrink: 0 }} />
             </Tooltip>
           )}
-          {tab.readOnly && <Chip size="small" variant="outlined" label={STATUS.readOnly} sx={{ height: 18, fontSize: 10.5 }} />}
+          {readOnly && (
+            <Tooltip title={roWhy} enterDelay={300}>
+              <Chip size="small" variant="outlined" label={STATUS.readOnly} data-testid="doc-readonly"
+                sx={{ height: 18, fontSize: 10.5, flexShrink: 0, "& .MuiChip-label": { px: 0.75 } }} />
+            </Tooltip>
+          )}
         </Stack>
         <Stack direction="row" spacing={0.5} alignItems="center" sx={{ minWidth: 0, height: 20 }}>
           {tab.path ? (
@@ -77,12 +83,18 @@ export function DocBar({ tab }: { tab: FileTab }) {
 
       <Stack direction="row" spacing={1} alignItems="center" sx={{ flexShrink: 0 }}>
         {tab.saving && <CircularProgress size={12} />}
-        <Typography variant="caption" color={tab.notSaved ? "warning.main" : "text.secondary"} noWrap data-testid="doc-status"
-          sx={{ display: hasBanner ? { xs: "none", lg: "block" } : "block" }}>
+        <Typography variant="caption" color={tab.notSaved ? "warning.main" : "text.secondary"} noWrap data-testid="doc-status" title={status}
+          sx={{
+            // Who saved stays visible beside a banner from md up while read-only (it replaces the per-save toasts; fixer F4).
+            display: hasBanner ? (readOnly && tab.presence?.status ? { xs: "none", md: "block" } : { xs: "none", lg: "block" }) : "block",
+            maxWidth: hasBanner ? 240 : 320, overflow: "hidden", textOverflow: "ellipsis",
+          }}>
           {status}
         </Typography>
-        <Tooltip title={shortcutText("s")}>
-          <span>
+        <Tooltip title={readOnly ? STATUS.readOnlySave : shortcutText("s")}>
+          {/* A click on the disabled Save of a read-only tab counts as an edit attempt (the banner's button pulses). */}
+          <span data-testid="doc-save-wrap"
+            onClick={() => { if (readOnly && !tab.saving) useFileSession.getState().reportEditAttempt("command", "save", tab.key); }}>
             <Button size="small" variant={tab.dirty ? "contained" : "outlined"} disabled={!canSave} onClick={save}
               data-testid="doc-save" startIcon={<SaveOutlinedIcon />}>
               Save

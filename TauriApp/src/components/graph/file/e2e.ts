@@ -26,25 +26,37 @@
    before the page listens (pending buffer), the rest while it runs (live event, sent by the runner after
    the result says stage "cold").
    "renamed" (after "missing"): the runner renamed movedDir/E2E C.lag to "E2E C renamed.lag" while the app was
-   closed; the tab must be on the new name at once (no waiting card, also in a cloud folder). */
+   closed; the tab must be on the new name at once (no waiting card, also in a cloud folder).
+   "presence" (phase 3, checklist E1–E9): `dir` is in LAS_NOTE_ROOTS and LAS_CLOUD_ROOTS, `otherDir` only in
+   LAS_NOTE_ROOTS (a local folder); LAS_NOTE_HEARTBEAT_MS is short. E1 my note on open (and none for a local file),
+   E2 editing / heartbeat / Save / 30 s later idle, E3 another computer's note makes the tab read-only (written by
+   the runner's writeText), E4 its save refreshes the read-only tab, E5 Edit here, E6 wake while holding with
+   unsaved changes → resuming, a note naming my claim → continued elsewhere, E8 File → Show Others… and Never,
+   E7 close tab → note gone; then a second file whose note is left as after a crash; quit as the script says
+   (the runner checks the folder after exit). "presenceRestart" (after quit "terminate"): the tab's note is
+   replaced (new session, seq continued); the other file's leftover is removed by the 20 s sweep. */
 
-import { useGraphStore } from "../../../store/graphStore";
+import { isDirty, useGraphStore } from "../../../store/graphStore";
 import { useFileSession } from "./session";
 import { tauriInvoke } from "./tauriBackend";
 import { buildNextFile, fileAt, newDocKey, openFile } from "./docCodec";
 import { editContent } from "./devSim";
 import { MENU, type FileTab, type PathPickerRequest, type RevisionP2 } from "./contract";
-import { canonicalJson, type GraphFileData, type SectionName } from "./format";
+import { canonicalJson, FEATURES, type GraphFileData, type SectionName } from "./format";
 import { combineDelayMs } from "./graphMerge";
 
 interface Script {
-  phase: "first" | "restore" | "missing" | "renamed" | "opens" | "combine" | "combineRestore";
+  phase: "first" | "restore" | "missing" | "renamed" | "opens" | "combine" | "combineRestore" | "presence" | "presenceRestart";
   roots: string[];
   dir: string;
   otherDir: string;
   movedDir?: string;
   opens?: string[];
   quit: "menu" | "window" | "terminate";
+  /** presenceRestart: what the killed run's note said (seq, session), copied by the runner. */
+  leftover?: { seq: number; session: string };
+  /** presence: the sync service `dir` must be detected as (the real folder rules, not LAS_CLOUD_ROOTS), e.g. "Dropbox". */
+  expectService?: string;
 }
 
 interface Step { name: string; ok: boolean; ms: number; detail?: unknown; error?: string }
@@ -159,6 +171,309 @@ export async function runE2EIfAsked(): Promise<void> {
     log(`quitting via ${script!.quit}`);
     await inv("dev_e2e_quit", { how: script!.quit });
   };
+
+
+  // ── phase 3 ──
+  const N = lag(script.dir, "E2E N"), N2 = lag(script.dir, "E2E N2"), L = lag(script.otherDir, "E2E L");
+  const OTHER_ID = "d-e2e-other-4f2a";
+  interface NoteLike { device_id: string; session_id: string; state: string; head: string | null; base_revision: string | null; epoch: number; seq: number; supersedes: { device_id: string; epoch: number }[] | null; analysis_id: string; document_name: string }
+  const parse = (text: string | null): NoteLike | null => {
+    if (!text) return null;
+    try { return JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)) as NoteLike; } catch { return null; }
+  };
+  const notesIn = async (dir: string) => (await fs<string[]>("list", dir)).filter((n) => n.toLowerCase().endsWith(".laguse") && !n.startsWith("."));
+  const myNote = async (doc: string): Promise<{ name: string; note: NoteLike } | null> => {
+    const d = await backend().device();
+    const dir = doc.slice(0, doc.lastIndexOf("/"));
+    for (const n of await notesIn(dir)) {
+      const note = parse(await fs<string | null>("readText", `${dir}/${n}`));
+      if (note && note.device_id === d.device_id && note.document_name === doc.slice(dir.length + 1)) return { name: n, note };
+    }
+    return null;
+  };
+  const foreignText = (doc: string, over: Partial<NoteLike> & { updated_at?: string }) => {
+    const t = activeTab()!;
+    const note = {
+      format: "lasgraph-presence", v: 1, analysis_id: t.analysisId, document_name: doc.slice(doc.lastIndexOf("/") + 1), device_id: OTHER_ID,
+      session_id: "s-e2e-other", device_name: "Other Mac", user_name: "Other Person", state: "editing", head: t.baseRevision,
+      base_revision: t.baseRevision, epoch: 1, seq: 1, supersedes: null, updated_at: new Date().toISOString(), request_to: null, handover_to: null,
+      features: 2, ...over,
+    };
+    return `Lab Analysis Suite note: shows who has this analysis open. Safe to delete.\n${JSON.stringify(note, null, 1)}\n`;
+  };
+  const foreignPath = (doc: string) => `${doc.slice(0, doc.lastIndexOf("/"))}/E2E N (in use on Other Mac, 4f2a).laguse`;
+  const guard = () => G().guard?.reason ?? null;
+
+  async function presencePhase(phase: "presence" | "presenceRestart"): Promise<void> {
+    if (phase === "presenceRestart") {
+      await step("E7b: after a kill, the reopened tab's note is replaced (new session, seq continued)", async () => {
+        const before = script!.leftover;
+        await until("tab restored", () => activeTab()?.path === N && !!G().doc, 20000);
+        const mine = await until("my note", async () => { const m = await myNote(N); return m && m.note.session_id !== before?.session ? m : null; }, 15000);
+        check(!before || mine!.note.seq > before.seq, `seq ${mine!.note.seq} after ${before?.seq}`);
+        return { note: mine!.note, before };
+      });
+      await step("E7c: the leftover note of a file that was not reopened goes after the 20 s sweep", async () => {
+        await until("N2's note removed", async () => !(await notesIn(script!.dir)).some((n) => n.startsWith("E2E N2 ")), 40000);
+        return { notes: await notesIn(script!.dir) };
+      });
+      await quitAndKeep();
+      return;
+    }
+    await step("settings: names", async () => { await S().setSettings({ userName: "E2E Person", deviceName: "E2E Mac" }); return S().settings; });
+    await step("E1: open in a cloud folder → my idle note (§1.1 / §1.2); a local folder → no note", async () => {
+      await S().newDoc("column", true);
+      nextPath = N;
+      const s = await S().save();
+      check(s.ok, `save ${JSON.stringify(s)}`);
+      const m = await until("my note", () => myNote(N), 15000);
+      const text = await fs<string>("readText", `${script!.dir}/${m!.name}`);
+      check(/^E2E N \(in use on E2E Mac, [0-9a-f]{4}\)\.laguse$/.test(m!.name), `name ${m!.name}`);
+      check(text.startsWith("Lab Analysis Suite note: shows who has this analysis open. Safe to delete.\n{\n \"format\": \"lasgraph-presence\""), "layout");
+      check(m!.note.state === "idle" && m!.note.head === activeTab()!.baseRevision, JSON.stringify(m!.note));
+      check(activeTab()!.presence?.sharing.why === "cloud", JSON.stringify(activeTab()!.presence?.sharing));
+      check(!script!.expectService || activeTab()!.presence?.sharing.service === script!.expectService, `service ${JSON.stringify(activeTab()!.presence?.sharing)}`);
+      check(activeTab()!.presence?.mine === "idle", `mine ${activeTab()!.presence?.mine}`);
+      await S().newDoc("column", true);
+      nextPath = L;
+      check((await S().save()).ok, "save L");
+      G().setCell(0, 0, 0, "local edit");
+      await sleep(1500);
+      check((await S().save()).ok, "save L again");
+      check((await notesIn(script!.otherDir)).length === 0, `notes in a local folder: ${await notesIn(script!.otherDir)}`);
+      await S().closeTab();
+      if (activeTab()?.path !== N) await S().switchTab(S().tabs.find((t) => t.path === N)!.key);
+      return { name: m!.name, note: m!.note, localNotes: await notesIn(script!.otherDir) };
+    });
+    await step("E2: an edit → editing (epoch + 1); heartbeat → seq grows; Save → the new head at once; 30 s later idle", async () => {
+      const e0 = (await myNote(N))!.note.epoch;
+      G().setCell(0, 0, 0, "1.5");
+      const ed = await until("editing", async () => { const m = await myNote(N); return m?.note.state === "editing" ? m : null; }, 10000);
+      check(ed!.note.epoch === e0 + 1 && ed!.note.base_revision === activeTab()!.baseRevision, JSON.stringify(ed!.note));
+      const s0 = ed!.note.seq;
+      await until("heartbeat", async () => ((await myNote(N))?.note.seq ?? 0) > s0, 20000);
+      check((await S().save()).ok, "save");
+      const head = activeTab()!.baseRevision;
+      const after = await until("new head", async () => { const m = await myNote(N); return m?.note.head === head ? m : null; }, 5000);
+      check(after!.note.state === "editing", "still editing after save");
+      const t0 = Date.now();
+      await until("idle 30 s later", async () => (await myNote(N))?.note.state === "idle", 45000);
+      const idleAfterMs = Date.now() - t0;
+      check(idleAfterMs > 20000, `idle only ${idleAfterMs} ms after the save (the 30 s linger)`);
+      return { idleAfterMs };
+    });
+    await step("E3: another computer's editing note on my version → read-only; a higher seq keeps it; deleted → editable", async () => {
+      await fs("writeText", foreignPath(N), foreignText(N, {}));
+      await until("read-only", () => guard() === "editingElsewhere", 15000);
+      const before = cell();
+      G().setCell(0, 0, 0, "refused");
+      check(cell() === before && !activeTab()!.dirty, "edit applied while read-only");
+      await fs("writeText", foreignPath(N), foreignText(N, { seq: 2 }));
+      await sleep(4000);
+      check(guard() === "editingElsewhere", `guard ${guard()}`);
+      await fs("remove", foreignPath(N));
+      await until("editable", () => guard() === null, 15000);
+      return { banner: activeTab()!.banner?.kind };
+    });
+    // ── integrator: the other computer's whole life cycle, played through note files only ──
+    const peerOf = () => activeTab()?.presence?.peers.find((p) => p.deviceId === OTHER_ID) ?? null;
+    const mode = () => activeTab()?.presence?.mode ?? null;
+    const gone = async () => { await fs("remove", foreignPath(N)).catch(() => undefined); await until("the note is forgotten", () => !peerOf(), 15000); };
+    await step("I1: another computer opens the file (idle note) → listed, still editable, no banner", async () => {
+      await fs("writeText", foreignPath(N), foreignText(N, { state: "idle", base_revision: null, epoch: 0, seq: 1 }));
+      const p = await until("the idle note is seen", () => peerOf(), 15000);
+      check(p!.state === "idle" && guard() === null && mode() === "editable" && !activeTab()!.presence!.readOnly, `${guard()} ${mode()}`);
+      check(!activeTab()!.banners.some((b) => ["editingElsewhere", "editingInfo", "waitingNewer"].includes(b.kind)), JSON.stringify(activeTab()!.banners.map((b) => b.kind)));
+      return { peer: p, mine: activeTab()!.presence!.mine };
+    });
+    await step("I2: it starts editing and its note beats (seq 2, 3, 4) → read-only all along; every edit path refused and counted", async () => {
+      await fs("writeText", foreignPath(N), foreignText(N, { epoch: 5, seq: 2 }));
+      await until("read-only", () => guard() === "editingElsewhere", 15000);
+      const pr = activeTab()!.presence!;
+      check(pr.mode === "readOnly" && pr.readOnly && pr.guard === "editingElsewhere", JSON.stringify({ mode: pr.mode, ro: pr.readOnly, g: pr.guard }));
+      const b = activeTab()!.banners.find((x) => x.kind === "editingElsewhere");
+      check(b && b.peers?.some((p) => p.deviceId === OTHER_ID) && b.actions.includes("editAnyway"), `banner ${JSON.stringify(b)}`);
+      const a0 = pr.attempt, bs0 = G().blocked?.serial ?? 0, before = cell();
+      G().setCell(0, 0, 0, "refused 1");
+      G().setAnalysis({});
+      G().insertRow(0);
+      const saved = await S().save();
+      check(cell() === before && !activeTab()!.dirty && !isDirty(G()), "an edit was applied while read-only");
+      check(!saved.ok && (saved as { reason?: string }).reason === "readOnly", `save while read-only: ${JSON.stringify(saved)}`);
+      check((G().blocked?.serial ?? 0) > bs0 && activeTab()!.presence!.attempt > a0, `attempts not counted: ${G().blocked?.serial} ${activeTab()!.presence!.attempt}`);
+      for (const seq of [3, 4]) {
+        await sleep(2000);
+        await fs("writeText", foreignPath(N), foreignText(N, { epoch: 5, seq }));
+      }
+      await until("seq 4 seen", () => (peerOf()?.changedAt ?? 0) > 0 && guard() === "editingElsewhere" && activeTab()!.presence!.peers[0]?.freshness === "active", 10000);
+      await sleep(3500);
+      check(guard() === "editingElsewhere" && mode() === "readOnly", `guard ${guard()} mode ${mode()}`);
+      return { attempts: activeTab()!.presence!.attempt, blocked: G().blocked };
+    });
+    await step("I3: it saves (new version, its note keeps editing on it) → my tab refreshes and stays read-only; then its note says idle → editable", async () => {
+      const ext = await externalEdit(N, lag(script!.otherDir, "stageI"));
+      await fs("writeText", foreignPath(N), foreignText(N, { epoch: 5, seq: 5, head: ext.head, base_revision: ext.head }));
+      await until("refreshed", () => activeTab()?.baseRevision === ext.head && cell() === ext.value, 20000);
+      await sleep(3500);
+      check(guard() === "editingElsewhere" && !activeTab()!.dirty, `guard ${guard()}`);
+      const status = activeTab()!.presence!.status;
+      check(status?.kind === "upToDate", `status ${JSON.stringify(status)}`);
+      check(!(result.toasts as string[]).some((t) => t.startsWith("reloaded")), `a reloaded toast: ${JSON.stringify(result.toasts)}`);
+      await fs("writeText", foreignPath(N), foreignText(N, { state: "idle", epoch: 5, seq: 6, head: ext.head, base_revision: null }));
+      await until("editable", () => guard() === null, 15000);
+      check(mode() === "editable" && !activeTab()!.presence!.readOnly, `mode ${mode()}`);
+      return { head: ext.head, status };
+    });
+    await step("I4: a note already 20 min old when first seen (a crash leftover) → editable at once, information only, [Edit here] offered", async () => {
+      await gone();
+      const old = new Date(Date.now() - 20 * 60_000).toISOString();
+      await fs("writeText", foreignPath(N), foreignText(N, { epoch: 6, seq: 1, updated_at: old, user_name: "E2E Person" } as Partial<NoteLike>));
+      const p = await until("the old note is seen", () => peerOf(), 15000);
+      await sleep(3500);
+      check(guard() === null && mode() === "info" && p!.freshness === "quiet", `guard ${guard()} mode ${mode()} ${p!.freshness}`);
+      const b = activeTab()!.banners.find((x) => x.kind === "editingInfo");
+      check(b && b.actions.includes("editHere"), `banner ${JSON.stringify(b)}`);
+      return { peer: peerOf(), banner: b };
+    });
+    await step("I5: a fresh editing note that never changes → read-only, then editable ~90 s after it was first seen (this computer's clock)", async () => {
+      await gone();
+      await fs("writeText", foreignPath(N), foreignText(N, { epoch: 7, seq: 1 }));
+      await until("read-only", () => guard() === "editingElsewhere", 15000);
+      const t0 = Date.now();
+      await until("quiet → editable", () => guard() === null, 120000);
+      const ms = Date.now() - t0;
+      check(ms > 75_000 && ms < 105_000, `editable after ${ms} ms`);
+      check(mode() === "info", `mode ${mode()}`);
+      return { editableAfterMs: ms };
+    });
+    await step("I6: its note deleted → forgotten at once, editable, no presence banner", async () => {
+      await gone();
+      check(guard() === null && mode() === "editable", `guard ${guard()} mode ${mode()}`);
+      check(!activeTab()!.banners.some((b) => ["editingElsewhere", "editingInfo", "waitingNewer", "bothEditing"].includes(b.kind)), JSON.stringify(activeTab()!.banners.map((b) => b.kind)));
+      return { banners: activeTab()!.banners.map((b) => b.kind) };
+    });
+    await step("E4: while read-only, the other computer's save (and its note on the new version) refreshes the tab", async () => {
+      await fs("writeText", foreignPath(N), foreignText(N, { seq: 3, epoch: 2 }));
+      await until("read-only", () => guard() === "editingElsewhere", 15000);
+      const ext = await externalEdit(N, lag(script!.otherDir, "stageP"));
+      await fs("writeText", foreignPath(N), foreignText(N, { seq: 4, epoch: 2, head: ext.head, base_revision: ext.head }));
+      await until("refreshed", () => activeTab()?.baseRevision === ext.head && cell() === ext.value, 20000);
+      await sleep(3000);
+      check(guard() === "editingElsewhere", `guard ${guard()}`);
+      return { ...ext, status: activeTab()!.presence?.status };
+    });
+    await step("E5: Edit here → my note overrides that claim; editable", async () => {
+      check(await S().editHere(undefined, true), "editHere");
+      check(guard() === null, `guard ${guard()}`);
+      check(activeTab()!.presence?.mode === "bothEditing" && !activeTab()!.presence?.readOnly, `mode ${activeTab()!.presence?.mode}`);
+      const m = await until("my note overrides", async () => { const x = await myNote(N); return x?.note.supersedes?.some((t) => t.device_id === OTHER_ID && t.epoch === 2) ? x : null; }, 10000);
+      check(m!.note.state === "editing" && m!.note.base_revision === activeTab()!.baseRevision, JSON.stringify(m!.note));
+      return m!.note;
+    });
+    await step("E5b (fixer round 2, RV-4): 35 s after Edit here without typing → still editable, my note still editing", async () => {
+      await sleep(35000);
+      check(guard() === null && !activeTab()!.presence?.readOnly, `guard ${guard()} mode ${mode()}`);
+      const m = (await myNote(N))!;
+      check(m.note.state === "editing", `my note ${JSON.stringify(m.note)}`);
+      return { mode: mode(), note: m.note };
+    });
+    await step("E5c (fixer round 2, RV-4): the other computer presses Edit here back → read-only at once, my note idle; its note gone → editable", async () => {
+      const mine = (await myNote(N))!.note;
+      const t0 = Date.now();
+      await fs("writeText", foreignPath(N), foreignText(N, { seq: 5, epoch: 3, supersedes: [{ device_id: mine.device_id, epoch: mine.epoch }] }));
+      await until("read-only", () => guard() === "editingElsewhere", 15000);
+      const ms = Date.now() - t0;
+      await until("my note idle", async () => (await myNote(N))?.note.state === "idle", 10000);
+      await fs("remove", foreignPath(N));
+      await until("editable", () => guard() === null, 15000);
+      // Editing again (a new claim), so the next step starts from a holding tab as before.
+      const t1 = Date.now();
+      G().setCell(0, 0, 0, "after Edit here back");
+      const again = await until("my note editing again", async () => { const x = await myNote(N); return x?.note.state === "editing" && x.note.epoch > mine.epoch ? x : null; }, 10000);
+      return { readOnlyAfterMs: ms, editingAgainAfterMs: Date.now() - t1, epoch: again!.note.epoch };
+    });
+    await step("E6: wake while holding with unsaved changes → resuming; a note naming my claim → continued elsewhere, content intact", async () => {
+      G().setCell(0, 0, 0, "unsaved before sleep");
+      await until("dirty", () => activeTab()?.dirty);
+      await fs("wake", "120000");
+      await until("resuming", () => guard() === "resuming", 10000);
+      const mine = (await myNote(N))!.note;
+      await fs("writeText", foreignPath(N), foreignText(N, { seq: 9, epoch: 3, supersedes: [{ device_id: mine.device_id, epoch: mine.epoch }] }));
+      await until("continued elsewhere", () => activeTab()?.banners.some((b) => b.kind === "continuedElsewhere"), 15000);
+      check(guard() === null && cell() === "unsaved before sleep", `guard ${guard()} cell ${cell()}`);
+      await fs("remove", foreignPath(N));
+      check((await S().save()).ok, "save");
+      return { banners: activeTab()!.banners.map((b) => b.kind) };
+    });
+    await step("E8: File → Show Others When I'm Editing… → the dialog; Never removes my note", async () => {
+      await fs("menu", "file.sharing");
+      await until("sharing dialog", () => S().dialog?.kind === "sharing", 10000);
+      await S().setSharing(activeTab()!.key, "never");
+      await until("note removed", async () => !(await myNote(N)), 10000);
+      S().closeDialog();
+      await S().setSharing(activeTab()!.key, null);
+      await until("note back", () => myNote(N), 10000);
+      return { ok: true };
+    });
+    await step("E7: close the tab → the note is gone; reopen", async () => {
+      await sleep(31000);
+      await S().closeTab();
+      await until("note gone", async () => !(await myNote(N)), 10000);
+      check((await S().open(N)).ok, "reopen");
+      await until("note back", () => myNote(N), 10000);
+      return { notes: await notesIn(script!.dir) };
+    });
+    await step("E10 (fixer round 2, RV-2): the open file moved to another folder → Find it… → my note beside it there, none left at the old place; and back", async () => {
+      const sub = `${script!.dir}/Moved`;
+      const moved = lag(sub, "E2E N");
+      await fs("mkdir", sub);
+      const relocate = async (from: string, to: string, dir: string) => {
+        const key = activeTab()!.key;
+        await fs("rename", from, to);
+        const how = await until("missing or followed", () => activeTab()?.path === to ? "followed"
+          : activeTab()?.banners.some((b) => b.kind === "missing") ? "missing" : null, 30000);
+        if (how === "missing") {
+          await S().findIt(key, dir);
+          await until("tab re-pointed", () => activeTab()?.path === to, 30000);
+        }
+        const m = await until("my note at the new place", () => myNote(to), 15000);
+        check(m!.note.document_name === "E2E N.lag", JSON.stringify(m!.note));
+        await until("no note of mine left at the old place", async () => !(await myNote(from)), 15000);
+        G().setCell(0, 0, 0, `typed after ${how}`);
+        const ed = await until("editing at the new place", async () => { const x = await myNote(to); return x?.note.state === "editing" ? x : null; }, 10000);
+        check((await S().save()).ok, "save");
+        return { how, note: m!.name, editing: ed!.note.epoch };
+      };
+      const there = await relocate(N, moved, sub);
+      const back = await relocate(moved, N, script!.dir);
+      return { there, back, notes: await notesIn(script!.dir), sub: await notesIn(sub) };
+    });
+    await step("E9: the note's name passes the name rules", async () => {
+      const names = await notesIn(script!.dir);
+      for (const n of names) check(!n.startsWith(".") && !n.startsWith("~") && !/[\\/:*?"<>|]/.test(n) && n.length < 220 && n.endsWith(").laguse"), n);
+      return names;
+    });
+    if (script!.quit === "terminate") {
+      await step("a second file whose note is left as after a crash", async () => {
+        check((await S().open(N2)).ok || (await (async () => { await S().newDoc("column"); nextPath = N2; return (await S().save()).ok; })()), "N2");
+        await until("N2 note", () => myNote(N2), 10000);
+        const be = backend();
+        const clear = be.presenceClear;
+        be.presenceClear = async () => undefined;          // as if the app died before removing it
+        try { await S().closeTab(); } finally { be.presenceClear = clear; }
+        await S().switchTab(S().tabs.find((t) => t.path === N)!.key);
+        G().setCell(0, 0, 0, "editing when killed");
+        const m = await until("editing", async () => { const x = await myNote(N); return x?.note.state === "editing" ? x : null; }, 10000);
+        result.leftover = { seq: m!.note.seq, session: m!.note.session_id };
+        return { notes: await notesIn(script!.dir) };
+      });
+      // E7: the runner kills the app now (SIGKILL: no quit routine), as a crash would.
+      result.readyToKill = true;
+      await write();
+      return;
+    }
+    await quitAndKeep();
+  }
 
   try {
     await until("controller ready", () => S().ready, 30000);
@@ -575,7 +890,7 @@ export async function runE2EIfAsked(): Promise<void> {
           check(!!a && canonicalJson({ ...a, sections: null }) === canonicalJson({ ...r, sections: null }), `old version ${r.id} unchanged`);
         }
         const h = revOf(after, after.manifest.head)!;
-        check(h.kind === "merge" && h.parents.includes(ext.head) && after.manifest.format_version === 1 && after.manifest.min_reader_version === 1 && after.manifest.features === 1, `head ${JSON.stringify(h.parents)} format ${after.manifest.format_version}/${after.manifest.min_reader_version}/${after.manifest.features}`);
+        check(h.kind === "merge" && h.parents.includes(ext.head) && after.manifest.format_version === 1 && after.manifest.min_reader_version === 1 && after.manifest.features === FEATURES, `head ${JSON.stringify(h.parents)} format ${after.manifest.format_version}/${after.manifest.min_reader_version}/${after.manifest.features}`);
         check(openFile(after)!.doc.cells[0][0][0] === "321", "my value");
         await S().openVersions();
         await until("versions listed", () => !!S().versions && !S().versions!.loading && S().versions!.rows.length === after.manifest.revisions.length, 15000);
@@ -609,6 +924,11 @@ export async function runE2EIfAsked(): Promise<void> {
         return rows;
       });
       await quitAndKeep();
+      return;
+    }
+
+    if (script.phase === "presence" || script.phase === "presenceRestart") {
+      await presencePhase(script.phase);
       return;
     }
 

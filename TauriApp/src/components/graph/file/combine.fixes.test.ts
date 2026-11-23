@@ -77,7 +77,7 @@ describe("merge F1: an edit typed while Save meets another version is kept", () 
 
 describe("merge F2 / safety F3: combining with an extra copy while the tab's own file is ahead", () => {
   it("unsaved changes + a newer version in the file + a diverged copy: Combine… takes in the file first, then the copy", async () => {
-    const s = await pair(500);
+    const s = await pair(500, "dropbox", { notes: false });     // phase 3: edits on both computers within seconds
     const { a, b } = s;
     const seed = b.dev.localFile(P)!;
     await editCell(b, "B saved", 1); await b.ses.getState().save(); await syncPair(s);
