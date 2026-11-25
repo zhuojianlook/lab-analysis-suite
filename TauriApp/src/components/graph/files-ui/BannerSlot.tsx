@@ -44,8 +44,10 @@ const ICONS: Record<Severity, typeof InfoOutlinedIcon> = {
   error: ErrorOutlineIcon, warning: WarningAmberIcon, info: InfoOutlinedIcon, success: CheckCircleOutlineIcon,
 };
 
-function BannerBody({ tab, banner, compact, more, onMore, pulse }: {
+function BannerBody({ tab, banner, compact, more, onMore, pulse, onExpand }: {
   tab: FileTab; banner: TabBanner; compact: boolean; more?: number; onMore?: () => void; pulse?: number;
+  /** Fixer VUX-10: a click on the (possibly cut) text of the compact banner shows it in full. */
+  onExpand?: () => void;
 }) {
   const theme = useTheme();
   const settings = useFileSession((s) => s.settings);
@@ -76,9 +78,10 @@ function BannerBody({ tab, banner, compact, more, onMore, pulse }: {
         ? <CircularProgress size={15} sx={{ color, flexShrink: 0 }} data-testid="banner-combining" />
         : <Icon sx={{ fontSize: 18, color, flexShrink: 0 }} />}
       <Tooltip title={compact ? text : ""} placement="bottom-start" enterDelay={600}>
-        <Typography variant="body2" sx={{
+        <Typography variant="body2" data-testid="banner-text" onClick={compact ? onExpand : undefined} sx={{
           flexGrow: 1, minWidth: 0, fontSize: 12.5, lineHeight: 1.3,
           ...(compact ? { fontSize: 12, lineHeight: 1.25, display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden" } : {}),
+          ...(compact && onExpand ? { cursor: "pointer" } : {}),
         }}>
           {text}
         </Typography>
@@ -89,7 +92,7 @@ function BannerBody({ tab, banner, compact, more, onMore, pulse }: {
             data-testid={`banner-${a}`} data-pulse={i === 0 && pulseButton ? "true" : undefined}
             onClick={() => act(a)}
             sx={{ whiteSpace: "nowrap", py: 0.25, borderColor: alpha(color, 0.6), ...(i === 0 && pulseButton ? pulseSx : {}) }}>
-            {bannerActionLabel(banner.kind, a)}
+            {bannerActionLabel(banner.kind, a, banner.state)}
           </Button>
         ))}
         {more ? (
@@ -120,6 +123,7 @@ export function BannerSlot({ tab }: { tab: FileTab }) {
   // with a detached anchor — fixer F1).
   const slotRef = useRef<HTMLDivElement | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [fullOpen, setFullOpen] = useState(false);
   const pulse = useAttemptPulse(tab);
   // While another computer is editing, the banner that says who (and offers Edit here) is always the main one, not
   // under "+n more" (fixer F3). A refused edit shows the banner that explains it as the main one while it pulses.
@@ -128,12 +132,19 @@ export function BannerSlot({ tab }: { tab: FileTab }) {
   const banner = target ?? roMain ?? tab.banner;
   const rest = banner ? tab.banners.filter((b) => b !== banner) : [];
   const mainId = banner?.id ?? null;
-  useEffect(() => { setMoreOpen(false); }, [mainId, tab.key]);
+  useEffect(() => { setMoreOpen(false); setFullOpen(false); }, [mainId, tab.key]);
   useEffect(() => { if (rest.length === 0) setMoreOpen(false); }, [rest.length]);
   if (!banner) return null;
   return (
     <Box ref={slotRef} sx={{ display: "flex", alignItems: "center", flexGrow: 1, minWidth: 0, height: "100%" }}>
-      <BannerBody key={banner.id} tab={tab} banner={banner} compact more={rest.length} onMore={() => setMoreOpen(true)} pulse={target ? pulse.n : undefined} />
+      <BannerBody key={banner.id} tab={tab} banner={banner} compact more={rest.length} onMore={() => setMoreOpen(true)} pulse={target ? pulse.n : undefined}
+        onExpand={() => setFullOpen(true)} />
+      <Popover open={fullOpen && !!slotRef.current} anchorEl={() => slotRef.current!} onClose={() => setFullOpen(false)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "left" }} transformOrigin={{ vertical: "top", horizontal: "left" }}>
+        <Box sx={{ p: 1, width: 560, maxWidth: "90vw" }} data-testid="banner-full">
+          <BannerBody tab={tab} banner={banner} compact={false} />
+        </Box>
+      </Popover>
       <Popover open={moreOpen && rest.length > 0 && !!slotRef.current} anchorEl={() => slotRef.current!} onClose={() => setMoreOpen(false)}
         anchorOrigin={{ vertical: "bottom", horizontal: "right" }} transformOrigin={{ vertical: "top", horizontal: "right" }}>
         <Box sx={{ p: 1, width: 560, maxWidth: "90vw" }}>

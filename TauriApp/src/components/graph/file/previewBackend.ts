@@ -7,7 +7,7 @@
 
 import { sampleDoc } from "../graphModel";
 import { openContent } from "../../../store/graphStore";
-import type { AppInfo } from "./contract";
+import { COMBINE_V, type AppInfo } from "./contract";
 import { buildNewFile, newAnalysisId, newDocKey, type Author } from "./docCodec";
 import { ManualClock, MemoryWorld, type MemoryDevice, type MemoryWorldState } from "./memoryBackend";
 
@@ -81,9 +81,11 @@ export function createPreviewWorld(opts: { persist?: boolean; drive?: boolean; c
     if (restored) return;
     const doc = sampleDoc("column");
     const content = openContent({ doc });
-    const file = await buildNewFile({
+    const file0 = await buildNewFile({
       content, analysisId: newAnalysisId(), forkedFrom: null, time: clock.now(), author: authorOf(device, "Me"),
     });
+    // Phase 4 §5.6: made by this build, so it carries the rules' version like everything the app writes.
+    const file = { ...file0, manifest: { ...file0.manifest, revisions: file0.manifest.revisions.map((r) => ({ ...r, combine_v: COMBINE_V })) } };
     await device.save({ path: PREVIEW_SAMPLE, expectedHead: null, analysisId: file.manifest.analysis_id, docKey: newDocKey(), manifest: file.manifest, newParts: file.parts });
     clock.advance(0);
     // A world saved by an earlier preview has no third computer yet: it gets the files the service holds.

@@ -16,7 +16,12 @@ import type { MemoryDevice, MemoryWorld } from "./memoryBackend";
 const flags = vi.hoisted(() => ({ fallback: false }));
 vi.mock("./graphMerge", async (importOriginal) => {
   const m = await importOriginal<typeof import("./graphMerge")>();
-  return { ...m, combine: async (input: Parameters<typeof m.combine>[0]) => (flags.fallback ? { ok: false as const, reason: "unreadable" as const, side: "theirs" as const } : m.combine(input)) };
+  // Phase 4: the controller combines through combineFine; both are made to fail.
+  return {
+    ...m,
+    combine: async (input: Parameters<typeof m.combine>[0]) => (flags.fallback ? { ok: false as const, reason: "unreadable" as const, side: "theirs" as const } : m.combine(input)),
+    combineFine: async (input: Parameters<typeof m.combineFine>[0]) => (flags.fallback ? { ok: false as const, reason: "unreadable" as const, side: "theirs" as const } : m.combineFine(input)),
+  };
 });
 afterEach(() => { flags.fallback = false; });
 

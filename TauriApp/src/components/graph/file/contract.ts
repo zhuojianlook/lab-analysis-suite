@@ -15,7 +15,11 @@
 
    Phase 3 ("Check-out": read-only on the other computers while one is editing,
    phase3-contract.md) is section 7 at the end, plus the members marked
-   "Phase 3" above. */
+   "Phase 3" above.
+
+   Phase 4 ("Fine-level combining": rows, cells, single settings and scratchpad
+   cells instead of whole sections, phase4-contract.md) is section 8 at the
+   end, plus the members marked "Phase 4" above. */
 
 import type { Template } from "../../../api/graph";
 import type {
@@ -25,6 +29,7 @@ import type {
 import type { FileHeader, GraphFileData, Manifest, PartRef, Revision, RevisionKind, SectionName } from "./format";
 import type { DocContent } from "../../../store/graphStore";
 import type { FileError } from "./backend";
+import type { FileAnalysis, FileFigure, FileTable } from "./idMap";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Constants
@@ -536,11 +541,15 @@ export interface TabBanner {
   when?: string;            // ISO time (drafts)
   message?: string;         // saveFailed: a plain sentence
   /** Phase 2, savedOver only. "combining": both versions are being combined automatically (no buttons).
-   *  "choose": they could not be combined without a choice (button `combine`). Absent = the phase 1
+   *  "choose": they could not be combined without a choice (button `combine`).
+   *  Phase 4, "review": nothing needs a choice, but the combine is not written without a click
+   *  (button `combine`; phase 4 contract §4.2). Absent = the phase 1
    *  meaning (my version was saved as a copy: `name` / `path`). */
-  state?: "combining" | "choose";
+  state?: "combining" | "choose" | "review";
   /** Phase 2, combined only: the sections taken from the other version. */
   sections?: SectionName[];
+  /** Phase 4, combined only: the sections that now hold changes from both versions (combined inside). */
+  mixed?: SectionName[];
   /** Phase 3: who the banner is about (kinds resuming, continuedElsewhere, bothEditing, waitingNewer,
    *  editingElsewhere, editingInfo, olderPeer), most relevant first. */
   peers?: PeerView[];
@@ -2028,4 +2037,368 @@ export interface DevSimApiP3 extends DevSimApiP2 {
   setOffline(on: boolean): void;
   /** This computer sleeps for `ms` and wakes up: simulated time jumps, no timer runs in between. */
   sleep(ms: number): void;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. Phase 4 — fine-level combining (docs/design/analysis-files-phase4-contract.md)
+//
+// Additive. Nothing in the file format changes: no new part, no new manifest
+// field, `features` stays 2, the id of a combined version keeps its formula.
+// A section both sides changed is no longer one choice: the data table is
+// combined by row / column id and cell, the analysis and graph settings field
+// by field, the scratchpad cell by cell. The controller's store becomes
+// FileSessionStateP4, the simulator DevSimApiP4. Types and constants only.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Version of the fine-level combining rules of this build. Written as `combine_v` into every version
+ *  this build makes; two computers combine a pair without being asked only when both versions of the
+ *  pair carry this number (phase 4 contract §3.3). It changes whenever a rule of §2 changes a result. */
+export const COMBINE_V = 1;
+
+/** Numbers of phase 4. */
+export const LIMITS_P4 = {
+  /** Scratchpad shift check: more than this share of the common version's cells changed on one side … */
+  shiftChangedShare: 0.3,
+  /** … counted only when the common version has at least this many cells. */
+  shiftMinBaseCells: 10,
+  /** Scratchpad shift check, moved content: at least this many changed cells reappear at one offset … */
+  shiftOffsetMinCells: 5,
+  /** … and they are at least this share of the cells that side changed. */
+  shiftOffsetShare: 0.5,
+  /** Places looked at per changed cell when looking for where its content went (row-major, first ones). */
+  shiftSameInputCap: 50,
+  /** "Both side by side": blank columns between mine and theirs. */
+  bothGapCols: 1,
+  /** Hex digits (of a SHA-256) in the id of a blank row the combine has to add. */
+  fillIdHex: 12,
+  /** FineConflict.items / CombineSectionP4.auto: most entries listed (the rest is counted). */
+  conflictItems: 24,
+  autoItems: 50,
+  /** Conflicts of one section the dialog draws (the rest is reached with "use … for all"). */
+  dialogConflicts: 200,
+  /** Most entries of an "Adjusted automatically" list. */
+  adjustments: 50,
+} as const;
+
+/** A revision as phase 4 writes it. */
+export interface RevisionP4 extends RevisionP2 {
+  /** COMBINE_V of the app that made this version (saves, working copies, brought-back and combined
+   *  versions alike). Absent on versions made by exp-0.2.25 and older. */
+  combine_v?: number;
+}
+
+/** What orders the two sides wherever an order is needed (same-place insertions): the side with the
+ *  smaller `deviceId` (plain string compare) is FIRST; equal → the smaller `revisionId`; still equal →
+ *  mine. Both come from the side's revision (`device_id`, `id`), never from the computer that combines. */
+export interface SideKey {
+  deviceId: string;
+  revisionId: string;
+}
+
+export type FineChoice = "mine" | "theirs" | "both";
+/** Conflict id → choice. */
+export type FineChoices = Readonly<Record<string, FineChoice>>;
+
+/** Graph settings that are only ever taken together. */
+export type FigureGroup = "colours" | "size" | "yRange";
+/** The top-level fields of each group. "colours" additionally holds the colour of every column both sides have. */
+export const FIGURE_GROUPS: Readonly<Record<FigureGroup, readonly string[]>> = {
+  colours: ["palette", "palette_colors", "palette_reverse", "palette_edited", "axis_scheme"],
+  size: ["width", "height", "dpi"],
+  yRange: ["y_min", "y_max"],
+};
+
+/** section:     the whole section is one choice (`reason` says why). id "<section>:section".
+ *  row:         cells, the row title or the X value of one row were changed differently. id "table:row:<row id>".
+ *  rowDeleted:  one side deleted the row, the other changed something in it. id "table:row:<row id>".
+ *  colDeleted:  the same for a column. id "table:col:<col id>".
+ *  colTitle:    id "table:coltitle:<col id>".
+ *  tableField:  the X column's title. id "table:field:x_title".
+ *  field:       one analysis or graph setting. id "analysis:field:<key>" / "figure:field:<key>".
+ *  group:       a FigureGroup. id "figure:group:<group>".
+ *  seriesLabel: the legend label of one column. id "figure:label:<col id>".
+ *  cell:        one scratchpad cell. id "scratchpad:cell:<A1 address>". */
+export type FineConflictKind =
+  | "section" | "row" | "rowDeleted" | "colDeleted" | "colTitle" | "tableField" | "field" | "group" | "seriesLabel" | "cell";
+
+/** Why a section is one whole choice. twoWay: no common version can be compared. shift: the scratchpad
+ *  was rearranged on one side. table: the two tables cannot be combined row by row (§2.2.9). */
+export type WholeReason = "twoWay" | "shift" | "table";
+
+/** One value that differs, for display. Texts: table cells and titles as typed; settings by the short-text
+ *  rule (§2.1.5); a scratchpad cell's input (`what: "scratch"`) and number format (`"scratchFormat"`).
+ *  null = that side does not have the place (row, column or field missing there). */
+export interface FineItem {
+  what: "cell" | "rowTitle" | "x" | "colTitle" | "xTitle" | "field" | "seriesColor" | "seriesLabel" | "scratch" | "scratchFormat";
+  rowId?: string;
+  colId?: string;
+  /** Replicate, 0-based (`what: "cell"`). */
+  rep?: number;
+  /** Top-level field name (`what: "field"`). */
+  field?: string;
+  /** "B12" (`what: "scratch"` / `"scratchFormat"`). */
+  addr?: string;
+  base: string | null;
+  mine: string | null;
+  theirs: string | null;
+}
+
+export interface FineConflict {
+  /** Stable for a pair of versions: built only from the section name, the kind's prefix and ids / field names / addresses. */
+  id: string;
+  section: SectionName;
+  kind: FineConflictKind;
+  rowId?: string;
+  colId?: string;
+  field?: string;
+  group?: FigureGroup;
+  /** Scratchpad cell, "B12"; `row` / `col` are its 1-based numbers. */
+  addr?: string;
+  row?: number;
+  col?: number;
+  /** rowDeleted / colDeleted: the side that deleted it (choosing that side removes it). */
+  deletedBy?: SidePick;
+  /** kind "section". */
+  reason?: WholeReason;
+  /** What may be chosen, in display order. "both" only for the scratchpad's shift choice, and only when it fits. */
+  options: readonly FineChoice[];
+  /** What differs between the two sides here, at most LIMITS_P4.conflictItems (table order / key order). Empty for kind "section". */
+  items: FineItem[];
+  /** Further differing values that are not listed. */
+  more: number;
+}
+
+/** One change that was taken without a choice ("Combined automatically"). `from`: the side that made it; "same" = both made it. */
+export interface FineAuto {
+  what:
+    | "cell" | "rowTitle" | "x" | "colTitle" | "xTitle" | "replicates"
+    | "rowAdded" | "rowRemoved" | "colAdded" | "colRemoved"
+    | "field" | "group" | "seriesLabel" | "scratch" | "colWidth";
+  from: SidePick | "same";
+  rowId?: string;
+  colId?: string;
+  rep?: number;
+  field?: string;
+  group?: FigureGroup;
+  addr?: string;
+  /** Short text of the value in the common version / in the result (null = not there). */
+  before: string | null;
+  after: string | null;
+}
+
+/** Rows (or columns) both sides added in the same place: their order is a rule, not a fact. */
+export interface OrderCheck {
+  axis: "row" | "col";
+  /** The run of added ids, in the result's order ([] when the shared rows themselves were in different orders). */
+  ids: string[];
+  /** The order means something here (columns: always; rows: grouped and XY tables, and paired tests). Then a person looks before it is written. */
+  matters: boolean;
+}
+
+/** setting:     the load pipeline changed a stored analysis / graph setting (`field`; a graph series is "series.<col id>").
+ *  testNotRun:  the chosen test cannot run on the combined table (it is sent as "none").
+ *  comparisons: chosen pairs or the control group are not used with the combined table.
+ *  replicates:  the replicate count was raised so that no value is dropped.
+ *  table / scratchpad: the load pipeline changed that section. */
+export type AdjustKind = "setting" | "testNotRun" | "comparisons" | "replicates" | "table" | "scratchpad";
+
+export interface FineAdjustment {
+  section: SectionName;
+  kind: AdjustKind;
+  field?: string;
+  /** Short text before / after (null = not there). */
+  from: string | null;
+  to: string | null;
+}
+
+/** What every fine-level module returns for one section. */
+export interface FineMerge<T> {
+  /** The combined section in file form, already in the form the load pipeline gives it. null: a conflict has no choice yet. */
+  value: T | null;
+  /** Every conflict, whatever the choices. Display order (§2). */
+  conflicts: FineConflict[];
+  /** Number of changes taken without a choice, and the first LIMITS_P4.autoItems of them. */
+  combined: number;
+  auto: FineAuto[];
+  orderChecks: OrderCheck[];
+  /** Adjustments the module itself made (the table's replicate count). */
+  adjustments: FineAdjustment[];
+}
+
+/** Fixer round 2 (findings RV-1, RV-3; additive, display only): rows that share an id on the two sides but are not
+ *  the same row there. Only set when there are any. */
+export interface TableRowNotes {
+  /** Rows blank in the common version that both sides typed different things into (§2.2.2, M1): one row added on
+   *  each side, not a changed row. */
+  split: string[];
+  /** A row an earlier combine moved to a new id (`id`) that `side` still has under its old id (`was`): that side's
+   *  row `was` is compared with, and combined into, row `id`. */
+  moved: { id: string; was: string; side: SidePick }[];
+}
+
+export interface TableMerge extends FineMerge<FileTable> {
+  /** Set when the table is one whole choice (then `conflicts` is the single "table:section"). */
+  whole: WholeReason | null;
+  /** Fixer round 2: see TableRowNotes. Absent when empty. */
+  rowNotes?: TableRowNotes;
+}
+
+export interface ScratchMerge extends FineMerge<unknown | null> {
+  /** The shift check fired (then `conflicts` is the single "scratchpad:section"). */
+  shift: boolean;
+}
+
+/** file/mergeTable.ts (§2.2). Async only for hashing. */
+export interface MergeTableApi {
+  /** Three-way. Sides are tables in file form after the load pipeline (NormalisedSide.sections.table). */
+  mergeTable(
+    input: { base: FileTable; mine: FileTable; theirs: FileTable; mineKey: SideKey; theirsKey: SideKey },
+    choices?: FineChoices,
+  ): Promise<TableMerge>;
+  /** The order rule on its own (§2.2.4): `first` / `second` by SideKey, `kept` = ids in the result. */
+  mergeOrder(base: readonly string[], first: readonly string[], second: readonly string[], kept: ReadonlySet<string>): string[];
+}
+
+/** file/mergeFields.ts (§2.3, §2.4, §2.6). No I/O, synchronous. */
+export interface MergeFieldsApi {
+  mergeAnalysis(input: { base: FileAnalysis; mine: FileAnalysis; theirs: FileAnalysis }, choices?: FineChoices): FineMerge<FileAnalysis>;
+  /** `colIds`: the result table's column ids in order; null while the table still needs a choice (then `value` is null). */
+  mergeFigure(
+    input: { base: FileFigure; mine: FileFigure; theirs: FileFigure; colIds: readonly string[] | null },
+    choices?: FineChoices,
+  ): FineMerge<FileFigure>;
+  /** What the load pipeline and the plot request change in a put-together result (§2.6). `assembled`: the four
+   *  sections before the pipeline; `result`: after it. */
+  detectAdjustments(p: {
+    assembled: SectionValues; result: NormalisedSide; mine: NormalisedSide; theirs: NormalisedSide;
+  }): FineAdjustment[];
+  /** The short text of a setting's value (§2.1.5). */
+  shortText(v: unknown): string;
+}
+
+/** file/mergeScratch.ts (§2.5). No I/O, synchronous. Sides are the scratchpad section in file form (object or null). */
+export interface MergeScratchApi {
+  mergeScratch(input: { base: unknown | null; mine: unknown | null; theirs: unknown | null }, choices?: FineChoices): ScratchMerge;
+  /** Was `side` rearranged against `base` (either rule of §2.5.2)? */
+  shiftCheck(base: unknown | null, side: unknown | null): boolean;
+  /** A cell input with every column reference moved `dCols` to the right (text that is not a formula is returned as it is).
+   *  null: a reference would leave the sheet. */
+  shiftFormula(input: string, dCols: number): string | null;
+  /** Mine with theirs placed to its right (§2.5.4); null when it does not fit. */
+  sideBySide(mine: unknown | null, theirs: unknown | null): unknown | null;
+}
+
+export interface CombineSectionP4 extends CombineSection {
+  /** whole: the section comes from one side as it is (status same / mine / theirs, or one "section" conflict).
+   *  fine: both changed it and it is combined inside. */
+  level: "whole" | "fine";
+  /** [] unless status is "both". */
+  conflicts: FineConflict[];
+  combined: number;
+  auto: FineAuto[];
+  orderChecks: OrderCheck[];
+  /** Fixer round 2: the table module's row notes (table section only; absent when empty). */
+  rowNotes?: TableRowNotes;
+}
+
+export interface CombineResultP4 extends CombineResult {
+  /** Everything changed automatically after the sections were put together, incl. the modules' own (§2.6). */
+  adjustments: FineAdjustment[];
+  orderChecks: OrderCheck[];
+  /** Sections whose content is neither side's as a whole. */
+  mixed: SectionName[];
+}
+
+/** Choices of a combine. `sections[k]`: take section k whole from that side (overrides everything else for k).
+ *  `fine`: per conflict id. */
+export interface CombineChoices {
+  sections?: Partial<Record<SectionName, SidePick>>;
+  fine?: Record<string, FineChoice>;
+}
+
+export interface CombinePlanP4 extends CombinePlan {
+  sections: CombineSectionP4[];
+  result: CombineResultP4 | null;
+  /** "section": no section is "both" — the result is exactly what exp-0.2.21 … 0.2.25 compute. "fine": at least one is. */
+  level: "section" | "fine";
+  mineKey: SideKey;
+  theirsKey: SideKey;
+}
+
+export type CombineOutcomeP4 = CombinePlanP4 | { ok: false; reason: "unreadable"; side: "mine" | "theirs" };
+
+/** file/graphMerge.ts from phase 4 on. `combine` / `applyChoices` stay as the section-level rules of phase 2
+ *  (what an older app computes); the controller uses `combineFine` / `applyFineChoices`. */
+export interface GraphMergeApiP4 extends GraphMergeApi {
+  combineFine(input: {
+    base: SectionValues | null; baseKind: BaseKind; mine: SectionValues; theirs: SectionValues;
+    mineKey: SideKey; theirsKey: SideKey;
+  }): Promise<CombineOutcomeP4>;
+  /** null: a conflict has no choice, or the result is not a Graphs document. */
+  applyFineChoices(plan: CombinePlanP4, choices: CombineChoices): Promise<CombineResultP4 | null>;
+  /** Both versions were made by an app with this build's COMBINE_V (§3.3). */
+  peersCombineAlike(mine: Revision, theirs: Revision): boolean;
+  /** As phase 2, plus `combine_v: COMBINE_V` on the revision unless `legacy` (the simulation of an older app). */
+  combineRevision(p: {
+    mine: Revision; theirs: Revision; result: CombineResult; auto: boolean;
+    author?: import("./docCodec").Author; time?: number; legacy?: boolean;
+  }): Promise<RevisionP4>;
+}
+
+// ── 8.1 The dialog ──────────────────────────────────────────────────────────
+
+export interface CombineSectionViewP4 extends CombineSectionView {
+  level: "whole" | "fine";
+  conflicts: FineConflict[];
+  /** The choices made so far for this section's conflicts. */
+  choices: Record<string, FineChoice>;
+  /** Conflicts still without a choice (0 when the whole section is taken from one side). */
+  left: number;
+  combined: number;
+  auto: FineAuto[];
+  /** For the result with the current choices ([] while a choice is missing). */
+  orderChecks: OrderCheck[];
+  /** Fixer round 2: the table's row notes (table section only; absent when empty). */
+  rowNotes?: TableRowNotes;
+}
+
+/** From phase 4 on, the `state` of the dialog kind "combine" is always this (the UI reads it as CombineStateP4). */
+export interface CombineStateP4 extends CombineState {
+  sections: CombineSectionViewP4[];
+  /** "Adjusted automatically", for the result with the current choices ([] while a choice is missing). */
+  adjustments: FineAdjustment[];
+  /** Conflicts without a choice, all sections. */
+  toChoose: number;
+  /** Changes combined without a choice, all sections (a whole section taken from one side counts 1). */
+  combinedCount: number;
+  /** The document as it would be saved with the current choices; null while a choice is missing. */
+  resultContent: DocContent | null;
+}
+
+// ── 8.2 The session controller, phase 4 ─────────────────────────────────────
+
+export interface FileSessionStateP4 extends FileSessionStateP3 {
+  /** In the dialog: choose for one conflict. Nothing is written. */
+  setConflictChoice(conflictId: string, choice: FineChoice): Promise<void>;
+  /** In the dialog: "Use mine / theirs for all" — that side for every conflict of the section. */
+  setAllInSection(section: SectionName, side: SidePick): Promise<void>;
+}
+
+// ── 8.3 Browser preview: simulator additions ────────────────────────────────
+
+/** A small, exact change the other computer makes (§6.7). */
+export type SimFineEdit =
+  | "cell" | "cellOther" | "addRow" | "insertRow" | "deleteRow" | "deleteCol" | "renameCol"
+  | "yRange" | "graphTitle" | "alpha" | "scratchCells" | "scratchShift";
+
+export interface DevSimApiP4 extends DevSimApiP3 {
+  /** As phase 2; with `fine` the other computer makes exactly that change (and `section` is ignored). */
+  remoteEdit(path: string, opts?: { userName?: string; section?: SectionName; fine?: SimFineEdit }): Promise<string>;
+  /** As phase 2; with `fine` the other computer makes exactly that change (and `section` is not needed). */
+  remoteDiverge(path: string, opts: { section?: SectionName; fine?: SimFineEdit; how: "copy" | "saveOver"; userName?: string }): Promise<string>;
+  /** As phase 3; with `fine` the computer saves exactly that change. */
+  peerSaves(path: string, opts?: { who?: SimWho; section?: SectionName; fine?: SimFineEdit; keepEditing?: boolean }): Promise<string>;
+  /** As phase 3 (no notes, features 1); from phase 4 on such a computer also writes no `combine_v` and
+   *  combines by whole sections. */
+  setOldApp(on: boolean, who?: SimWho): void;
 }

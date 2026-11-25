@@ -8,17 +8,25 @@
    open, by the same rules as the app (MemoryDevice.presenceSet, its heartbeat,
    presence.ts): open, start editing, save (the note goes back to idle 30 s
    later unless it keeps editing), stop, quit, crash, sleep / wake, "Edit here",
-   a conflict copy of a note, an older app, a wrong clock. */
+   a conflict copy of a note, an older app, a wrong clock.
+
+   Phase 4 (DevSimApiP4, phase4-contract.md §6.7): small, exact changes the other
+   computer makes ("fine" edits: one value, a row, a column, the Y range,
+   scratchpad cells, a rearranged scratchpad), so every fine-level combine case
+   can be produced. Its saves carry `combine_v` unless it plays an older app. */
 
 import type { DocContent } from "../../../store/graphStore";
-import { LIMITS_P3, type DevSimApiP2, type DevSimApiP3, type NoteTarget, type SimFile, type SimNote, type SimWho } from "./contract";
+import {
+  COMBINE_V, LIMITS_P3, type DevSimApiP2, type DevSimApiP3, type DevSimApiP4, type NoteTarget, type SimFile, type SimFineEdit, type SimNote,
+  type SimWho,
+} from "./contract";
 import { isNoteFileName, liveNoteHeads, noteText } from "./presence";
 import type { MemoryDevice } from "./memoryBackend";
-import { buildNewFile, buildNextFile, fileAt, newAnalysisId, newDocKey, openFile, revisionOf } from "./docCodec";
+import { buildNewFile, buildNextFile, fileAt, newAnalysisId, newDocKey, openFile, revisionOf, type Author } from "./docCodec";
 import { GRAPH_EXT, fileStem, parentDir, type GraphFileData, type SectionName } from "./format";
 import { applyRetention } from "./retention";
 import { canonScratch, parseScratch } from "../scratchpad/scratchModel";
-import { sampleDoc } from "../graphModel";
+import { deleteCol, deleteRow, ensureRows, insertRow, remapAnalysis, remapFigure, rowHasData, sampleDoc } from "../graphModel";
 import { openContent } from "../../../store/graphStore";
 import { PREVIEW_STORAGE_KEY, authorOf, freezePreviewPersist, previewBackend, type PreviewWorld } from "./previewBackend";
 
@@ -48,10 +56,101 @@ export function editContent(c: DocContent, section: SectionName = "table"): DocC
   return { ...c, doc: { ...c.doc, cells } };
 }
 
+/** Phase 4 §6.7: exactly one small change, as the editor would make it. The result is in the stored form
+ *  (rows padded with one blank row at the end), so it reads back the same on every computer. */
+export function fineEditContent(c: DocContent, fine: SimFineEdit): DocContent {
+  const bump = (v: string | undefined) => {
+    const s = v ?? "";
+    const n = Number(s);
+    return s.trim() !== "" && Number.isFinite(n) ? String(Math.round((n + 1) * 1000) / 1000) : "1";
+  };
+  const setCell0 = (doc: DocContent["doc"], r: number, col: number): DocContent["doc"] => {
+    if (!doc.cells[r]?.[col]) return doc;
+    const cells = doc.cells.map((row) => row.map((reps) => [...reps]));
+    cells[r][col][0] = bump(cells[r][col][0]);
+    return { ...doc, cells };
+  };
+  /** "v" in replicate 1 of every column of row r (and X on XY tables). */
+  const fillRow = (doc: DocContent["doc"], r: number, v: string): DocContent["doc"] => {
+    const cells = doc.cells.map((row, i) => (i === r ? row.map((reps) => reps.map((x, k) => (k === 0 ? v : x))) : row.map((reps) => [...reps])));
+    const x = doc.template === "xy" ? doc.x.map((xv, i) => (i === r ? v : xv)) : [...doc.x];
+    return { ...doc, cells, x };
+  };
+  const done = (next: DocContent): DocContent =>
+    openContent({ doc: ensureRows(next.doc), analysis: next.analysis, figure: next.figure, scratch: next.scratch });
+  const scratchCells = (): [number, number, string, ...string[]][] => parseScratch(c.scratch).cells.map((x) => [...x] as [number, number, string, ...string[]]);
+  switch (fine) {
+    case "cell": return done({ ...c, doc: setCell0(c.doc, 0, 0) });
+    case "cellOther": return done({ ...c, doc: setCell0(c.doc, 2, 0) });
+    case "addRow": {
+      let r = c.doc.cells.findIndex((_, i) => !rowHasData(c.doc, i));
+      if (r < 0) { const d = ensureRows(c.doc); r = d.cells.length - 1; return done({ ...c, doc: fillRow(d, r, "7") }); }
+      return done({ ...c, doc: fillRow(c.doc, r, "7") });
+    }
+    case "insertRow": {
+      const doc = insertRow(c.doc, 0);
+      return done({ ...c, doc: fillRow(doc, 0, "3"), analysis: remapAnalysis(c.analysis, doc.template, "row", { type: "insert", at: 0 }) });
+    }
+    case "deleteRow":
+      return done({ ...c, doc: deleteRow(c.doc, 0), analysis: remapAnalysis(c.analysis, c.doc.template, "row", { type: "delete", at: 0 }) });
+    case "deleteCol": {
+      const last = c.doc.col_titles.length - 1;
+      if (last < 1) return done(c);
+      const op = { type: "delete" as const, at: last };
+      return done({ ...c, doc: deleteCol(c.doc, last), analysis: remapAnalysis(c.analysis, c.doc.template, "col", op), figure: remapFigure(c.figure, op) });
+    }
+    case "renameCol": {
+      const col_titles = [...c.doc.col_titles];
+      if (col_titles.length) col_titles[0] = `${col_titles[0]} *`;
+      return done({ ...c, doc: { ...c.doc, col_titles } });
+    }
+    case "yRange": return done({ ...c, figure: { ...c.figure, y_min: 0, y_max: c.figure.y_max === 100 ? 50 : 100 } });
+    case "graphTitle": return done(editContent(c, "figure"));
+    case "alpha": return done(editContent(c, "analysis"));
+    case "scratchCells": {
+      const doc = parseScratch(c.scratch);
+      const b2 = doc.cells.find((x) => x[0] === 2 && x[1] === 2);
+      const keep = doc.cells.filter((x) => !(x[1] === 2 && (x[0] === 2 || x[0] === 3)));
+      const cells = [...keep, [2, 2, bump(b2?.[2])] as [number, number, string], [3, 2, "=B2*2"] as [number, number, string]];
+      return done({ ...c, scratch: canonScratch({ ...doc, cells }) });
+    }
+    case "scratchShift": {
+      const doc = parseScratch(c.scratch);
+      const moved = scratchCells().map((x) => { const y = [...x] as typeof x; y[0] = x[0] + 1; return y; });
+      const cells = [[1, 1, "Inserted"] as [number, number, string], ...moved];
+      return done({ ...c, scratch: canonScratch({ ...doc, cells: cells as typeof doc.cells }) });
+    }
+  }
+}
+
+/** A scratchpad with A1:B6 filled with numbers (what scratchShift needs to move). */
+function filledScratch(c: DocContent): DocContent {
+  const doc = parseScratch(c.scratch);
+  const cells: [number, number, string][] = [];
+  for (let r = 1; r <= 6; r++) for (let col = 1; col <= 2; col++) cells.push([r, col, String(r * 10 + col)]);
+  const others = doc.cells.filter((x) => !(x[0] <= 6 && x[1] <= 2));
+  return openContent({ doc: c.doc, analysis: c.analysis, figure: c.figure, scratch: canonScratch({ ...doc, cells: [...others, ...cells] as typeof doc.cells }) });
+}
+
 const withExt = (name: string) => (name.toLowerCase().endsWith(`.${GRAPH_EXT}`) ? name : `${name}.${GRAPH_EXT}`);
 
-export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {}): DevSimApiP3 {
+export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {}): DevSimApiP4 {
   const { world, clock, device, other, third } = pw;
+  /** Phase 4: the next version made by a simulated computer, with `combine_v` unless it plays an older app. */
+  async function nextOn(dev: MemoryDevice, base: GraphFileData, content: DocContent, author: Author): Promise<GraphFileData> {
+    const next = await buildNextFile(base, content, { time: clock.now(), author });
+    if (dev.writesNoNotes) return next;
+    const head = next.manifest.head;
+    return { ...next, manifest: { ...next.manifest, revisions: next.manifest.revisions.map((r) => (r.id === head ? { ...r, combine_v: COMBINE_V } : r)) } };
+  }
+  /** The content a simulated computer saves: the phase 2 section edit, or exactly the fine edit. */
+  const changed = (f: GraphFileData, o: { section?: SectionName; fine?: SimFineEdit }, rev?: string): DocContent => {
+    if (!o.fine) return edited(f, o.section ?? "table", rev);
+    const c = openFile(f, rev);
+    if (!c) throw new Error("The file can't be read");
+    return fineEditContent(c, o.fine);
+  };
+  const scratchCount = (f: GraphFileData) => parseScratch(openFile(f)?.scratch ?? "").cells.length;
   const settle = () => clock.advance(0);
   const synced = (path: string) => world.synced(path);
   const otherAuthor = (userName?: string) => authorOf(other, userName ?? "Alice");
@@ -93,8 +192,11 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
   };
 
   /** The other computer's next version of `f`, kept to the newest versions as its app would (retention). */
-  async function nextVersion(f: GraphFileData, section: SectionName, userName?: string, path?: string, dev: MemoryDevice = other): Promise<GraphFileData> {
-    const next = await buildNextFile(f, edited(f, section), { time: clock.now(), author: { ...authorOf(dev, userName ?? defaultUser(dev)) } });
+  async function nextVersion(
+    f: GraphFileData, section: SectionName | { section?: SectionName; fine?: SimFineEdit }, userName?: string, path?: string, dev: MemoryDevice = other,
+  ): Promise<GraphFileData> {
+    const o = typeof section === "string" ? { section } : section;
+    const next = await nextOn(dev, f, changed(f, o), { ...authorOf(dev, userName ?? defaultUser(dev)) });
     if (dev.writesNoNotes) next.manifest = { ...next.manifest, features: 1 };      // an older app
     // Phase 3: the versions the notes it can see are on keep their content (as the app's retention does).
     const beaconHeads = path ? liveNoteHeads(dev.noteFiles(parentDir(path)).map((n) => n.note).filter((n): n is NonNullable<typeof n> => !!n && n.analysis_id === f.manifest.analysis_id)) : [];
@@ -113,7 +215,10 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
     return fileHere(path);
   }
 
-  const api0: DevSimApiP2 = {
+  /** scratchShift needs content to move: a scratchpad with fewer than 12 cells is filled first (one version). */
+  const needsFill = (f: GraphFileData, fine?: SimFineEdit) => fine === "scratchShift" && scratchCount(f) < 12;
+
+  const api0: Omit<DevSimApiP2, "remoteEdit" | "remoteDiverge"> & Pick<DevSimApiP4, "remoteEdit" | "remoteDiverge"> = {
     thisDevice: device.name,
     otherDevice: other.name,
     folders: () => device.folderList(),
@@ -126,16 +231,26 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
     async remoteEdit(path, o = {}) {
       settle();
       const f = (synced(path) ? other.localFile(path) : null) ?? fileHere(path);
-      const next = await nextVersion(f, o.section ?? "table", o.userName, path);
+      if (needsFill(f, o.fine)) {
+        const filled = await nextOn(other, f, filledScratch(openFile(f)!), { ...authorOf(other, o.userName ?? "Alice") });
+        await otherWrites(path, filled, f.manifest.head);
+        return filled.manifest.head;
+      }
+      const next = await nextVersion(f, { section: o.section, fine: o.fine }, o.userName, path);
       await otherWrites(path, next, f.manifest.head);
       return next.manifest.head;
     },
 
     async remoteDiverge(path, o) {
+      if (needsFill(fileHere(path), o.fine)) {
+        // Content to move first: one version of its own; the next press rearranges it.
+        await api.remoteEdit(path, { fine: o.fine, userName: o.userName });
+        return path;
+      }
       const f = await withPrevious(path);
       const parent = revisionOf(f.manifest, f.manifest.head)!.parents[0];
       const base = fileAt(f, parent) ?? f;
-      const next = await buildNextFile(base, edited(base, o.section), { time: clock.now(), author: otherAuthor(o.userName) });
+      const next = await nextOn(other, base, changed(base, { section: o.section, fine: o.fine }), otherAuthor(o.userName));
       if (o.how === "copy") {
         const copy = world.conflictName(path, other.name);
         if (synced(path)) world.forceReplace(copy, next); else device.place(copy, next);
@@ -172,7 +287,7 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
       const f = fileHere(path);
       const parent = revisionOf(f.manifest, f.manifest.head)?.parents[0];
       const base = (parent && fileAt(f, parent)) || f;
-      const next = await buildNextFile(base, edited(base), { time: clock.now(), author: otherAuthor() });
+      const next = await nextOn(other, base, edited(base), otherAuthor());
       const copy = world.conflictName(path, other.name);
       await otherWrites(copy, next, null);
       return copy;
@@ -182,7 +297,7 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
       const f = fileHere(path);
       const parent = revisionOf(f.manifest, f.manifest.head)?.parents[0];
       const base = (parent && fileAt(f, parent)) || f;
-      const next = await buildNextFile(base, edited(base, "figure"), { time: clock.now(), author: otherAuthor() });
+      const next = await nextOn(other, base, edited(base, "figure"), otherAuthor());
       if (synced(path)) world.forceReplace(path, next); else device.place(path, next);
       settle();
       return next.manifest.head;
@@ -228,9 +343,7 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
     async sendBack(path, toFolder, userName) {
       const f = fileHere(path);
       const who = userName ?? "Bob";
-      const next = await buildNextFile(f, edited(f), {
-        time: clock.now(), author: { ...authorOf(other, who), device_id: "d-preview-colleague", device_name: `${who}'s MacBook` },
-      });
+      const next = await nextOn(other, f, edited(f), { ...authorOf(other, who), device_id: "d-preview-colleague", device_name: `${who}'s MacBook` });
       device.addFolder(toFolder);
       const to = freePath(toFolder, fileStem(path));
       device.place(to, next);
@@ -253,7 +366,7 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
 
     armSaveRace(path) {
       const f = fileHere(path);
-      void buildNextFile(f, edited(f, "figure"), { time: clock.now(), author: otherAuthor() }).then((next) => device.armDisplace(path, next));
+      void nextOn(other, f, edited(f, "figure"), otherAuthor()).then((next) => device.armDisplace(path, next));
     },
     armOffline(path) { device.armOffline(path); },
 
@@ -352,13 +465,15 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
       await startEditing(d, path);
     },
 
-    async peerSaves(path: string, o: { who?: SimWho; section?: SectionName; keepEditing?: boolean } = {}) {
+    async peerSaves(path: string, o: { who?: SimWho; section?: SectionName; fine?: SimFineEdit; keepEditing?: boolean } = {}) {
       const d = peerOf(o.who);
       await ready(d);
       let doc = docFor(d, path);
       if (!doc.editing) doc = await startEditing(d, path);
       const f = peerFile(d, path);
-      const next = await nextVersion(f, o.section ?? "table", userOf.get(d) ?? defaultUser(d), path, d);
+      const next = needsFill(f, o.fine)
+        ? await nextOn(d, f, filledScratch(openFile(f)!), { ...authorOf(d, userOf.get(d) ?? defaultUser(d)) })
+        : await nextVersion(f, { section: o.section, fine: o.fine }, userOf.get(d) ?? defaultUser(d), path, d);
       const res = await d.save({ path, expectedHead: f.manifest.head, analysisId: f.manifest.analysis_id, docKey: newDocKey(), manifest: next.manifest, newParts: next.parts });
       if (!res.ok) throw new Error(`${d.name} couldn't save: ${res.kind === "error" ? res.message : res.kind}`);
       settle();
@@ -443,6 +558,7 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
       return copy;
     },
 
+    /** Phase 4: an older app also writes no `combine_v` (nextOn reads the same flag). */
     setOldApp(on: boolean, w?: SimWho) {
       const d = peerOf(w);
       d.writesNoNotes = on;
@@ -465,20 +581,20 @@ export function makeDevSim(pw: PreviewWorld, opts: { reload?: () => void } = {})
       clock.advance(ms);
     },
   };
-  const api: DevSimApiP3 = Object.assign(api0, p3);
+  const api: DevSimApiP4 = Object.assign(api0, p3);
   return api;
 }
 
-let api: DevSimApiP3 | null = null;
+let api: DevSimApiP4 | null = null;
 
 const inTauri = () => typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
 
 /** The simulator in the browser preview (dev builds only), else null. */
-export function devSim(): DevSimApiP3 | null {
+export function devSim(): DevSimApiP4 | null {
   if (!import.meta.env.DEV || inTauri()) return null;
   if (!api) {
     api = makeDevSim(previewBackend());
-    if (typeof window !== "undefined") (window as unknown as { __lasSim?: DevSimApiP3 }).__lasSim = api;
+    if (typeof window !== "undefined") (window as unknown as { __lasSim?: DevSimApiP4 }).__lasSim = api;
   }
   return api;
 }

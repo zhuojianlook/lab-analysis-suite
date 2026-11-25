@@ -32,10 +32,11 @@ import type {
   SessionTab,
 } from "./backend";
 import {
-  BANNER_ORDER, CMD, EVT, LIMITS, LIMITS_P2, LIMITS_P3, MENU, SUMMARY, WORKING_ROW, emptySeenMap,
-  type AppInfo, type BannerAction, type BannerKind, type BaseChoice, type CloudInfo, type CombinePlan, type CombineResult, type CombineSource,
-  type CombineState, type ConflictChoice, type DialogAnswer, type DraftListItem, type EditGuardReason, type EditPath, type ExportState,
-  type FileBackendP3, type FileSessionStateP3, type FileSettings, type FileTab, type LaneLayout, type LaneNode, type MenuEvent, type MenuId,
+  BANNER_ORDER, CMD, COMBINE_V, EVT, LIMITS, LIMITS_P2, LIMITS_P3, MENU, SUMMARY, WORKING_ROW, emptySeenMap,
+  type AppInfo, type BannerAction, type BannerKind, type BaseChoice, type CloudInfo, type CombineChoices, type CombinePlan, type CombinePlanP4,
+  type CombineResult, type CombineResultP4, type CombineSectionViewP4, type CombineSource, type CompareResult,
+  type CombineState, type CombineStateP4, type ConflictChoice, type FileSessionStateP4, type FineChoice, type DialogAnswer, type DraftListItem, type EditGuardReason, type EditPath, type ExportState,
+  type FileBackendP3, type FileSettings, type FileTab, type LaneLayout, type LaneNode, type MenuEvent, type MenuId,
   type NoteJson, type NoteRecord, type NoteTarget, type PeerView, type PresenceDecision, type PresenceObs, type ShareMode, type SharingView,
   type StatusLine, type TabPresence,
   type MenuState, type OpenFilesEvent, type OpenOutcome, type PathPickerRequest, type QuitRequest, type QuitSource, type RecentItem,
@@ -46,10 +47,12 @@ import {
 import {
   buildNewFile, completeParts, contentOfDraft, contentOfSections, draftOf, makeRevision, mergeRevisionId, newAnalysisId, newDocKey,
   newRevisionId, openFile, partsNotIn, partsOf, relationOf, revisionOf, revisionSections, roundTrip, sectionsOf,
-  unionManifests, versionInfo, withAbsentSnapshotsDropped, withRevision, isStrictAncestor, type Author, type BuiltParts,
+  unionManifests, versionInfo, withAbsentSnapshotsDropped, withRevision, isStrictAncestor, type Author, type BuiltParts, type FileSections4,
 } from "./docCodec";
-import { SECTION_NAMES, fileStem, isAncestorOrSelf, parentDir, type GraphFileData, type Manifest, type Revision, type SectionName } from "./format";
-import { applyChoices, combine, combineDelayMs as defaultCombineDelayMs, combineRevision } from "./graphMerge";
+import { SECTION_NAMES, canonicalJson, fileStem, isAncestorOrSelf, parentDir, type GraphFileData, type Manifest, type Revision, type SectionName } from "./format";
+import {
+  applyChoices, applyFineChoices, combine, combineDelayMs as defaultCombineDelayMs, combineFine, combineRevision, peersCombineAlike,
+} from "./graphMerge";
 import { layoutLanes } from "./laneGraph";
 import { applyRetention } from "./retention";
 import {
@@ -104,6 +107,10 @@ export interface SessionDeps {
   /** Phase 3: sleep gaps come from the backend's `wake` event (true) or from the controller's own timer (false).
    *  null = desktop. */
   nativeWake: boolean | null;
+  /** Phase 4 §5.7 (tests only): "section" plays an exp-0.2.25 computer: combines by whole sections
+   *  (graphMerge.combine / applyChoices), writes no `combine_v`, the phase 2 rule for unprompted combines.
+   *  Default "fine". Production code never sets it. */
+  combineLevel?: "fine" | "section";
 }
 
 // Mouse button and typing state for domInteractionBusy (listeners added once, on first use).
@@ -250,8 +257,10 @@ interface CombineCtx {
   extra: GraphFileData[];
   base: BaseChoice;
   baseId: string | null;
-  plan: CombinePlan;
-  choices: Partial<Record<SectionName, SidePick>>;
+  /** Phase 4: the fine plan (combineFine); with SessionDeps.combineLevel "section" the phase 2 plan in this form. */
+  plan: CombinePlanP4;
+  /** Phase 4 §5.1: whole-section choices and per-conflict choices. */
+  choices: CombineChoices;
   /** Extra copies still to combine after this one ("Copy 2 of 3"). */
   queue: string[];
   index: number;
@@ -303,6 +312,8 @@ interface Internal {
   combining: number;
   /** The open combine dialog's context. */
   combine: CombineCtx | null;
+  /** Fixer VUX-3: the context of a combine dialog that was cancelled with choices made (kept for the same pair). */
+  cancelled: CombineCtx | null;
   /** What the last combine of this tab was with (notSaved → Choose… reopens it). */
   lastSource: CombineSource | null;
   /** Banner id → the combine source it stands for. */
@@ -407,7 +418,7 @@ const newInternal = (p: Partial<Internal> = {}): Internal => ({
   manifest: null, acceptedHead: null, knownCopies: [], copyAnswer: {}, settled: [], template: null, sample: false,
   conflict: null, retry: null, firstTry: 0, waitedCloud: false, hasDraft: false, bannerData: new Map(), seenCopies: [],
   draftSeq: 0, draftSerialAt: undefined,
-  asides: [], carryHeads: [], combinePending: null, autoTimer: null, combining: 0, combine: null, lastSource: null,
+  asides: [], carryHeads: [], combinePending: null, autoTimer: null, combining: 0, combine: null, cancelled: null, lastSource: null,
   bannerSource: new Map(), held: null, preCombineHead: null, recheck: false, catchUps: 0, lastWorking: null, keptHeads: {}, pr: newPresenceTab(), ...p,
 });
 
@@ -415,13 +426,18 @@ const newInternal = (p: Partial<Internal> = {}): Internal => ({
 export const PENDING_SUMMARY = "Your last save — not in the file yet";
 /** The same row when that version was saved by another computer (shown in this tab, gone from the file). */
 export const PENDING_SUMMARY_OTHER = "Shown in this tab — not in the file now";
+/** Fixer VUX-6: why the combine window came back after Apply instead of saving (nothing was written). */
+export const LOOK_AGAIN_NEWER = "A newer version arrived. Nothing was saved yet — please check again.";
+export const LOOK_AGAIN_EDITED = "Your document changed meanwhile. Nothing was saved yet — please check again.";
+/** Fixer round 2 (RV-2): Apply while the tab is read-only (another computer is editing). */
+export const APPLY_READ_ONLY = "Another computer is editing this file. Nothing was saved — try again in a moment.";
 
 const CARD_KINDS: readonly TabStatus[] = ["waiting", "downloading", "missing", "permission", "unreadable"];
 const isCard = (s: TabStatus) => CARD_KINDS.includes(s);
 const iso = (t: number) => new Date(t).toISOString();
 const asTemplate = (t: unknown): Template | null => (t === "column" || t === "grouped" || t === "xy" ? t : null);
 
-export type FileSessionStore = UseBoundStore<StoreApi<FileSessionStateP3>> & {
+export type FileSessionStore = UseBoundStore<StoreApi<FileSessionStateP4>> & {
   /** Test and simulator access to controller internals (not for the UI). */
   internal: {
     deps: SessionDeps;
@@ -444,6 +460,11 @@ export type FileSessionStore = UseBoundStore<StoreApi<FileSessionStateP3>> & {
     } | null;
     /** Run the presence timer's work now (tests). */
     presenceTick(): void;
+  };
+  /** Fixer VUX-4: dialog actions beyond the contract's FileSessionStateP4 (the UI may call these). */
+  dialogExtras: {
+    /** "Use mine / theirs for the rest": that side for every conflict of the section without a choice. Nothing is written. */
+    setRestInSection(section: SectionName, side: SidePick): Promise<void>;
   };
 };
 
@@ -516,7 +537,23 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   // eslint-disable-next-line prefer-const
   let store: FileSessionStore;
   const get = () => store.getState();
-  const set = (p: Partial<FileSessionStateP3>) => store.setState(p);
+  const set = (p: Partial<FileSessionStateP4>) => store.setState(p);
+
+  // ── phase 4: the rules' version on everything this build writes (§5.6) ──
+  /** Playing an exp-0.2.25 computer (tests only, §5.7). */
+  const legacy = deps.combineLevel === "section";
+  /** A new revision object with `combine_v` (its id and content_hash do not depend on it). */
+  function stampRev<T extends Revision>(r: T): T {
+    return legacy ? r : ({ ...r, combine_v: COMBINE_V } as T);
+  }
+  const makeRev = (p: Parameters<typeof makeRevision>[0]): Revision => stampRev(makeRevision(p));
+  /** buildNewFile with its one (root) revision stamped. */
+  async function newFile(p: Parameters<typeof buildNewFile>[0]): Promise<GraphFileData> {
+    const f = await buildNewFile(p);
+    if (legacy) return f;
+    const head = f.manifest.head;
+    return { ...f, manifest: { ...f.manifest, revisions: f.manifest.revisions.map((r) => (r.id === head ? stampRev(r) : r)) } };
+  }
 
   // ── small helpers ──
 
@@ -1341,7 +1378,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const head = revisionOf(m, m.head)!;
     const aid = newAnalysisId();
     const rev: Revision = {
-      ...makeRevision({
+      ...makeRev({
         id: newRevisionId(now()), parents: [m.head], kind: "save", time: now(), author: author(), summary: SUMMARY.separated,
         parts: { refs: head.sections!, texts: {}, contentHash: head.content_hash },
       }),
@@ -1572,7 +1609,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     // the same version, so this computer's saved copies don't fill up with copies nobody can tell apart.
     const same = !!reuse && reuse.parts.contentHash === parts.contentHash
       && (reuse.rev.parents[0] ?? null) === (t.baseRevision ?? null) && reuse.rev.parents.length === (t.baseRevision ? 1 : 0);
-    const rev = same ? reuse!.rev : makeRevision({
+    const rev = same ? reuse!.rev : makeRev({
       id: newRevisionId(now()), parents: t.baseRevision ? [t.baseRevision] : [], kind: "save", time: now(), author: author(),
       summary: summaryText({ kind: "save", root: !t.baseRevision, prev: baseRev?.sections, next: parts.refs }), parts,
     });
@@ -1824,7 +1861,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (choice === "keepMine") {
       const kid = await mergeRevisionId([theirsHead, c.rev.id], c.parts.contentHash);
       const k: Revision = {
-        ...makeRevision({
+        ...makeRev({
           id: kid, parents: [theirsHead, c.rev.id], kind: "merge", time: now(), author: author(),
           summary: summaryText({ kind: "merge", root: false, auto: false, prev: null, next: c.parts.refs }), parts: c.parts,
         }),
@@ -1904,7 +1941,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
     c = (await refreshConflict(key, c)).c;
     const newAid = newAnalysisId();
-    const file = await buildNewFile({ content: c.content, analysisId: newAid, forkedFrom: { analysis_id: aid, revision_id: c.base ?? theirsHead }, time: now(), author: author(), summary: SUMMARY.first });
+    const file = await newFile({ content: c.content, analysisId: newAid, forkedFrom: { analysis_id: aid, revision_id: c.base ?? theirsHead }, time: now(), author: author(), summary: SUMMARY.first });
     const res = await backend.save({ path, expectedHead: null, replaceExisting: true, analysisId: newAid, docKey: key, manifest: file.manifest, newParts: file.parts });
     if (!res.ok) {
       addBanner(key, { kind: "saveFailed", message: res.kind === "error" ? saveFailedMessage(res.code) : saveFailedMessage("Io") });
@@ -1982,7 +2019,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (kind === "new") {
       const aid = t.path === null ? t.analysisId ?? newAnalysisId() : newAnalysisId();
       const forked = t.path !== null && t.analysisId && t.baseRevision ? { analysis_id: t.analysisId, revision_id: t.baseRevision } : null;
-      const file = await buildNewFile({ content: c, analysisId: aid, forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
+      const file = await newFile({ content: c, analysisId: aid, forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
       req = { path, expectedHead: null, replaceExisting: true, analysisId: aid, docKey: key, manifest: file.manifest, newParts: file.parts };
     } else {
       const w = await workingOf(key);
@@ -2027,7 +2064,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       return { ok: false, reason: "failed" };
     }
     const forked = t.path !== null && t.analysisId && t.baseRevision ? { analysis_id: t.analysisId, revision_id: t.baseRevision } : null;
-    const file = await buildNewFile({ content: content(), analysisId: newAnalysisId(), forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
+    const file = await newFile({ content: content(), analysisId: newAnalysisId(), forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
     const res = await backend.save({
       path, expectedHead: null, replaceExisting: true, analysisId: file.manifest.analysis_id, docKey: newDocKey(), manifest: file.manifest, newParts: file.parts,
     });
@@ -2520,9 +2557,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         : (pool.get(mineRev.id) ?? (revisionSections(mineFile, mineRev.id) as SectionValues | null));
       const theirsSections = revisionSections(theirsFile, theirsHead) as SectionValues | null;
       if (!mineSections || !theirsSections) return { kind: "fallback", theirs: theirsFile, working, mineFile };
-      const plan = await combine({
+      const plan = await planOf({
         base: baseId ? pool.get(baseId) : null, baseKind: base.kind === "none" ? "none" : base.kind, mine: mineSections, theirs: theirsSections,
-      });
+      }, mineRev, theirsRev);
       if (!plan.ok) return { kind: "fallback", theirs: theirsFile, working, mineFile };
       return {
         kind: "plan",
@@ -2534,12 +2571,100 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     } finally { i.combining--; }
   }
 
-  /** The dialog's state for a context (§6.4). */
-  async function combineStateOf(ctx: CombineCtx, extra: Partial<CombineState> = {}): Promise<CombineState> {
+  // ── phase 4: the plan, its result, the choices (§5.1–5.3) ──
+
+  /** Step 4: the fine plan (phase 4), or the phase 2 plan in its form when playing an older app. */
+  async function planOf(
+    input: { base: SectionValues | null; baseKind: CombinePlan["baseKind"]; mine: SectionValues; theirs: SectionValues },
+    mineRev: Revision, theirsRev: Revision,
+  ): Promise<CombinePlanP4 | { ok: false }> {
+    const mineKey = { deviceId: String(mineRev.device_id ?? ""), revisionId: String(mineRev.id ?? "") };
+    const theirsKey = { deviceId: String(theirsRev.device_id ?? ""), revisionId: String(theirsRev.id ?? "") };
+    if (!legacy) {
+      const p = await combineFine({ ...input, mineKey, theirsKey });
+      return p.ok ? p : { ok: false };
+    }
+    const p = await combine(input);
+    if (!p.ok) return { ok: false };
+    return {
+      ...p, level: "section", mineKey, theirsKey, result: p.result ? asP4Result(p.result) : null,
+      sections: p.sections.map((s) => ({ ...s, level: "whole" as const, conflicts: [], combined: 0, auto: [], orderChecks: [] })),
+    };
+  }
+
+  const asP4Result = (r: CombineResult): CombineResultP4 => ({ ...r, adjustments: [], orderChecks: [], mixed: [] });
+
+  /** Step 7.2: the result for the context's choices (null: a choice is missing). */
+  async function resultOf(ctx: CombineCtx): Promise<CombineResultP4 | null> {
+    if (!legacy) return applyFineChoices(ctx.plan, ctx.choices);
+    const r = await applyChoices(ctx.plan, ctx.choices.sections ?? {});
+    return r ? asP4Result(r) : null;
+  }
+
+  /** No choice of any kind was made (an automatic combine stays automatic, §4.1). */
+  const noChoices = (c: CombineChoices) => !Object.keys(c.sections ?? {}).length && !Object.keys(c.fine ?? {}).length;
+  /** Only choices that equal what would be taken anyway (the phase 2 "preset only" rule). */
+  const presetOnly = (ctx: CombineCtx) => !Object.keys(ctx.choices.fine ?? {}).length
+    && Object.entries(ctx.choices.sections ?? {}).every(([k, v]) => ctx.plan.sections.find((s) => s.key === k)?.pick === v);
+
+  /** Conflicts of a section still without a valid choice. */
+  function leftOf(ctx: CombineCtx, k: SectionName): number {
+    const s = ctx.plan.sections.find((x) => x.key === k)!;
+    if (ctx.choices.sections?.[k]) return 0;
+    if (legacy) return s.status === "both" ? 1 : 0;
+    const fine = ctx.choices.fine ?? {};
+    return s.conflicts.filter((c) => { const v = fine[c.id]; return v === undefined || !c.options.includes(v); }).length;
+  }
+
+  /** Fixer round 2 (RV-1, RV-3): the two sides as the dialog shows and compares them. A row an earlier combine
+   *  moved is shown under its new id on the side that still has the old one (so the two are compared and the
+   *  values to choose are found); a row both typed into that was split is compared as a row added on each side,
+   *  not as changed cells. Display only: what is combined and written comes from the plan. */
+  function shownSides(plan: CombinePlanP4): { mineContent: DocContent; theirsContent: DocContent; compare: CompareResult } {
+    const notes = plan.sections.find((x) => x.key === "table")?.rowNotes;
+    const plain = { mineContent: plan.mine.content, theirsContent: plan.theirs.content, compare: compareSections(plan.theirs.sections, plan.mine.sections) };
+    if (!notes) return plain;
+    const rename = (ids: readonly string[] | undefined, side: SidePick, forCompare: boolean): string[] | undefined => {
+      if (!ids) return ids;
+      const out = [...ids];
+      for (const mv of notes.moved) {
+        if (mv.side !== side || out.includes(mv.id)) continue;
+        const i = out.indexOf(mv.was);
+        if (i >= 0) out[i] = mv.id;
+      }
+      if (forCompare) for (const r of notes.split) { const i = out.indexOf(r); if (i >= 0) out[i] = `${r}\n${side}`; }
+      return out;
+    };
+    const content = (c: DocContent, side: SidePick): DocContent =>
+      notes.moved.some((m) => m.side === side) ? { ...c, doc: { ...c.doc, row_ids: rename(c.doc.row_ids, side, false) ?? c.doc.row_ids } } : c;
+    const sections = (x: FileSections4, side: SidePick): FileSections4 => {
+      const t = x.table as unknown as { row_ids?: string[] } | undefined;
+      return t ? ({ ...x, table: { ...t, row_ids: rename(t.row_ids, side, true) } } as unknown as FileSections4) : x;
+    };
+    const cmp = compareSections(sections(plan.theirs.sections, "theirs"), sections(plan.mine.sections, "mine"));
+    return {
+      mineContent: content(plan.mine.content, "mine"), theirsContent: content(plan.theirs.content, "theirs"),
+      compare: { ...plain.compare, table: cmp.table },
+    };
+  }
+
+  /** The dialog's state for a context (§6.4; phase 4 §5.2). */
+  async function combineStateOf(ctx: CombineCtx, extra: Partial<CombineStateP4> = {}): Promise<CombineStateP4> {
     const t = tabOf(ctx.key);
-    const sections = ctx.plan.sections.map((s) => ({ key: s.key, status: s.status, choice: ctx.choices[s.key] ?? s.pick }));
-    const complete = sections.every((s) => s.choice !== null);
-    const result = complete ? await applyChoices(ctx.plan, ctx.choices) : null;
+    const fine = ctx.choices.fine ?? {};
+    const lefts = ctx.plan.sections.map((s) => leftOf(ctx, s.key));
+    const toChoose = lefts.reduce((a, b) => a + b, 0);
+    const result = toChoose === 0 ? await resultOf(ctx) : null;
+    const sections: CombineSectionViewP4[] = ctx.plan.sections.map((s, n) => ({
+      key: s.key, status: s.status, choice: ctx.choices.sections?.[s.key] ?? s.pick,
+      level: s.level, conflicts: s.conflicts,
+      choices: Object.fromEntries(s.conflicts.filter((c) => fine[c.id] !== undefined).map((c) => [c.id, fine[c.id]])),
+      left: lefts[n], combined: s.combined, auto: s.auto,
+      orderChecks: result && s.key === "table" ? result.orderChecks : [],
+      ...(s.key === "table" && s.rowNotes ? { rowNotes: s.rowNotes } : {}),
+    }));
+    const shown = shownSides(ctx.plan);
+    const combinedCount = ctx.plan.sections.reduce((a, s) => a + (s.level === "fine" ? s.combined : s.status === "mine" || s.status === "theirs" ? 1 : 0), 0);
     const union = unionManifests(ctx.mineFile.manifest, ctx.theirsFile.manifest);
     return {
       tabKey: ctx.key, name: t?.title ?? "", origin: ctx.origin, source: ctx.source,
@@ -2548,15 +2673,21 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       mine: vi(ctx.mineFile.manifest, ctx.mineRev.id), mineUnsaved: !!ctx.working,
       theirs: vi(ctx.theirsFile.manifest, ctx.theirsRev.id),
       since: ctx.baseId ? vi(union, ctx.baseId) : null,
-      twoWay: ctx.plan.twoWay, sections, adjusted: result?.repairs ?? [], canApply: complete && !!result, applying: false,
-      mineContent: ctx.plan.mine.content, theirsContent: ctx.plan.theirs.content,
-      compare: compareSections(ctx.plan.theirs.sections, ctx.plan.mine.sections), error: null,
+      twoWay: ctx.plan.twoWay, sections, adjusted: result?.repairs ?? [], canApply: !!result, applying: false,
+      mineContent: shown.mineContent, theirsContent: shown.theirsContent,
+      compare: shown.compare, error: null,
+      adjustments: result?.adjustments ?? [], toChoose, combinedCount, resultContent: result?.content ?? null,
       ...extra,
     };
   }
 
   /** The other side changed while a dialog was open or a write was prepared: same statuses? */
   const sameStatuses = (a: CombinePlan, b: CombinePlan) => a.sections.every((s, k) => s.status === b.sections[k]?.status);
+  const conflictIds = (p: CombinePlanP4) => p.sections.flatMap((s) => s.conflicts.map((c) => c.id)).sort().join("\n");
+  const conflictText = (p: CombinePlanP4, id: string): string | null => {
+    for (const s of p.sections) for (const c of s.conflicts) if (c.id === id) return canonicalJson(c);
+    return null;
+  };
 
   /** The tab's content moved on since the context was built (§5.4 step 7.1). */
   function staleCtx(ctx: CombineCtx): boolean {
@@ -2565,26 +2696,57 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     return ctx.serial !== undefined || i.draftSeq !== ctx.draftSeq;
   }
 
+  /** Choices carried into a context put together again (§5.1 step 7.1): whole-section choices for sections that
+   *  still differ, per-conflict choices for conflicts that are still the same. */
+  function carryChoices(a: CombineCtx, b: CombineCtx): CombineChoices {
+    const sections = Object.fromEntries(Object.entries(a.choices.sections ?? {})
+      .filter(([k]) => b.plan.sections.find((s) => s.key === k)?.status !== "same"));
+    const fine = Object.fromEntries(Object.entries(a.choices.fine ?? {}).filter(([id]) => {
+      const x = conflictText(a.plan, id);
+      return x !== null && x === conflictText(b.plan, id);
+    }));
+    return {
+      ...(Object.keys(sections).length ? { sections } : {}),
+      ...(Object.keys(fine).length ? { fine } : {}),
+    };
+  }
+
   /** A context put together again (edits typed meanwhile, or the other side moved on): must the person look
-   *  again before anything is written? When a section's status changed; when it was going to be written
-   *  without anyone looking and now can't be (a repair, or no true common version any more); or when a
-   *  section somebody chose for changed on either side since they chose. */
-  function lookAgain(a: CombineCtx, b: CombineCtx, auto: boolean): boolean {
+   *  again before anything is written? When a section's status changed; when the set of conflicts changed;
+   *  when it was going to be written without anyone looking and now can't be (a repair, an adjustment, an
+   *  order to check, or no true common version any more); when a conflict somebody chose for is no longer
+   *  the same; or when a section somebody chose as a whole changed on either side since they chose. */
+  async function lookAgain(a: CombineCtx, b: CombineCtx, auto: boolean): Promise<boolean> {
     if (!sameStatuses(a.plan, b.plan)) return true;
+    if (conflictIds(a.plan) !== conflictIds(b.plan)) return true;
     if (auto && !b.plan.autoApplicable) return true;
-    for (const k of Object.keys(a.choices) as SectionName[]) {
+    for (const id of Object.keys(a.choices.fine ?? {})) if (conflictText(a.plan, id) !== conflictText(b.plan, id)) return true;
+    for (const k of Object.keys(a.choices.sections ?? {}) as SectionName[]) {
       if (a.plan.theirs.parts.refs[k]?.sha256 !== b.plan.theirs.parts.refs[k]?.sha256) return true;
       if (a.plan.mine.parts.refs[k]?.sha256 !== b.plan.mine.parts.refs[k]?.sha256) return true;
+    }
+    // Fixer VS-2: the person looked at what was adjusted automatically and at the orders to check; anything
+    // of that which is new or different since is shown before it is written (phase 4: an adjustment always
+    // forces a review).
+    if (!auto && !legacy) {
+      const [ra, rb] = await Promise.all([resultOf(a), resultOf(b)]);
+      if (!rb || reviewText(ra) !== reviewText(rb)) return true;
     }
     return false;
   }
 
+  /** What a person reviews in a result besides the choices: the adjustments, the repairs and the orders to check. */
+  const reviewText = (r: CombineResultP4 | null): string => (r
+    ? canonicalJson({ adjustments: r.adjustments, repairs: r.repairs, orders: r.orderChecks.filter((o) => o.matters) })
+    : "");
+
   type WriteResult =
-    | { kind: "saved"; path: string }
+    /** `used`: the context the write was made from (7.1 may have put it together again). */
+    | { kind: "saved"; path: string; used: CombineCtx }
     | { kind: "changed"; ctx: CombineCtx }
     | { kind: "conflict" }
     /** Combining with an extra copy, but the tab's own file has a version the tab doesn't have yet. */
-    | { kind: "diskAhead" }
+    | { kind: "diskAhead"; used: CombineCtx }
     | { kind: "failed"; outcome: SaveOutcome };
 
   /** §5.4 step 7: write the combined version once. */
@@ -2597,8 +2759,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (staleCtx(ctx)) {
       const again = await prepareCombine(key, ctx.source, ctx.origin, { queue: ctx.queue, index: ctx.index, total: ctx.total, fromBanner: ctx.fromBanner });
       if (again.kind !== "plan") return { kind: "failed", outcome: { ok: false, reason: "failed" } };
-      again.ctx.choices = { ...ctx.choices };
-      if (lookAgain(ctx, again.ctx, auto)) return { kind: "changed", ctx: again.ctx };
+      again.ctx.choices = carryChoices(ctx, again.ctx);
+      if (await lookAgain(ctx, again.ctx, auto)) return { kind: "changed", ctx: again.ctx };
       // Written without anyone looking only while the new plan still allows it.
       auto = auto && again.ctx.plan.autoApplicable;
       ctx = again.ctx;
@@ -2608,7 +2770,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (!t?.path || !t.analysisId) return { kind: "failed", outcome: { ok: false, reason: "nothing" } };
     const aid = t.analysisId;
     // 7.2
-    const result = Object.keys(ctx.choices).length || !ctx.plan.result ? await applyChoices(ctx.plan, ctx.choices) : ctx.plan.result;
+    const result = !noChoices(ctx.choices) || !ctx.plan.result ? await resultOf(ctx) : ctx.plan.result;
     if (!result) return { kind: "failed", outcome: { ok: false, reason: "failed" } };
     // 7.3 The file it goes into, as it is now.
     const targetPath = ctx.source.kind === "copy" ? survivorPath([t.path, ctx.source.path]) : t.path;
@@ -2621,9 +2783,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const allowed = targetPath === t.path
       ? (ctx.source.kind === "disk" ? [ctx.theirsRev.id] : [ctx.mineBase, ctx.mineRev.id])
       : [ctx.theirsRev.id];
-    if (!allowed.includes(expected)) return ctx.source.kind === "copy" && targetPath === t.path ? { kind: "diskAhead" } : { kind: "conflict" };
+    if (!allowed.includes(expected)) return ctx.source.kind === "copy" && targetPath === t.path ? { kind: "diskAhead", used: ctx } : { kind: "conflict" };
     // 7.4
-    const M = await combineRevision({ mine: ctx.mineRev, theirs: ctx.theirsRev, result, auto, author: author(), time: now() });
+    const M = await combineRevision({ mine: ctx.mineRev, theirs: ctx.theirsRev, result, auto, author: author(), time: now(), legacy });
     // 7.5
     const union = unionManifests(tr.file.manifest, unionManifests(ctx.mineFile.manifest, ctx.theirsFile.manifest));
     const manifest0 = await retain(withRevision(union, M, author(), result.content.doc.template), [ctx.mineRev.id, ctx.theirsRev.id, ctx.baseId]);
@@ -2653,7 +2815,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
           if (!tabDirty(key)) void autoCombine(key, { kind: "journal", revisionId: D });
           else { const j = await readJournalFile(aid, D); if (j) chooseBanner(key, { kind: "journal", revisionId: D }, vi(j.manifest, D)); }
         }
-        return { kind: "saved", path: res.path };
+        return { kind: "saved", path: res.path, used: ctx };
       case "conflict": return { kind: "conflict" };
       case "savedAside":
         i.asides = addUnique(i.asides, res.path);
@@ -2682,7 +2844,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   }
 
   /** §5.4.2 */
-  async function afterCombineSaved(ctx: CombineCtx, path: string, manifest: Manifest, result: CombineResult, M: RevisionP2, opts: { hold: boolean }): Promise<void> {
+  async function afterCombineSaved(ctx: CombineCtx, path: string, manifest: Manifest, result: CombineResultP4, M: RevisionP2, opts: { hold: boolean }): Promise<void> {
     const key = ctx.key;
     const i = it(key);
     const t = tabOf(key)!;
@@ -2761,7 +2923,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       }
     }
     const taken = SECTION_NAMES.filter((k) => result.from[k] === "theirs");
-    addBanner(key, { kind: "combined", version: theirsInfo, sections: taken, actions: ["whatChanged", "undo"], dismissible: true });
+    addBanner(key, { kind: "combined", version: theirsInfo, sections: taken, mixed: [...result.mixed], actions: ["whatChanged", "undo"], dismissible: true });
     toast({ tone: "success", kind: "combined", version: theirsInfo });
     await touchRecent(path, aid);
     await saveSession();
@@ -2773,11 +2935,20 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
   }
 
-  /** "Another computer saved over your last save. … Choose what to keep." [Choose…] */
-  function chooseBanner(key: string, source: CombineSource, version: VersionInfo): void {
-    const b = addBanner(key, { id: "savedOver", kind: "savedOver", state: "choose", version, actions: ["combine"], dismissible: true });
+  /** "Another computer saved over your last save. … Choose what to keep." [Choose…]. Phase 4 `review`: nothing
+   *  to choose, but it is not combined without a click (§4.2) — "… both sets of changes can be combined." [Combine] */
+  function chooseBanner(key: string, source: CombineSource, version: VersionInfo, state: "choose" | "review" = "choose"): void {
+    // Fixer VUX-9: `review` cannot be closed — with it gone the tab read "All changes saved" while the file held
+    // the other computer's version and mine was not in it.
+    const b = addBanner(key, { id: "savedOver", kind: "savedOver", state, version, actions: ["combine"], dismissible: state !== "review" });
     if (b) it(key).bannerSource.set(b.id, source);
   }
+
+  /** Phase 4 §3.3: may a combine nobody asked for be written? (Playing an older app: the phase 2 rule.) */
+  const mayAutoWrite = (ctx: CombineCtx) =>
+    ctx.plan.autoApplicable && (legacy || ctx.plan.level === "section" || peersCombineAlike(ctx.mineRev, ctx.theirsRev));
+  /** The banner of a combine that is not written by itself: `choose` when something needs a choice, else `review`. */
+  const holdState = (ctx: CombineCtx): "choose" | "review" => (legacy || ctx.plan.needsChoice ? "choose" : "review");
 
   function clearCombining(key: string): void {
     const i = internal.get(key);
@@ -2827,7 +2998,12 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     }
     const ctx = prep.ctx;
     const theirsInfo = vi(ctx.theirsFile.manifest, ctx.theirsRev.id);
-    if (!ctx.plan.autoApplicable || tabDirty(key) || ctx.working) { chooseBanner(key, source, theirsInfo); return; }
+    if (tabDirty(key) || ctx.working) { chooseBanner(key, source, theirsInfo); return; }
+    if (!mayAutoWrite(ctx)) {
+      removeBanners(key, (b) => b.kind === "savedOver" && b.state !== undefined);
+      chooseBanner(key, source, theirsInfo, holdState(ctx));
+      return;
+    }
     removeBanners(key, (b) => b.kind === "savedOver");
     addBanner(key, { id: "savedOver", kind: "savedOver", state: "combining", version: theirsInfo, actions: [], dismissible: false });
     patchTab(key, { combining: true });
@@ -2845,7 +3021,24 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (!t?.path || internal.get(key) === undefined) return;
     // Phase 3 §5.5: while the tab is read-only the combine stays pending ("combining" note kept), looked at again
     // when the guard clears.
-    if (readOnlyNow(key)) { it(key).pr.autoWaiting = { ctx, expected }; return; }
+    if (readOnlyNow(key)) {
+      // Fixer VS-3: the file may already hold the combined version (or have moved on) — then there is nothing
+      // to wait for: the tab is brought up to date instead of parking with a stale view.
+      const r0 = await readFile(t.path);
+      if (internal.get(key) === undefined) return;
+      if (r0.ok) {
+        const m0 = r0.file.manifest;
+        const done = isAncestorOrSelf(m0, ctx.mineRev.id, m0.head) && isAncestorOrSelf(m0, ctx.theirsRev.id, m0.head);
+        if (done || m0.head !== expected) {
+          clearCombining(key);
+          const i0 = it(key);
+          if (done && ctx.source.kind === "journal" && !i0.settled.includes(ctx.source.revisionId)) i0.settled = [...i0.settled, ctx.source.revisionId];
+          await onHead(key, m0.head);
+          return;
+        }
+      }
+      if (readOnlyNow(key)) { it(key).pr.autoWaiting = { ctx, expected }; return; }
+    }
     const theirsInfo = vi(ctx.theirsFile.manifest, ctx.theirsRev.id);
     if (tabDirty(key)) { clearCombining(key); chooseBanner(key, ctx.source, theirsInfo); return; }
     const r = await readFile(t.path);
@@ -3043,10 +3236,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const ctx = prep.ctx;
     i.lastSource = source;
     if (ctx.plan.autoApplicable) return applyNow(ctx);
+    // Fixer VUX-3: choices made before the dialog was cancelled, for conflicts that are still the same.
+    const was = i.cancelled;
+    if (was && was.theirsRev.id === ctx.theirsRev.id && noChoices(ctx.choices)) ctx.choices = carryChoices(was, ctx);
     return openCombineDialog(ctx);
   }
 
-  async function openCombineDialog(ctx: CombineCtx, extra: Partial<CombineState> = {}): Promise<SaveOutcome> {
+  async function openCombineDialog(ctx: CombineCtx, extra: Partial<CombineStateP4> = {}): Promise<SaveOutcome> {
     const key = ctx.key;
     const i = it(key);
     i.combine = ctx;
@@ -3062,7 +3258,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   async function applyNow(ctx0: CombineCtx): Promise<SaveOutcome> {
     let ctx = ctx0;
     for (let round = 0; round < 3; round++) {
-      const w = await writeCombine(ctx, ctx.plan.autoApplicable && Object.keys(ctx.choices).length === 0, { hold: false });
+      const w = await writeCombine(ctx, ctx.plan.autoApplicable && noChoices(ctx.choices), { hold: false });
       if (w.kind === "saved") { await nextInQueue(ctx.key, ctx.queue, ctx.index + 1, ctx.total); return { ok: true, path: w.path }; }
       if (w.kind === "failed") return w.outcome;
       if (w.kind === "changed") return openCombineDialog(w.ctx);
@@ -3128,24 +3324,30 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const i = it(key);
     const ctx = i.combine;
     if (!ctx || d.state.applying) return { ok: false, reason: "nothing" };
-    if (presenceBlocks(key, "applyCombine")) return { ok: false, reason: "readOnly" };
+    if (presenceBlocks(key, "applyCombine")) {
+      // Fixer round 2 (RV-2): the tab became read-only while the dialog was open; the notice is behind the dialog.
+      set({ dialog: { kind: "combine", state: { ...d.state, error: APPLY_READ_ONLY } } });
+      return { ok: false, reason: "readOnly" };
+    }
     set({ dialog: { kind: "combine", state: { ...d.state, applying: true, error: null } } });
     const out = await inSaveSlot(key, async () => {
       let cur = ctx;
       for (let round = 0; round < 3; round++) {
-        const presetOnly = Object.entries(cur.choices).every(([k, v]) => cur.plan.sections.find((s) => s.key === k)?.pick === v);
-        const w = await writeCombine(cur, cur.plan.autoApplicable && presetOnly, { hold: false });
+        const w = await writeCombine(cur, cur.plan.autoApplicable && presetOnly(cur), { hold: false });
         if (w.kind === "diskAhead") {
           // Combining with an extra copy while the tab's own file has a newer version: that is taken in
           // first (combined, or the person is asked), then this copy is offered again.
-          if (i.combine === ctx || i.combine === cur) i.combine = null;
+          // Fixer VS-1: also the context 7.1 put together again (typing while the dialog was open) — left set, it
+          // kept the tab from ever showing a later version.
+          if (i.combine === ctx || i.combine === cur || i.combine === w.used) i.combine = null;
           const dd = get().dialog;
           if (dd?.kind === "combine" && dd.state.tabKey === key) set({ dialog: null });
           i.catchUps = 0;
           return startCombineCore(key, cur.source, cur.origin, { queue: cur.queue, index: cur.index, total: cur.total });
         }
         if (w.kind === "saved") {
-          if (i.combine === ctx || i.combine === cur) i.combine = null;
+          if (i.combine === ctx || i.combine === cur || i.combine === w.used) i.combine = null;
+          i.cancelled = null;
           const dd = get().dialog;
           if (dd?.kind === "combine" && dd.state.tabKey === key) set({ dialog: null });
           await nextInQueue(key, cur.queue, cur.index + 1, cur.total);
@@ -3167,12 +3369,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
           if (dd?.kind === "combine") set({ dialog: { kind: "combine", state: { ...dd.state, applying: false, error: "The other version can't be read yet. Try again in a moment." } } });
           return { ok: false, reason: "failed" } as SaveOutcome;
         }
-        next.choices = Object.fromEntries(Object.entries(cur.choices).filter(([k]) => next.plan.sections.find((s) => s.key === k)?.status !== "same"));
+        if (w.kind !== "changed") next.choices = carryChoices(cur, next);
         i.combine = next;
-        if (w.kind === "changed" || lookAgain(cur, next, false)) {
+        if (w.kind === "changed" || await lookAgain(cur, next, false)) {
           // Something changed underneath (a status, or a part somebody chose for): the person looks again;
-          // nothing was written.
-          await openCombineDialog(next);
+          // nothing was written. Fixer VUX-6: the dialog says why it came back.
+          const newer = next.theirsRev.id !== cur.theirsRev.id || next.theirsFile.manifest.head !== cur.theirsFile.manifest.head;
+          await openCombineDialog(next, { error: newer ? LOOK_AGAIN_NEWER : LOOK_AGAIN_EDITED });
           return { ok: false, reason: "conflict" } as SaveOutcome;
         }
         cur = next;
@@ -3191,10 +3394,70 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (!d || d.kind !== "combine") return;
     const ctx = it(d.state.tabKey).combine;
     if (!ctx) return;
-    ctx.choices = { ...ctx.choices, [section]: choice };
-    const st = await combineStateOf(ctx, { index: d.state.index, total: d.state.total });
+    ctx.choices = { ...ctx.choices, sections: { ...(ctx.choices.sections ?? {}), [section]: choice } };
+    await refreshCombineDialog(d.state.tabKey, ctx, d.state);
+  }
+
+  async function refreshCombineDialog(key: string, ctx: CombineCtx, was: CombineState): Promise<void> {
+    const st = await combineStateOf(ctx, { index: was.index, total: was.total });
     const now2 = get().dialog;
-    if (now2?.kind === "combine" && now2.state.tabKey === d.state.tabKey) set({ dialog: { kind: "combine", state: { ...st, applying: now2.state.applying } } });
+    if (now2?.kind === "combine" && now2.state.tabKey === key && it(key).combine === ctx) {
+      set({ dialog: { kind: "combine", state: { ...st, applying: now2.state.applying, error: now2.state.error } } });
+    }
+  }
+
+  /** A whole-section choice of `section` goes (a per-conflict choice was made there). */
+  function dropSectionChoice(c: CombineChoices, section: SectionName): CombineChoices["sections"] {
+    const { [section]: _gone, ...rest } = c.sections ?? {};
+    return Object.keys(rest).length ? rest : undefined;
+  }
+
+  /** §5.3 setConflictChoice: nothing is written. */
+  async function setConflictChoiceImpl(conflictId: string, choice: FineChoice): Promise<void> {
+    const d = get().dialog;
+    if (!d || d.kind !== "combine") return;
+    const ctx = it(d.state.tabKey).combine;
+    if (!ctx) return;
+    const s = ctx.plan.sections.find((x) => x.conflicts.some((c) => c.id === conflictId));
+    const c = s?.conflicts.find((x) => x.id === conflictId);
+    if (!s || !c || !c.options.includes(choice)) return;
+    const sections = dropSectionChoice(ctx.choices, s.key);
+    ctx.choices = { ...(sections ? { sections } : {}), fine: { ...(ctx.choices.fine ?? {}), [conflictId]: choice } };
+    await refreshCombineDialog(d.state.tabKey, ctx, d.state);
+  }
+
+  /** §5.3 setAllInSection ("Use mine / theirs for all"): every conflict of the section, also those not drawn. */
+  async function setAllInSectionImpl(section: SectionName, side: SidePick): Promise<void> {
+    const d = get().dialog;
+    if (!d || d.kind !== "combine") return;
+    const ctx = it(d.state.tabKey).combine;
+    if (!ctx) return;
+    const s = ctx.plan.sections.find((x) => x.key === section);
+    if (!s) return;
+    const fine = { ...(ctx.choices.fine ?? {}) };
+    for (const c of s.conflicts) if (c.options.includes(side)) fine[c.id] = side;
+    const sections = dropSectionChoice(ctx.choices, section);
+    ctx.choices = { ...(sections ? { sections } : {}), fine };
+    await refreshCombineDialog(d.state.tabKey, ctx, d.state);
+  }
+
+  /** Fixer VUX-4: "Use mine / theirs for the rest": that side for every conflict of the section that has no
+   *  choice yet (also those not drawn); the choices already made stay. */
+  async function setRestInSectionImpl(section: SectionName, side: SidePick): Promise<void> {
+    const d = get().dialog;
+    if (!d || d.kind !== "combine") return;
+    const ctx = it(d.state.tabKey).combine;
+    if (!ctx) return;
+    const s = ctx.plan.sections.find((x) => x.key === section);
+    if (!s) return;
+    const fine = { ...(ctx.choices.fine ?? {}) };
+    for (const c of s.conflicts) {
+      const v = fine[c.id];
+      if ((v === undefined || !c.options.includes(v)) && c.options.includes(side)) fine[c.id] = side;
+    }
+    const sections = dropSectionChoice(ctx.choices, section);
+    ctx.choices = { ...(sections ? { sections } : {}), fine };
+    await refreshCombineDialog(d.state.tabKey, ctx, d.state);
   }
 
   function cancelCombineImpl(): void {
@@ -3206,6 +3469,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     i.combine = null;
     set({ dialog: null });
     if (!ctx || !tabOf(key)) return;
+    // Fixer VUX-3: the choices made are kept for the same pair of versions (Esc or Cancel by mistake).
+    i.cancelled = noChoices(ctx.choices) ? null : ctx;
     if (ctx.origin === "save") {
       patchTab(key, { notSaved: true });
       i.lastSource = ctx.source;
@@ -3237,7 +3502,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       if (!c) return;
       const who = ctx.theirsRev.device_name || "another computer";
       const target = await freeBeside(t.path, `(version from ${who})`);
-      const file = await buildNewFile({
+      const file = await newFile({
         content: c, analysisId: newAnalysisId(), forkedFrom: { analysis_id: aid, revision_id: ctx.theirsRev.id }, time: now(), author: author(),
         summary: SUMMARY.first,
       });
@@ -3700,7 +3965,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       }
       const refs = data.rev.sections;
       const rev: RevisionP2 = {
-        ...makeRevision({
+        ...makeRev({
           id: newRevisionId(now()), parents: [R], kind: "restore", time: now(), author: author(), summary: SUMMARY.broughtBack,
           parts: { refs, texts: {}, contentHash: data.rev.content_hash },
         }),
@@ -3778,7 +4043,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const v = get().versions;
     if (v && v.tabKey === key) set({ versions: { ...v, busy: "saveAsNew" } });
     try {
-      const file = await buildNewFile({
+      const file = await newFile({
         content: data.content, analysisId: newAnalysisId(), forkedFrom: { analysis_id: t.analysisId, revision_id: id }, time: now(), author: author(),
         summary: SUMMARY.first,
       });
@@ -4488,7 +4753,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const serial = graph.getState().editSerial;
     const aid = newAnalysisId();
     const forked = t.baseRevision ? { analysis_id: t.analysisId, revision_id: t.baseRevision } : null;
-    const file = await buildNewFile({ content: c, analysisId: aid, forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
+    const file = await newFile({ content: c, analysisId: aid, forkedFrom: forked, time: now(), author: author(), summary: SUMMARY.first });
     const res = await backend.save({ path, expectedHead: null, replaceExisting: true, analysisId: aid, docKey: key, manifest: file.manifest, newParts: file.parts });
     if (!res.ok) {
       addBanner(key, { kind: "saveFailed", message: res.kind === "error" ? saveFailedMessage(res.code) : saveFailedMessage("Io") });
@@ -5191,7 +5456,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
 
   // ── the store ──
 
-  const base = create<FileSessionStateP3>(() => ({
+  const base = create<FileSessionStateP4>(() => ({
     ready: false, desktop: false, tabs: [], activeKey: null, cards: [], recent: [], dialog: null, pathPicker: null, toasts: [],
     settings: null, oldLibrary: null, focusSerial: 0, aboutSerial: 0, busy: false, versions: null,
 
@@ -5326,6 +5591,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     saveVersionAsNew: (id) => saveVersionAsNewImpl(id),
     startCombine: async (key, source) => { await startCombineImpl(key, source, "banner"); },
     setSectionChoice: (section, choice) => setSectionChoiceImpl(section, choice),
+    setConflictChoice: (id, choice) => setConflictChoiceImpl(id, choice),
+    setAllInSection: (section, side) => setAllInSectionImpl(section, side),
     applyCombine: () => applyCombineImpl(),
     cancelCombine: () => cancelCombineImpl(),
     keepBothAsSeparate: () => keepBothAsSeparateImpl(),
@@ -5370,6 +5637,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         };
       },
       presenceTick: () => presenceTick(),
+    },
+    dialogExtras: {
+      setRestInSection: (section: SectionName, side: SidePick) => setRestInSectionImpl(section, side),
     },
   });
 

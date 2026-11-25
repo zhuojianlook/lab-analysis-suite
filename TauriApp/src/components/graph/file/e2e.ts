@@ -34,19 +34,32 @@
    unsaved changes → resuming, a note naming my claim → continued elsewhere, E8 File → Show Others… and Never,
    E7 close tab → note gone; then a second file whose note is left as after a crash; quit as the script says
    (the runner checks the folder after exit). "presenceRestart" (after quit "terminate"): the tab's note is
-   replaced (new session, seq continued); the other file's leftover is removed by the 20 s sweep. */
+   replaced (new session, seq continued); the other file's leftover is removed by the 20 s sweep.
+   "combineFine" (phase 4, checklist E1–E3): fine-level combining against files "another computer" wrote with
+   this build's code (so with combine_v) and, for E3b, without it (an older app). E1 an unsaved edit of one
+   cell here + their save of another cell → Save → one two-parent head with both cells, auto, combine_v 1, my
+   working version in the journal; E2 both changed the same cell → Save → the dialog with one row to choose,
+   nothing on disk changes, theirs + Apply → their value and my other edit; E3 my save replaced on a clean tab
+   by a version with combine_v (another cell) → "combining", nothing written before this computer's delay, one
+   automatic combine; E3b the same with a version without combine_v → "review", nothing written for 15 s, the
+   banner's Combine writes it at once. E2c (integrator) they deleted the last column while I changed a value in
+   it → Save → "Column … deleted by …" to choose, nothing on disk changes, Keep + Apply → the column with my value.
+   E6a / E6b (integrator, when the runner gives `older`): a file written by the released exp-0.2.25 code (a
+   phase 3 file; a file whose head is a phase 2 section-level combine), placed as JSON and saved by this app,
+   opens, combines cell by cell on Save and saves; every older version stays byte for byte, the new ones carry
+   combine_v, the format fields are unchanged. Quits as the script says. */
 
-import { isDirty, useGraphStore } from "../../../store/graphStore";
+import { isDirty, useGraphStore, type DocContent } from "../../../store/graphStore";
 import { useFileSession } from "./session";
 import { tauriInvoke } from "./tauriBackend";
 import { buildNextFile, fileAt, newDocKey, openFile } from "./docCodec";
-import { editContent } from "./devSim";
-import { MENU, type FileTab, type PathPickerRequest, type RevisionP2 } from "./contract";
+import { editContent, fineEditContent } from "./devSim";
+import { COMBINE_V, MENU, type CombineStateP4, type FileTab, type PathPickerRequest, type RevisionP2, type RevisionP4 } from "./contract";
 import { canonicalJson, FEATURES, type GraphFileData, type SectionName } from "./format";
 import { combineDelayMs } from "./graphMerge";
 
 interface Script {
-  phase: "first" | "restore" | "missing" | "renamed" | "opens" | "combine" | "combineRestore" | "presence" | "presenceRestart";
+  phase: "first" | "restore" | "missing" | "renamed" | "opens" | "combine" | "combineRestore" | "presence" | "presenceRestart" | "combineFine";
   roots: string[];
   dir: string;
   otherDir: string;
@@ -57,6 +70,8 @@ interface Script {
   leftover?: { seq: number; session: string };
   /** presence: the sync service `dir` must be detected as (the real folder rules, not LAS_CLOUD_ROOTS), e.g. "Dropbox". */
   expectService?: string;
+  /** combineFine: GraphFileData JSON files written by the released exp-0.2.25 code (integrator E6a / E6b). */
+  older?: { p3?: string; p2comb?: string };
 }
 
 interface Step { name: string; ok: boolean; ms: number; detail?: unknown; error?: string }
@@ -472,6 +487,224 @@ export async function runE2EIfAsked(): Promise<void> {
       await write();
       return;
     }
+    await quitAndKeep();
+  }
+
+  // ── phase 4 ──
+  async function combineFinePhase(): Promise<void> {
+    const dir = script!.dir;
+    const F = lag(dir, "E2E P4");
+    const stage = (n: string) => lag(script!.otherDir, `stage-p4-${n}`);
+    const read = async (p: string) => { const r = await backend().read(p); if (!r.ok) throw new Error(`read ${p}: ${r.code}`); return r.file; };
+    const headRevOf = (f: GraphFileData) => f.manifest.revisions.find((r) => r.id === f.manifest.head) as RevisionP4;
+    const cellAt = (r: number, c: number) => G().doc?.cells?.[r]?.[c]?.[0] ?? null;
+    /** Another computer's save of `path` with exactly the cells given, built with this build's code
+     *  (combine_v unless `old`), staged and copied over the file the way a sync client delivers it. */
+    const otherSaves = async (path: string, n: string, cells: [number, number, string][], o: { fromParent?: boolean; old?: boolean; edit?: (c: DocContent) => DocContent } = {}) => {
+      let src = await read(path);
+      if (o.fromParent) {
+        const parent = headRevOf(src).parents[0];
+        src = (parent && fileAt(src, parent)) || src;
+      }
+      const c0 = openFile(src)!;
+      const c = o.edit ? o.edit(c0) : c0;
+      const rows = c.doc.cells.map((row) => row.map((reps) => [...reps]));
+      for (const [r, col, v] of cells) rows[r][col][0] = v;
+      const author = { user_name: "Other Person", device_id: "d-e2e-other", device_name: "Other Mac", session_id: "s-e2e-other", app_version: "e2e", platform: "macos" };
+      const built = await buildNextFile(src, { ...c, doc: { ...c.doc, cells: rows } }, { time: Date.now(), author });
+      const f: GraphFileData = o.old ? built : {
+        ...built, manifest: { ...built.manifest, revisions: built.manifest.revisions.map((r) => (r.id === built.manifest.head ? { ...r, combine_v: COMBINE_V } : r)) },
+      };
+      const res = await backend().save({ path: stage(n), expectedHead: null, analysisId: f.manifest.analysis_id, docKey: newDocKey(), manifest: f.manifest, newParts: f.parts, replaceExisting: true });
+      if (!res.ok) throw new Error(`stage save: ${JSON.stringify(res)}`);
+      await fs("copyOver", stage(n), path);
+      return f.manifest.head;
+    };
+    const tabAt = (p: string) => S().tabs.find((t) => t.path === p) ?? null;
+    const tabF = () => tabAt(F);
+    const myDevice = (await backend().device()).device_id;
+    const delay = await combineDelayMs(myDevice);
+    result.combineDelayMs = delay;
+
+    await step("E1: an unsaved edit of one cell + their save of another cell (with combine_v) → Save → one combined version, both cells, auto, combine_v 1", async () => {
+      check((await S().newDoc("column", true)).ok, "newDoc");
+      nextPath = F;
+      check((await S().save()).ok, "first save");
+      const first = headRevOf(await read(F));
+      check(first.combine_v === COMBINE_V, `first save combine_v ${first.combine_v}`);
+      G().setCell(0, 0, 0, "E1 mine");
+      await until("dirty", () => tabF()?.dirty);
+      const theirs = await otherSaves(F, "e1", [[4, 1, "E1 theirs"]]);
+      await until("newer-version banner", () => tabF()?.banners.some((b) => b.kind === "newerOnDisk"), 20000);
+      const s = await S().save();
+      check(s.ok && S().dialog === null, `save ${JSON.stringify(s)} dialog ${S().dialog?.kind}`);
+      const f = await read(F);
+      const h = headRevOf(f);
+      check(h.kind === "merge" && h.parents.length === 2 && h.parents.includes(theirs), `head ${JSON.stringify(h.parents)}`);
+      check(h.auto === true && h.combine_v === COMBINE_V, `auto ${h.auto} combine_v ${h.combine_v}`);
+      const c = openFile(f)!;
+      check(c.doc.cells[0][0][0] === "E1 mine" && c.doc.cells[4][1][0] === "E1 theirs", `cells ${c.doc.cells[0][0][0]} / ${c.doc.cells[4][1][0]}`);
+      const w = h.parents.find((p) => p !== theirs)!;
+      const j = await backend().readJournal(f.manifest.analysis_id, w);
+      check(!!j && j.manifest.head === w, "my working version is in this computer's saved copies");
+      check((j!.manifest.revisions.find((r) => r.id === w) as RevisionP4).combine_v === COMBINE_V, "working version has combine_v");
+      const banner = tabF()!.banners.find((b) => b.kind === "combined");
+      check(!!banner && JSON.stringify(banner.mixed) === JSON.stringify(["table"]), `combined banner ${JSON.stringify(banner)}`);
+      await until("tab shows both cells", () => cellAt(0, 0) === "E1 mine" && cellAt(4, 1) === "E1 theirs" && !tabF()?.dirty, 15000);
+      return { head: h.id, parents: h.parents, mixed: banner!.mixed };
+    });
+
+    await step("E2: both changed the same cell → Save → one row to choose, nothing on disk changes; theirs + Apply → their value and my other edit", async () => {
+      G().setCell(0, 0, 0, "E2 mine");
+      G().setCell(3, 2, 0, "E2 other");
+      await until("dirty", () => tabF()?.dirty);
+      const theirs = await otherSaves(F, "e2", [[0, 0, "E2 theirs"]]);
+      await until("newer-version banner", () => tabF()?.banners.some((b) => b.kind === "newerOnDisk"), 20000);
+      const s = await S().save();
+      check(!s.ok && s.reason === "conflict" && S().dialog?.kind === "combine", `save ${JSON.stringify(s)} dialog ${S().dialog?.kind}`);
+      const st = () => (S().dialog as unknown as { state: CombineStateP4 }).state;
+      const table = st().sections.find((x) => x.key === "table")!;
+      check(st().toChoose === 1 && !st().canApply && table.conflicts.length === 1 && table.conflicts[0].id.startsWith("table:row:"), `state ${JSON.stringify({ toChoose: st().toChoose, ids: table.conflicts.map((c) => c.id) })}`);
+      const onDisk = (await read(F)).manifest.head;
+      check(onDisk === theirs, `written before Apply: ${onDisk}`);
+      await S().setConflictChoice(table.conflicts[0].id, "theirs");
+      check(st().canApply && st().toChoose === 0, "Apply not enabled after the choice");
+      check((await read(F)).manifest.head === theirs, "written by the choice");
+      const ap = await S().applyCombine();
+      check(ap.ok, `apply ${JSON.stringify(ap)}`);
+      const f = await read(F);
+      const h = headRevOf(f);
+      check(h.kind === "merge" && !h.auto && h.device_id === myDevice && h.combine_v === COMBINE_V, `head ${JSON.stringify({ auto: h.auto, dev: h.device_id, v: h.combine_v })}`);
+      const c = openFile(f)!;
+      check(c.doc.cells[0][0][0] === "E2 theirs" && c.doc.cells[3][2][0] === "E2 other", `cells ${c.doc.cells[0][0][0]} / ${c.doc.cells[3][2][0]}`);
+      return { head: h.id, conflict: table.conflicts[0].id };
+    });
+
+    await step("E2c: they deleted the last column, I changed a value in it → Save → 'Column … deleted' to choose, nothing on disk changes; Keep + Apply → the column with my value and my other edit", async () => {
+      const d0 = G().doc!;
+      const last = d0.col_titles.length - 1;
+      const lastId = d0.col_ids[last];
+      check(last >= 1, `columns ${d0.col_titles.length}`);
+      G().setCell(1, last, 0, "E2c mine");
+      G().setCell(2, 0, 0, "E2c other");
+      await until("dirty", () => tabF()?.dirty);
+      const theirs = await otherSaves(F, "e2c", [], { edit: (c) => fineEditContent(c, "deleteCol") });
+      check(!openFile(await read(F))!.doc.col_ids.includes(lastId), "their version still has the column");
+      await until("newer-version banner", () => tabF()?.banners.some((b) => b.kind === "newerOnDisk"), 20000);
+      const s = await S().save();
+      check(!s.ok && s.reason === "conflict" && S().dialog?.kind === "combine", `save ${JSON.stringify(s)} dialog ${S().dialog?.kind}`);
+      const st = () => (S().dialog as unknown as { state: CombineStateP4 }).state;
+      const table = st().sections.find((x) => x.key === "table")!;
+      const cd = table.conflicts.find((c) => c.kind === "colDeleted");
+      check(!!cd && cd.id === `table:col:${lastId}` && cd.deletedBy === "theirs", `conflicts ${JSON.stringify(table.conflicts.map((c) => [c.id, c.kind, c.deletedBy]))}`);
+      check(st().toChoose === 1 && !st().canApply, `toChoose ${st().toChoose} canApply ${st().canApply}`);
+      check(cd!.items.some((it) => it.mine === "E2c mine" && it.theirs === null), `items ${JSON.stringify(cd!.items)}`);
+      check((await read(F)).manifest.head === theirs, "written before Apply");
+      await S().setConflictChoice(cd!.id, "mine");                  // the side that did not delete it: keep the column
+      check(st().canApply && st().toChoose === 0, "Apply not enabled after the choice");
+      const adjustments = st().adjustments.map((a) => `${a.section}:${a.kind}:${a.field ?? ""}`);
+      await sleep(1500);
+      check((await read(F)).manifest.head === theirs, "written by the choice");
+      const ap = await S().applyCombine();
+      check(ap.ok, `apply ${JSON.stringify(ap)}`);
+      const f = await read(F);
+      const h = headRevOf(f);
+      check(h.kind === "merge" && h.parents.includes(theirs) && !h.auto && h.combine_v === COMBINE_V, `head ${JSON.stringify({ p: h.parents, auto: h.auto, v: h.combine_v })}`);
+      const c = openFile(f)!;
+      const at = c.doc.col_ids.indexOf(lastId);
+      check(at === last && c.doc.col_titles.length === d0.col_titles.length, `column at ${at}, ${c.doc.col_titles.length} columns`);
+      check(c.doc.cells[1][at][0] === "E2c mine" && c.doc.cells[2][0][0] === "E2c other", `cells ${c.doc.cells[1][at][0]} / ${c.doc.cells[2][0][0]}`);
+      await until("tab clean on it", () => tabF()?.baseRevision === h.id && !tabF()?.dirty && cellAt(1, last) === "E2c mine", 15000);
+      return { head: h.id, conflict: cd!.id, adjustments };
+    });
+
+    await step("E3: my save replaced on a clean tab by a version with combine_v (another cell) → 'combining', nothing before the delay, one automatic combine", async () => {
+      G().setCell(6, 0, 0, "E3 mine");
+      await until("dirty", () => tabF()?.dirty);
+      check((await S().save()).ok, "my save");
+      const mine = (await read(F)).manifest.head;
+      await until("clean", () => !tabF()?.dirty && tabF()?.baseRevision === mine);
+      const t0 = Date.now();
+      const theirs = await otherSaves(F, "e3", [[7, 1, "E3 theirs"]], { fromParent: true });
+      await until("'combining' banner", () => tabF()?.banners.some((b) => b.kind === "savedOver" && b.state === "combining"), 20000);
+      check((await read(F)).manifest.head === theirs, "written before the delay");
+      await until("one automatic combine", async () => (await read(F)).manifest.revisions.some((r) => r.parents.length === 2 && r.parents.includes(theirs) && r.parents.includes(mine)), 30000);
+      const wroteAfter = Date.now() - t0;
+      const f = await read(F);
+      const h = headRevOf(f);
+      check(h.auto === true && h.combine_v === COMBINE_V && h.user_name === "", `head ${JSON.stringify({ auto: h.auto, v: h.combine_v, user: h.user_name })}`);
+      const c = openFile(f)!;
+      check(c.doc.cells[6][0][0] === "E3 mine" && c.doc.cells[7][1][0] === "E3 theirs", "both cells");
+      check(wroteAfter >= delay - 500, `combined after ${wroteAfter} ms, the delay is ${delay} ms`);
+      await until("tab clean on it", () => tabF()?.baseRevision === h.id && !tabF()?.combining && cellAt(7, 1) === "E3 theirs", 15000);
+      return { delay, wroteAfterMs: wroteAfter, head: h.id };
+    });
+
+    await step("E3b: the same with a version WITHOUT combine_v → 'review', nothing written for 15 s; Combine writes it at once", async () => {
+      G().setCell(8, 0, 0, "E3b mine");
+      await until("dirty", () => tabF()?.dirty);
+      check((await S().save()).ok, "my save");
+      const mine = (await read(F)).manifest.head;
+      await until("clean", () => !tabF()?.dirty && tabF()?.baseRevision === mine);
+      const theirs = await otherSaves(F, "e3b", [[9, 1, "E3b theirs"]], { fromParent: true, old: true });
+      const b = (await until("'review' banner", () => tabF()?.banners.find((x) => x.kind === "savedOver" && x.state === "review"), 20000))!;
+      check(b.actions.join() === "combine", `actions ${b.actions}`);
+      await sleep(15000);
+      check((await read(F)).manifest.head === theirs, "written without a click");
+      check(tabF()?.banners.some((x) => x.kind === "savedOver" && x.state === "review"), "banner went");
+      await S().bannerAction(tabF()!.key, b.id, "combine");
+      await until("combined", async () => headRevOf(await read(F)).parents.length === 2, 15000);
+      check(S().dialog === null, `dialog ${S().dialog?.kind}`);
+      const f = await read(F);
+      const h = headRevOf(f);
+      check(h.parents.includes(mine) && h.parents.includes(theirs) && h.combine_v === COMBINE_V, `head ${JSON.stringify(h.parents)}`);
+      const c = openFile(f)!;
+      check(c.doc.cells[8][0][0] === "E3b mine" && c.doc.cells[9][1][0] === "E3b theirs", "both cells");
+      return { head: h.id };
+    });
+
+    const olderFile = async (tag: string, what: string, json: string | undefined, name: string) => {
+      if (!json) return;
+      await step(`E6${tag}: ${what} (written by the released exp-0.2.25 code) opens, combines cell by cell on Save and saves; its versions stay byte for byte`, async () => {
+        const text = await fs<string | null>("readText", json);
+        check(!!text, `the runner did not place ${json}`);
+        const data = JSON.parse(text!) as GraphFileData;
+        check(!data.manifest.revisions.some((r) => "combine_v" in r), "the older file already has combine_v");
+        const P = lag(dir, name);
+        const placed = await backend().save({ path: P, expectedHead: null, analysisId: data.manifest.analysis_id, docKey: newDocKey(), manifest: data.manifest, newParts: data.parts, replaceExisting: true });
+        check(placed.ok, `place ${JSON.stringify(placed)}`);
+        const before = await read(P);
+        check(before.manifest.head === data.manifest.head, "placed head");
+        const o = await S().open(P);
+        check(o.ok, `open ${JSON.stringify(o)}`);
+        await until("loaded", () => activeTab()?.path === P && !!G().doc && !activeTab()?.dirty, 15000);
+        G().setCell(4, 0, 0, `E6${tag} mine`);
+        await until("dirty", () => tabAt(P)?.dirty);
+        const theirs = await otherSaves(P, `e6${tag}`, [[5, 1, `E6${tag} theirs`]]);
+        await until("newer-version banner", () => tabAt(P)?.banners.some((b) => b.kind === "newerOnDisk"), 20000);
+        const s = await S().save();
+        check(s.ok && S().dialog === null, `save ${JSON.stringify(s)} dialog ${S().dialog?.kind}`);
+        const f = await read(P);
+        const h = headRevOf(f);
+        check(h.kind === "merge" && h.parents.length === 2 && h.parents.includes(theirs) && h.auto === true && h.combine_v === COMBINE_V, `head ${JSON.stringify({ p: h.parents, auto: h.auto, v: h.combine_v })}`);
+        const c = openFile(f)!;
+        check(c.doc.cells[4][0][0] === `E6${tag} mine` && c.doc.cells[5][1][0] === `E6${tag} theirs`, "both cells");
+        for (const r of data.manifest.revisions) {
+          const now = f.manifest.revisions.find((x) => x.id === r.id);
+          check(!!now && canonicalJson(now) === canonicalJson(r), `older version ${r.id} changed`);
+        }
+        const added = f.manifest.revisions.filter((x) => !data.manifest.revisions.some((r) => r.id === x.id)) as RevisionP4[];
+        check(added.length === 3 && added.every((x) => x.combine_v === COMBINE_V), `added ${JSON.stringify(added.map((x) => [x.kind, x.combine_v]))}`);
+        const fm = (m: GraphFileData["manifest"]) => [m.format_version, m.min_reader_version, m.features].join("/");
+        check(fm(f.manifest) === fm(data.manifest), `format ${fm(f.manifest)} was ${fm(data.manifest)}`);
+        const banner = tabAt(P)!.banners.find((b) => b.kind === "combined");
+        check(!!banner && JSON.stringify(banner.mixed) === JSON.stringify(["table"]), `combined banner ${JSON.stringify(banner)}`);
+        return { head: h.id, olderVersions: data.manifest.revisions.length, olderHeadParents: revisionOfData(data).parents.length, format: fm(f.manifest) };
+      });
+    };
+    const revisionOfData = (d: GraphFileData) => d.manifest.revisions.find((r) => r.id === d.manifest.head)!;
+    await olderFile("a", "a phase 3 file", script!.older?.p3, "E2E older p3");
+    await olderFile("b", "a file whose head is a phase 2 combine", script!.older?.p2comb, "E2E older p2comb");
     await quitAndKeep();
   }
 
@@ -929,6 +1162,11 @@ export async function runE2EIfAsked(): Promise<void> {
 
     if (script.phase === "presence" || script.phase === "presenceRestart") {
       await presencePhase(script.phase);
+      return;
+    }
+
+    if (script.phase === "combineFine") {
+      await combineFinePhase();
       return;
     }
 

@@ -22,7 +22,9 @@ function Toast({ t }: { t: SessionToast }) {
 /** Short notes from the files controller (contract §5.5 "Toasts"), bottom centre. */
 export function Toasts() {
   const toasts = useFileSession((s) => s.toasts);
-  if (!toasts.length) return null;
+  // Fixer VUX-10: not over the combine window's footer; they show (and time out) once it is closed.
+  const combining = useFileSession((s) => s.dialog?.kind === "combine");
+  if (!toasts.length || combining) return null;
   return (
     <Box sx={{ position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", zIndex: 1450, pointerEvents: "none" }}>
       <Stack spacing={1} alignItems="center" sx={{ "& > *": { pointerEvents: "auto" } }} data-testid="toasts">

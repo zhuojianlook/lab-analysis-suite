@@ -5,7 +5,8 @@
 import type { GraphSaved, GraphSummary } from "../../../api/graph";
 import { createGraphStore, type GraphStoreApi } from "../../../store/graphStore";
 import { sampleDoc } from "../graphModel";
-import type { DialogAnswer, PathPickerRequest } from "./contract";
+import type { CombineStateP4, DialogAnswer, PathPickerRequest, RevisionP4 } from "./contract";
+import { canonScratch, parseScratch } from "../scratchpad/scratchModel";
 import { buildNewFile, newAnalysisId, newDocKey, openFile, type Author } from "./docCodec";
 import type { GraphFileData } from "./format";
 import { ManualClock, MemoryWorld, type ConflictMode, type DeviceOptions, type MemoryDevice } from "./memoryBackend";
@@ -300,4 +301,59 @@ export async function group(n = 2, opts: {
   }
   await tick(w, 2 * Math.max(delay, opts.noteDelay ?? 0) + 500);
   return { w, cs, delay, path };
+}
+
+// ── phase 4 helpers (fine-level combining) ──────────────────────────────────
+
+/** Type `value` into replicate `rep` of row `r`, column `col`. */
+export async function editCellAt(c: Computer, r: number, col: number, value: string, rep = 0) {
+  c.graph.getState().setCell(r, col, rep, value);
+  await flush();
+}
+export async function insertRowAt(c: Computer, at: number) { c.graph.getState().insertRow(at); await flush(); }
+export async function deleteRowAt(c: Computer, r: number) { c.graph.getState().deleteRow(r); await flush(); }
+export async function deleteColAt(c: Computer, col: number) { c.graph.getState().deleteCol(col); await flush(); }
+export async function setYRange(c: Computer, yMin: number | null, yMax: number | null) {
+  c.graph.getState().setFigure({ y_min: yMin, y_max: yMax } as never);
+  await flush();
+}
+/** Scratchpad cells set to these inputs ("" clears one); the other cells stay. */
+export async function setScratchCells(c: Computer, cells: [row: number, col: number, input: string][]) {
+  const doc = parseScratch(c.graph.getState().scratch ?? "");
+  const keyOf = (r: number, k: number) => `${r}:${k}`;
+  const by = new Map(doc.cells.map((x) => [keyOf(x[0], x[1]), x] as const));
+  for (const [r, k, v] of cells) { if (v === "") by.delete(keyOf(r, k)); else by.set(keyOf(r, k), [r, k, v]); }
+  c.graph.getState().setScratch(canonScratch({ ...doc, cells: [...by.values()] }));
+  await flush();
+}
+/** Every scratchpad cell moved `dRows` rows down (a row inserted at the top), plus `extra` cells. */
+export async function shiftScratch(c: Computer, dRows: number, extra: [number, number, string][] = []) {
+  const doc = parseScratch(c.graph.getState().scratch ?? "");
+  const cells = [...doc.cells.map((x) => { const y = [...x] as typeof x; y[0] = x[0] + dRows; return y; }), ...extra];
+  c.graph.getState().setScratch(canonScratch({ ...doc, cells }));
+  await flush();
+}
+/** The scratchpad input at (row, col) of a content, or null. */
+export const scratchAt = (content: DocContent | null, r: number, k: number): string | null =>
+  parseScratch(content?.scratch ?? "").cells.find((x) => x[0] === r && x[1] === k)?.[2] ?? null;
+/** The dialog state of a combine (phase 4 form), or null. */
+export function combineState(c: Computer): CombineStateP4 | null {
+  const d = c.ses.getState().dialog;
+  return d?.kind === "combine" ? (d.state as CombineStateP4) : null;
+}
+/** The head revision of the file at `path` on `dev` (as stored). */
+export function headRev(dev: MemoryDevice, path: string): RevisionP4 | null {
+  const f = dev.localFile(path);
+  return (f?.manifest.revisions.find((r) => r.id === f.manifest.head) as RevisionP4 | undefined) ?? null;
+}
+/** Revisions with `auto: true` that share sorted parents (D3), over every file of every disk. */
+export function duplicateAutoCombines(w: MemoryWorld): string[] {
+  const by = new Map<string, Set<string>>();
+  for (const d of w.devices) for (const p of d.localPaths()) for (const r of (d.localFile(p)?.manifest.revisions ?? []) as RevisionP4[]) {
+    if (!(r as { auto?: boolean }).auto) continue;
+    const k = [...r.parents].sort().join("+");
+    if (!by.has(k)) by.set(k, new Set());
+    by.get(k)!.add(r.id);
+  }
+  return [...by.entries()].filter(([, ids]) => ids.size > 1).map(([k, ids]) => `${k}: ${[...ids].join(",")}`);
 }

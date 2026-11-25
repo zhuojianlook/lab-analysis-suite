@@ -333,3 +333,135 @@ describe("simulator, phase 3 (who is editing)", () => {
     expect(sim.notes(PREVIEW_SAMPLE).filter((n) => n.deviceName === "This Mac")).toEqual([]);
   });
 });
+
+// ── phase 4: small changes on the other computer (§6.7) ─────────────────────
+
+describe("phase 4 simulator: the cases the 'Small changes' group must produce", () => {
+  type Own = (app: Awaited<ReturnType<typeof preview>>["app"]) => void;
+  const cell = (r: number, c: number, v: string): Own => (app) => app.graph.getState().setCell(r, c, 0, v);
+  const dialogOf = (app: Awaited<ReturnType<typeof preview>>["app"]) => {
+    const d = app.ses.getState().dialog;
+    return d?.kind === "combine" ? (d.state as import("./contract").CombineStateP4) : null;
+  };
+  /** Own unsaved edit, the other computer saves a newer version with `fine`, then "Combine my changes with it". */
+  async function newer(fine: import("./contract").SimFineEdit, own: Own, prep?: (s: Awaited<ReturnType<typeof preview>>) => Promise<void>) {
+    const p = await preview();
+    await p.app.ses.getState().open(PREVIEW_SAMPLE);
+    await prep?.(p);
+    own(p.app);
+    await flush();
+    await p.sim.remoteEdit(PREVIEW_SAMPLE, { fine });
+    await tick(p.w, 3000);
+    const t = p.app.ses.getState().tabs[0];
+    const b = t.banners.find((x) => x.kind === "newerOnDisk");
+    expect(b).toBeTruthy();
+    await p.app.ses.getState().bannerAction(t.key, b!.id, "combine");
+    await flush();
+    return p;
+  }
+
+  it("own edit of another cell + 'cell' → combined without a dialog, both values", async () => {
+    const { app, pw } = await newer("cell", cell(1, 0, "mine"));
+    expect(app.ses.getState().dialog).toBeNull();
+    const head = pw.device.localFile(PREVIEW_SAMPLE)!.manifest;
+    expect(head.revisions.find((r) => r.id === head.head)!.parents).toHaveLength(2);
+    expect(app.graph.getState().doc!.cells[1][0][0]).toBe("mine");
+  });
+
+  it("own edit of the same cell + 'cell' → one row to choose", async () => {
+    const { app } = await newer("cell", cell(0, 0, "mine"));
+    const d = dialogOf(app)!;
+    expect(d.toChoose).toBe(1);
+    expect(d.sections.find((s) => s.key === "table")!.conflicts.map((c) => c.kind)).toEqual(["row"]);
+  });
+
+  it("own values in the first blank row + 'addRow' → two rows, nothing to choose (fixer M1); the order is checked where it matters", async () => {
+    const { app } = await newer("addRow", (a) => {
+      const doc = a.graph.getState().doc!;
+      const r = doc.cells.findIndex((row, i) => row.every((reps) => reps.every((v) => v.trim() === "")) && !doc.row_titles[i]);
+      a.graph.getState().setCell(r, 0, 0, "mine");
+    });
+    const d = dialogOf(app);
+    if (d) {
+      // Grouped / XY: "Row order — please check", nothing to choose, Apply enabled.
+      expect(d.toChoose).toBe(0);
+      expect(d.canApply).toBe(true);
+      expect(d.sections.find((s) => s.key === "table")!.orderChecks.some((o) => o.matters && o.axis === "row")).toBe(true);
+      await app.ses.getState().applyCombine();
+      await flush();
+    }
+    expect(app.ses.getState().dialog).toBeNull();
+    const doc = app.graph.getState().doc!;
+    const mineRow = doc.cells.findIndex((row) => row[0][0] === "mine");
+    expect(mineRow).toBeGreaterThanOrEqual(0);
+    expect(doc.cells[mineRow].slice(1).every((reps) => reps.every((v) => v === ""))).toBe(true);
+    expect(doc.cells.some((row, i) => i !== mineRow && row.every((reps) => reps[0] === "7"))).toBe(true);
+  });
+
+  it("own edit in the last column + 'deleteCol' → the column deleted by them, changed here", async () => {
+    const { app } = await newer("deleteCol", (a) => a.graph.getState().setCell(3, a.graph.getState().doc!.col_titles.length - 1, 0, "mine"));
+    const c = dialogOf(app)!.sections.find((s) => s.key === "table")!.conflicts;
+    expect(c).toEqual([expect.objectContaining({ kind: "colDeleted", deletedBy: "theirs" })]);
+  });
+
+  it("own Y range + 'yRange' → 'Y axis range' to choose; own graph title + 'yRange' → combined", async () => {
+    const p1 = await newer("yRange", (a) => a.graph.getState().setFigure({ y_min: 1, y_max: 9 } as never));
+    expect(dialogOf(p1.app)!.sections.find((s) => s.key === "figure")!.conflicts.map((c) => c.id)).toEqual(["figure:group:yRange"]);
+    const p2 = await newer("yRange", (a) => a.graph.getState().setFigure({ title: "mine" }));
+    expect(p2.app.ses.getState().dialog).toBeNull();
+    expect(p2.app.graph.getState().figure).toMatchObject({ title: "mine", y_min: 0, y_max: 100 });
+  });
+
+  it("own B2 + 'scratchCells' → cell B2 to choose", async () => {
+    const { app } = await newer("scratchCells", (a) => a.graph.getState().setScratch(JSON.stringify({ v: 1, cells: [[2, 2, "mine"]] })));
+    expect(dialogOf(app)!.sections.find((s) => s.key === "scratchpad")!.conflicts.map((c) => c.id)).toEqual(["scratchpad:cell:B2"]);
+  });
+
+  it("'scratchShift' on a small scratchpad first fills A1:B6; then own edit + 'scratchShift' → the three-button whole choice", async () => {
+    const { app } = await newer("scratchShift", (a) => a.graph.getState().setScratch(JSON.stringify({ v: 1, cells: [[1, 1, "11"], [9, 9, "mine"]] })), async ({ sim, w }) => {
+      await sim.remoteEdit(PREVIEW_SAMPLE, { fine: "scratchShift" });
+      await tick(w, 3000);
+    });
+    const sp = dialogOf(app)!.sections.find((s) => s.key === "scratchpad")!;
+    expect(sp.conflicts).toEqual([expect.objectContaining({ id: "scratchpad:section", reason: "shift", options: ["mine", "theirs", "both"] })]);
+  });
+
+  it("'saves over my last save' with the older app on → the 'review' banner; off → combining by itself", async () => {
+    for (const oldApp of [true, false]) {
+      const { app, sim, w, pw } = await preview();
+      await app.ses.getState().open(PREVIEW_SAMPLE);
+      app.graph.getState().setCell(2, 1, 0, "my save");
+      await flush();
+      await app.ses.getState().save();
+      await tick(w, 3000);
+      sim.setOldApp(oldApp);
+      await sim.remoteDiverge(PREVIEW_SAMPLE, { fine: "cell", how: "saveOver" });
+      const head = pw.other.localFile(PREVIEW_SAMPLE)!.manifest;
+      expect("combine_v" in head.revisions.find((r) => r.id === head.head)!).toBe(!oldApp);
+      await tick(w, 30_000);
+      const t = app.ses.getState().tabs[0];
+      if (oldApp) {
+        expect(t.banners.find((b) => b.kind === "savedOver")).toMatchObject({ state: "review", actions: ["combine"] });
+      } else {
+        expect(t.banners.find((b) => b.kind === "combined")).toMatchObject({ mixed: ["table"] });
+        const m = pw.device.localFile(PREVIEW_SAMPLE)!.manifest;
+        expect(m.revisions.find((r) => r.id === m.head)).toMatchObject({ auto: true, combine_v: 1 });
+      }
+    }
+  });
+
+  it("every fine edit the panel offers saves a version that reads back the same (pipeline form)", async () => {
+    const { fineEditContent } = await import("./devSim");
+    const { openFile, sectionsOf, partsOf } = await import("./docCodec");
+    const { normaliseSections } = await import("./graphMerge");
+    const { pw } = await preview();
+    const c0 = openFile(pw.device.localFile(PREVIEW_SAMPLE)!)!;
+    for (const fine of ["cell", "cellOther", "addRow", "insertRow", "deleteRow", "deleteCol", "renameCol", "yRange", "graphTitle", "alpha", "scratchCells", "scratchShift"] as const) {
+      const c = fineEditContent(c0, fine);
+      const sec = sectionsOf(c);
+      const n = await normaliseSections(JSON.parse(JSON.stringify(sec)));
+      expect(n, fine).not.toBeNull();
+      expect(n!.parts.contentHash, fine).toBe((await partsOf(sec)).contentHash);
+    }
+  });
+});

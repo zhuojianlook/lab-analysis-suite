@@ -349,7 +349,12 @@ describe("M14 combineRevision", () => {
     expect(rv.sections).toEqual(p.result!.parts.refs);
     expect(rv.content_hash).toBe(p.result!.parts.contentHash);
     expect(rv.sections_from).toEqual({ table: mine.id, figure: theirs.id });
-    expect(Object.keys(rv)).toEqual(["id", "parents", "time", "user_name", "device_id", "device_name", "session_id", "app_version", "kind", "summary", "sections", "content_hash", "auto", "sections_from"]);
+    // Phase 4 §2.7.3: plus the rules' version (left out only when playing an older app).
+    expect(Object.keys(rv)).toEqual(["id", "parents", "time", "user_name", "device_id", "device_name", "session_id", "app_version", "kind", "summary", "sections", "content_hash", "auto", "sections_from", "combine_v"]);
+    expect(rv.combine_v).toBe(1);
+    const old = await combineRevision({ mine, theirs, result: p.result!, auto: true, author, time: T + 99999, legacy: true });
+    expect("combine_v" in old).toBe(false);
+    expect({ ...old, combine_v: 1 }).toEqual(rv);
   });
 
   it("chosen form carries the author and time; no auto key; a repaired section is left out of sections_from", async () => {

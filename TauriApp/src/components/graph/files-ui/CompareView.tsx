@@ -1,36 +1,21 @@
 /* "Compare with current" (phase 2 contract §6.1): which parts differ, the
    changed cells of the table, changed settings as "field: a → b", the
-   scratchpad's changed cell count and the two graphs side by side. */
+   scratchpad's changed cell count and the two graphs side by side.
+   Phase 4 (contract §6.6): the mini-table of one row on two sides, used by the
+   combine dialog's blocks, so the dialog and this view draw a row the same way. */
 
-import { useMemo } from "react";
-import { Box, Chip, Stack, Typography } from "@mui/material";
-import type { CompareResult } from "../file/contract";
+import { Fragment, useMemo } from "react";
+import { Box, Chip, Stack, Typography, alpha, useTheme } from "@mui/material";
+import type { CompareResult, FineItem } from "../file/contract";
+import type { GraphDoc } from "../../../api/graph";
+import { defaultColTitle } from "../graphModel";
 import type { SectionName } from "../file/format";
 import type { DocContent } from "../../../store/graphStore";
 import { VersionGraph, VersionTable, cellKey, type CellMark } from "./ReadOnlyViews";
-import { SECTION_TITLE, V } from "./text";
+import { F, SECTION_TITLE, V, fieldLabel, shortValue } from "./text";
 
-const FIELD: Record<string, string> = {
-  test: "Test", posthoc: "Follow-up test", compare: "Comparisons", control: "Control group", pairs: "Chosen pairs",
-  alpha: "Significance level", within: "Compare within", family: "Correction applied", correlation: "Correlation",
-  graph_type: "Graph type", center: "Centre and error bars", show_points: "Show points", point_size: "Point size",
-  bar_width: "Bar width", show_band: "Confidence band", show_equation: "Show equation", sig_show: "Significance marks",
-  sig_label: "Significance label", title: "Graph title", xlabel: "X axis title", ylabel: "Y axis title",
-  font_size: "Font size", y_min: "Y axis from", y_max: "Y axis to", colors: "Colours", labels: "Series labels",
-  show_legend: "Legend", theme: "Theme", width: "Width", height: "Height", dpi: "Resolution", export_format: "Export format",
-  transparent: "Transparent background", fig_label: "Figure label", n_unit: "What n counts", palette: "Palette",
-  palette_colors: "Palette colours", palette_reverse: "Palette reversed", palette_edited: "Colours edited", axis_scheme: "Axis colours",
-  series: "Series",
-};
-
-/** A settings field in plain words. */
-export function fieldLabel(field: string): string {
-  if (FIELD[field]) return FIELD[field];
-  const t = field.replace(/_/g, " ").trim();
-  return t ? t[0].toUpperCase() + t.slice(1) : field;
-}
-
-export const shortValue = (s: string) => (s === "" ? "(empty)" : s);
+// The settings' plain names live in text.ts (phase 4: the combine dialog's texts use them too).
+export { fieldLabel, shortValue };
 
 /** Changed cells of `cmp` as marks on the `a` side (the other value is `b`), or the `b` side. */
 export function cellMarks(cmp: CompareResult, side: "a" | "b"): Map<string, CellMark> {
@@ -132,4 +117,179 @@ export function CompareView({ compare, content, current }: { compare: CompareRes
       </Box>
     </Stack>
   );
+}
+
+// ── phase 4: one row on two sides (the combine dialog's mini-table, §6.2) ──
+
+export interface MiniSide {
+  side: "mine" | "theirs";
+  label: string;
+  doc: GraphDoc;
+}
+
+const NEIGHBOURS = 6;
+
+/** Which columns to show: every column with a differing value, plus neighbours around them (nearest first) —
+ *  up to NEIGHBOURS, and fewer when the row is wide (fixer VUX-5: about a dozen values in all, so the values to
+ *  choose are not off to the side). */
+export function miniColumns(all: readonly string[], diff: ReadonlySet<string>, nRep = 1): string[] {
+  const idx = all.map((id, i) => (diff.has(id) ? i : -1)).filter((i) => i >= 0);
+  const budget = Math.min(NEIGHBOURS, Math.max(0, Math.floor(12 / Math.max(1, nRep)) - idx.length));
+  if (idx.length === 0) return all.slice(0, Math.max(1, budget));
+  const keep = new Set(idx);
+  let added = 0;
+  for (let d = 1; added < budget && d < all.length; d++) {
+    for (const i of idx) {
+      for (const j of [i - d, i + d]) {
+        if (added >= budget) break;
+        if (j >= 0 && j < all.length && !keep.has(j)) { keep.add(j); added++; }
+      }
+    }
+  }
+  return all.filter((_, i) => keep.has(i));
+}
+
+const sideKey = (it: FineItem, side: "mine" | "theirs") => (side === "mine" ? it.mine : it.theirs);
+
+/** One row of the table as each side has it, read by row and column id. The values listed in `items` are highlighted. */
+export function MiniRowTable({ rowId, sides, items, chosen = null, testId = "combine-conflict-table", result = null, resultLabel = "" }: {
+  rowId: string; sides: MiniSide[]; items: readonly FineItem[];
+  /** The side chosen so far: the other line is shown faded. */
+  chosen?: "mine" | "theirs" | null; testId?: string;
+  /** Fixer VUX-1: the combined table (when every choice is made): a third line shows the row as it will be saved;
+   *  a value there that is not the chosen side's is marked. */
+  result?: GraphDoc | null; resultLabel?: string;
+}) {
+  const theme = useTheme();
+  const docs = sides.map((s) => s.doc);
+  const template = docs[0]?.template ?? "column";
+  // Columns: the first side's order, then the others' columns it lacks, in their order.
+  const all: string[] = [];
+  for (const d of docs) for (const id of d.col_ids ?? []) if (!all.includes(id)) all.push(id);
+  const diffCells = new Set(items.filter((i) => i.what === "cell" && i.colId).map((i) => `${i.colId}|${i.rep ?? 0}`));
+  const diffCols = new Set(items.filter((i) => i.what === "cell" && i.colId).map((i) => i.colId!));
+  const nRep = Math.max(1, ...docs.map((d) => (d.template === "column" ? 1 : d.n_rep || 1)));
+  const cols = miniColumns(all, diffCols, nRep);
+  const titleDiff = items.some((i) => i.what === "rowTitle");
+  const xDiff = items.some((i) => i.what === "x");
+  // The row title only when it is to choose or differs (the heading names it when it is the same; fixer VUX-5).
+  const titles = new Set(docs.map((d) => { const r = (d.row_ids ?? []).indexOf(rowId); return r < 0 ? null : d.row_titles[r] ?? ""; }).filter((t) => t !== null));
+  const showTitle = titleDiff || (template === "grouped" && titles.size > 1);
+  const showX = template === "xy" || xDiff;
+  const titleOf = (id: string) => {
+    for (const d of docs) {
+      const c = (d.col_ids ?? []).indexOf(id);
+      if (c >= 0) return d.col_titles[c]?.trim() || defaultColTitle(d.template, c);
+    }
+    return "";
+  };
+  const hl = alpha(theme.palette.warning.main, 0.3);
+  const cellSx = {
+    border: 1, borderColor: "divider", px: 0.6, py: 0.15, fontSize: 12, whiteSpace: "nowrap" as const,
+    textAlign: "right" as const, fontVariantNumeric: "tabular-nums", minWidth: 40, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis",
+  };
+  const headSx = { ...cellSx, textAlign: "center" as const, fontWeight: 600, bgcolor: "action.hover", color: "text.secondary", fontSize: 11.5 };
+  const sideSx = { ...headSx, textAlign: "left" as const, fontWeight: 600, color: "text.primary" };
+  const dash = <Box component="span" sx={{ color: "text.disabled" }}>{F.notThere}</Box>;
+  const resultRow = result ? (result.row_ids ?? []).indexOf(rowId) : -1;
+  const chosenDoc = chosen ? sides.find((x) => x.side === chosen)?.doc ?? null : null;
+  const valueIn = (d: GraphDoc | null, col: string | "x" | "title", k = 0): string | undefined => {
+    if (!d) return undefined;
+    const r = (d.row_ids ?? []).indexOf(rowId);
+    if (r < 0) return undefined;
+    if (col === "x") return d.x?.[r] ?? "";
+    if (col === "title") return d.row_titles[r] ?? "";
+    const c = (d.col_ids ?? []).indexOf(col);
+    return c < 0 ? undefined : d.cells[r]?.[c]?.[k] ?? "";
+  };
+  const otherSx = { boxShadow: `inset 0 -2px 0 ${theme.palette.info.main}` };
+  return (
+    <Box sx={{ overflowX: "auto", maxWidth: "100%" }} data-testid={testId}>
+      <Box component="table" sx={{ borderCollapse: "collapse", bgcolor: "background.paper" }}>
+        <thead>
+          <tr>
+            <Box component="th" sx={headSx} />
+            {showX && <Box component="th" sx={headSx}>{docs[0]?.x_title.trim() || "X"}</Box>}
+            {showTitle && <Box component="th" sx={headSx}>{F.rowTitleHead}</Box>}
+            {cols.map((id) => <Box component="th" key={id} colSpan={nRep} sx={headSx} title={titleOf(id)}>{titleOf(id)}</Box>)}
+          </tr>
+        </thead>
+        <tbody>
+          {sides.map((s) => {
+            const d = s.doc;
+            const r = (d.row_ids ?? []).indexOf(rowId);
+            const text = (v: string | undefined, diff: boolean, attrs: Record<string, string>) => (
+              <Box component="td" sx={{ ...cellSx, ...(diff ? { bgcolor: hl, fontWeight: 600 } : {}) }}
+                data-testid="combine-conflict-cell" data-side={s.side} data-diff={diff ? "true" : undefined} {...attrs}>
+                {r < 0 || v === undefined ? dash : v}
+              </Box>
+            );
+            return (
+              <Box component="tr" key={s.side} data-side={s.side} data-chosen={chosen === s.side ? "true" : undefined}
+                sx={{ opacity: chosen && chosen !== s.side && sides.length > 1 ? 0.45 : 1, transition: "opacity 120ms" }}>
+                <Box component="th" scope="row" sx={sideSx}>{s.label}</Box>
+                {showX && text(r >= 0 ? d.x?.[r] ?? "" : undefined, xDiff, { "data-col": "x" })}
+                {showTitle && text(r >= 0 ? d.row_titles[r] ?? "" : undefined, titleDiff, { "data-col": "title" })}
+                {cols.map((id) => {
+                  const c = (d.col_ids ?? []).indexOf(id);
+                  return Array.from({ length: nRep }, (_, k) => {
+                    const has = r >= 0 && c >= 0;
+                    const v = has ? d.cells[r]?.[c]?.[k] ?? "" : undefined;
+                    const diff = diffCells.has(`${id}|${k}`) && items.some((i) => i.what === "cell" && i.colId === id && (i.rep ?? 0) === k && sideKey(i, s.side) !== null);
+                    return <Fragment key={`${id}:${k}`}>{text(v, diff, { "data-col": id, "data-rep": String(k) })}</Fragment>;
+                  });
+                })}
+              </Box>
+            );
+          })}
+          {result && resultRow >= 0 && (
+            <Box component="tr" data-side="result" data-testid="combine-conflict-result">
+              <Box component="th" scope="row" sx={{ ...sideSx, fontStyle: "italic" }}>{resultLabel}</Box>
+              {(() => {
+                const cell = (col: string, k: number, key: string) => {
+                  const v = valueIn(result, col, k) ?? "";
+                  const ch = valueIn(chosenDoc, col, k);
+                  const fromOther = chosenDoc !== null && ch !== undefined && v !== ch;
+                  return (
+                    <Box component="td" key={key} sx={{ ...cellSx, ...(fromOther ? otherSx : {}) }} data-testid="combine-conflict-cell" data-side="result"
+                      data-col={col} data-rep={col === "x" || col === "title" ? undefined : String(k)} data-other={fromOther ? "true" : undefined}
+                      title={fromOther ? F.fromOtherSide : undefined}>
+                      {v}
+                    </Box>
+                  );
+                };
+                return [
+                  ...(showX ? [cell("x", 0, "x")] : []),
+                  ...(showTitle ? [cell("title", 0, "title")] : []),
+                  ...cols.flatMap((id) => Array.from({ length: nRep }, (_, k) => cell(id, k, `${id}:${k}`))),
+                ];
+              })()}
+            </Box>
+          )}
+        </tbody>
+      </Box>
+    </Box>
+  );
+}
+
+/** Fixer VUX-1: values of one row that differ between the two sides but are not to choose (one side changed
+ *  them): they are kept from that side whichever is chosen. */
+export function rowOthersDiffer(rowId: string, sides: MiniSide[], items: readonly FineItem[]): number {
+  const [a, b] = sides.map((x) => x.doc);
+  if (!a || !b) return 0;
+  const ra = (a.row_ids ?? []).indexOf(rowId), rb = (b.row_ids ?? []).indexOf(rowId);
+  if (ra < 0 || rb < 0) return 0;
+  const listed = new Set(items.map((i) => `${i.what}|${i.colId ?? ""}|${i.rep ?? 0}`));
+  let n = 0;
+  if ((a.row_titles[ra] ?? "") !== (b.row_titles[rb] ?? "") && !listed.has("rowTitle||0")) n++;
+  if (a.template === "xy" && (a.x?.[ra] ?? "") !== (b.x?.[rb] ?? "") && !listed.has("x||0")) n++;
+  (a.col_ids ?? []).forEach((cid, ca) => {
+    const cb = (b.col_ids ?? []).indexOf(cid);
+    if (cb < 0) return;
+    const reps = Math.max(a.cells[ra]?.[ca]?.length ?? 0, b.cells[rb]?.[cb]?.length ?? 0);
+    for (let k = 0; k < reps; k++) {
+      if ((a.cells[ra]?.[ca]?.[k] ?? "") !== (b.cells[rb]?.[cb]?.[k] ?? "") && !listed.has(`cell|${cid}|${k}`)) n++;
+    }
+  });
+  return n;
 }

@@ -7,7 +7,7 @@ import { useFileSession } from "../file/session";
 import { useDisk } from "./PathPicker";
 import { setUiNow, stemOf } from "./text";
 import { useTicker } from "./useTicker";
-import type { SimNote, SimWho } from "../file/contract";
+import type { SimFineEdit, SimNote, SimWho } from "../file/contract";
 
 const OPEN_KEY = "las.files.simPanel";
 
@@ -19,6 +19,28 @@ const SKEWS: { label: string; ms: () => number }[] = [
   { label: "year 2001", ms: () => Date.UTC(2001, 5, 1, 12) - Date.now() },
 ];
 const DELAYS = [0, 5000, 60_000];
+
+/** Phase 4 (contract §6.7): small, exact changes the other computer makes, and how it saves them. */
+type FineHow = "edit" | "saveOver" | "copy";
+const FINE_HOW: { value: FineHow; label: string }[] = [
+  { value: "edit", label: "saves a newer version" },
+  { value: "saveOver", label: "saves over my last save" },
+  { value: "copy", label: "makes a conflicted copy" },
+];
+const FINE_EDITS: { id: string; label: string; fine: SimFineEdit }[] = [
+  { id: "sim-fine-cell", label: "Change the first value", fine: "cell" },
+  { id: "sim-fine-cell-other", label: "Change a value in row 3", fine: "cellOther" },
+  { id: "sim-fine-add-row", label: "Add a row of values", fine: "addRow" },
+  { id: "sim-fine-insert-row", label: "Insert a row at the top", fine: "insertRow" },
+  { id: "sim-fine-delete-row", label: "Delete row 1", fine: "deleteRow" },
+  { id: "sim-fine-delete-col", label: "Delete the last column", fine: "deleteCol" },
+  { id: "sim-fine-rename-col", label: "Rename the first column", fine: "renameCol" },
+  { id: "sim-fine-yrange", label: "Set the Y axis range", fine: "yRange" },
+  { id: "sim-fine-title", label: "Change the graph title", fine: "graphTitle" },
+  { id: "sim-fine-alpha", label: "Change the significance level", fine: "alpha" },
+  { id: "sim-fine-scratch", label: "Edit scratchpad cells", fine: "scratchCells" },
+  { id: "sim-fine-scratch-shift", label: "Insert a scratchpad row", fine: "scratchShift" },
+];
 
 function NoteLine({ n }: { n: SimNote }) {
   return (
@@ -60,6 +82,7 @@ export function SimPanel() {
   const [skew, setSkew] = useState<Record<SimWho, number>>({ other: 0, third: 0 });
   const [delay, setDelay] = useState(0);
   const [offline, setOffline] = useState(false);
+  const [fineHow, setFineHow] = useState<FineHow>("edit");
   useTicker(1000, open);
 
   // Texts ("note updated 2 min ago") follow the simulated clock, which "+5 min" and "sleeps" move ahead.
@@ -181,6 +204,18 @@ export function SimPanel() {
             <SimButton off={busy || !disk} id="sim-edit-analysis" disabled={!file} onClick={() => void run("Edit analysis settings and save", () => disk!.remoteEdit(path, { section: "analysis" }))}>Edit analysis settings and save</SimButton>
             <SimButton off={busy || !disk} id="sim-edit-scratch" disabled={!file} onClick={() => void run("Edit scratchpad and save", () => disk!.remoteEdit(path, { section: "scratchpad" }))}>Edit scratchpad and save</SimButton>
             <SimButton off={busy || !disk} id="sim-many" disabled={!file} onClick={() => void run("Save 25 more versions", () => disk!.remoteEditMany(path, 25))}>Save 25 more versions</SimButton>
+            <Divider className="full" sx={{ my: 0.25 }} />
+            <Typography className="full" variant="overline" color="text.secondary" sx={{ lineHeight: 1.6 }}>Small changes</Typography>
+            <TextField className="full" select size="small" fullWidth label="The other computer" value={fineHow}
+              onChange={(e) => setFineHow(e.target.value as FineHow)} sx={{ "& .MuiSelect-select": { py: "4px", fontSize: 12 } }}
+              slotProps={{ htmlInput: { "data-testid": "sim-fine-how" } }}>
+              {FINE_HOW.map((h) => <MenuItem key={h.value} value={h.value} dense>{h.label}</MenuItem>)}
+            </TextField>
+            {FINE_EDITS.map((e) => (
+              <SimButton key={e.id} off={busy || !disk} id={e.id} disabled={!file} onClick={() => void run(`${e.label} (${FINE_HOW.find((h) => h.value === fineHow)?.label})`, () => (
+                fineHow === "edit" ? disk!.remoteEdit(path, { fine: e.fine }) : disk!.remoteDiverge(path, { fine: e.fine, how: fineHow })
+              ))}>{e.label}</SimButton>
+            ))}
             <Divider className="full" sx={{ my: 0.25 }} />
             <Typography className="full" variant="overline" color="text.secondary" sx={{ lineHeight: 1.6 }}>Worked separately</Typography>
             <SimButton off={busy || !disk} id="sim-diverge-copy-table" disabled={!file} onClick={() => void run("Diverged copy (table)", () => disk!.remoteDiverge(path, { section: "table", how: "copy" }))}>Make a diverged copy (table)</SimButton>

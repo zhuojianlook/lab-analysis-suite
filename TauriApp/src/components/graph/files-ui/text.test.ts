@@ -209,7 +209,7 @@ describe("phase 2 wording (phase 2 contract §6.2–6.4)", () => {
     expect(C.theirs("Alice (Office iMac)")).toBe("Theirs: Alice (Office iMac)");
     expect(C.theirsCopy("Dose response (conflicted copy)", "Alice (Office iMac)")).toBe("Theirs: 'Dose response (conflicted copy)', saved by Alice (Office iMac)");
     expect(C.queue(2, 3)).toBe("Copy 2 of 3");
-    expect(C.twoWay).toBe("These two copies were last the same too long ago to compare part by part. Choose which to keep for each part that differs.");
+    expect(C.twoWay).toBe("These two copies were last the same too long ago to compare cell by cell. Choose which to keep for each part that differs.");
     expect([C.unchanged, C.combinedChip, C.chooseChip, C.fromMine, C.fromTheirs("Alice"), C.mineButton])
       .toEqual(["Unchanged", "Combined", "Choose", "from mine", "from Alice", "Mine"]);
     expect(C.notChanged(2)).toBe("Not changed (2)");

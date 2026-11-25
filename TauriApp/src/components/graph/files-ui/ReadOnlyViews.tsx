@@ -10,7 +10,7 @@ import type { GraphDoc } from "../../../api/graph";
 import type { DocContent } from "../../../store/graphStore";
 import { defaultColTitle, effectiveAnalysis, effectiveFigure, hasNumbers, toNumericTable } from "../graphModel";
 import { parseScratch } from "../scratchpad/scratchModel";
-import { V } from "./text";
+import { F, V } from "./text";
 
 /** A changed cell: what the other side has there. */
 export interface CellMark { other: string }
@@ -26,8 +26,12 @@ function rowUsed(doc: GraphDoc, r: number): boolean {
 
 /** The table of a version, read only. `marks` highlights changed cells (the tooltip names the other value);
  *  `onlyMarked` shows just the rows that hold a mark (with at most `maxRows` rows either way). */
-export function VersionTable({ doc, marks, otherLabel, onlyMarked = false, maxRows = 120, dense = false, testId }: {
+export function VersionTable({ doc, marks, otherLabel, onlyMarked = false, maxRows = 120, dense = false, testId, markRows, markCols, markTitle, nearMarked = false }: {
   doc: GraphDoc; marks?: Map<string, CellMark>; otherLabel?: string; onlyMarked?: boolean; maxRows?: number; dense?: boolean; testId?: string;
+  /** Phase 4: rows / columns (by id) that get a small marker (an order to check). `markTitle` is its tooltip. */
+  markRows?: ReadonlySet<string>; markCols?: ReadonlySet<string>; markTitle?: string;
+  /** Fixer VUX-2: when a marked row lies beyond the first `maxRows`, show the marked rows with a few rows around them instead. */
+  nearMarked?: boolean;
 }) {
   const theme = useTheme();
   const nRep = Math.max(1, doc.n_rep || 1);
@@ -41,6 +45,16 @@ export function VersionTable({ doc, marks, otherLabel, onlyMarked = false, maxRo
     for (const k of marks.keys()) marked.add(k.split("|")[0]);
     rows = rows.filter((r) => marked.has(rowIdOf(doc, r)));
   }
+  let near = false;
+  if (nearMarked && markRows?.size && rows.length > maxRows) {
+    const at = rows.filter((r) => markRows.has(rowIdOf(doc, r)));
+    if (at.some((r) => rows.indexOf(r) >= maxRows)) {
+      const keep = new Set<number>();
+      for (const r of at) for (let d = -3; d <= 3; d++) keep.add(r + d);
+      rows = rows.filter((r) => keep.has(r));
+      near = true;
+    }
+  }
   const hidden = Math.max(0, rows.length - maxRows);
   rows = rows.slice(0, maxRows);
   const hl = alpha(theme.palette.warning.main, 0.28);
@@ -49,6 +63,9 @@ export function VersionTable({ doc, marks, otherLabel, onlyMarked = false, maxRo
     whiteSpace: "nowrap" as const, textAlign: "right" as const, fontVariantNumeric: "tabular-nums", minWidth: dense ? 36 : 48,
   };
   const headSx = { ...cellSx, textAlign: "center" as const, fontWeight: 600, bgcolor: "action.hover", color: "text.secondary" };
+  const markColor = theme.palette.info.main;
+  const rowMarkSx = { boxShadow: `inset 3px 0 0 ${markColor}`, color: "info.main", fontWeight: 600 };
+  const colMarkSx = { boxShadow: `inset 0 -3px 0 ${markColor}`, color: "info.main" };
   if (last < 0) {
     return <Typography variant="body2" color="text.secondary" sx={{ py: 2 }} data-testid={testId}>{V.noData}</Typography>;
   }
@@ -58,17 +75,26 @@ export function VersionTable({ doc, marks, otherLabel, onlyMarked = false, maxRo
         <thead>
           <tr>
             <Box component="th" sx={headSx}>{isXY ? (doc.x_title.trim() || "X") : hasRowTitles ? "" : "#"}</Box>
-            {doc.col_titles.map((t, c) => (
-              <Box component="th" key={colIdOf(doc, c)} colSpan={nRep} sx={headSx}>{t.trim() || defaultColTitle(doc.template, c)}</Box>
-            ))}
+            {doc.col_titles.map((t, c) => {
+              const marked = markCols?.has(colIdOf(doc, c)) ?? false;
+              return (
+                <Box component="th" key={colIdOf(doc, c)} colSpan={nRep} sx={{ ...headSx, ...(marked ? colMarkSx : {}) }}
+                  data-testid={marked ? "order-mark" : undefined} data-axis={marked ? "col" : undefined} title={marked ? markTitle : undefined}>
+                  {t.trim() || defaultColTitle(doc.template, c)}
+                </Box>
+              );
+            })}
           </tr>
         </thead>
         <tbody>
           {rows.map((r) => {
             const rid = rowIdOf(doc, r);
+            const rowMarked = markRows?.has(rid) ?? false;
             return (
               <tr key={rid}>
-                <Box component="td" sx={{ ...cellSx, textAlign: isXY ? "right" : "left", color: "text.secondary", bgcolor: "action.hover" }}>
+                <Box component="td" sx={{ ...cellSx, textAlign: isXY ? "right" : "left", color: "text.secondary", bgcolor: "action.hover", ...(rowMarked ? rowMarkSx : {}) }}
+                  data-testid={rowMarked ? "order-mark" : undefined} data-axis={rowMarked ? "row" : undefined} data-row={r + 1}
+                  title={rowMarked ? markTitle : near ? `Row ${r + 1}` : undefined}>
                   {isXY ? doc.x?.[r] ?? "" : hasRowTitles ? doc.row_titles[r] ?? "" : r + 1}
                 </Box>
                 {doc.col_titles.map((_, c) => Array.from({ length: nRep }, (_, k) => {
@@ -94,6 +120,7 @@ export function VersionTable({ doc, marks, otherLabel, onlyMarked = false, maxRo
           })}
         </tbody>
       </Box>
+      {near && <Typography variant="caption" color="text.secondary" component="div" data-testid="table-near-marked">{F.nearMarked}</Typography>}
       {hidden > 0 && <Typography variant="caption" color="text.secondary">{V.andMore(hidden)}</Typography>}
     </Box>
   );

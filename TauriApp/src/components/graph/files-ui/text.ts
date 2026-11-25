@@ -4,11 +4,12 @@
    "draft", "sibling", "displaced" or "analysis id" (contract §5.5, checklist 46). */
 
 import type {
-  BannerAction, BannerKind, FileSettings, FileTab, PeerView, RestoreCard, SessionToast, ShareMode, SharingView, StatusLine, TabBanner, TabPresence,
+  AdjustKind, BannerAction, BannerKind, FigureGroup, FileSettings, FineAdjustment, FineAuto, FineConflict, OrderCheck, FileTab, PeerView, RestoreCard, SessionToast, ShareMode, SharingView, StatusLine, TabBanner, TabPresence,
   VersionChip, VersionInfo,
 } from "../file/contract";
 import { SECTION_PHRASE } from "../file/contract";
 import { SECTION_NAMES, type SectionName } from "../file/format";
+import { POSTHOC_LABELS, TEST_LABELS } from "../graphModel";
 
 // ── platform ───────────────────────────────────────────────────────────────
 
@@ -94,7 +95,7 @@ const SEVERITY: Record<BannerKind, Severity> = {
 
 export function bannerSeverity(b: TabBanner): Severity {
   if (b.kind === "extraCopy") return b.relation === "newer" || b.relation === "diverged" ? "warning" : "info";
-  if (b.kind === "savedOver" && b.state === "combining") return "info";
+  if (b.kind === "savedOver" && (b.state === "combining" || b.state === "review")) return "info";
   return SEVERITY[b.kind];
 }
 
@@ -115,14 +116,18 @@ export function bannerText(b: TabBanner, settings: FileSettings | null): string 
     case "savedOver":
       if (b.state === "combining") return "Another computer saved over your last save. Nothing is lost — combining both now.";
       if (b.state === "choose") return "Another computer saved over your last save. Nothing is lost. Choose what to keep.";
+      if (b.state === "review") return "Another computer saved over your last save. Nothing is lost — both sets of changes can be combined.";
       return `Another computer saved over your last save. Nothing is lost — your version was saved as a copy: '${name}'.`;
     case "savedDisplaced": return `Saved. ${cap(who)} saved at the same moment; that version was kept as a copy: '${name}'.`;
     case "tookTheirs": return `Now showing the version saved by ${who}. Your version was saved as a copy: '${name}'.`;
     case "combined": {
       const list = sectionPhrases(b.sections ?? []);
+      // Phase 4: the parts that now hold changes from both versions.
+      const mixed = sectionPhrases(b.mixed ?? []);
+      const tail = `${list ? ` Taken from it: ${list}.` : ""}${mixed ? ` Changes from both are in ${mixed}.` : ""}`;
       // Combined with my own save that another computer's save had replaced.
-      if (b.version?.mine) return `Combined with your earlier save.${list ? ` Taken from it: ${list}.` : ""}`;
-      return `Combined with the version saved by ${whoLine(b.version, settings)}.${list ? ` Taken from it: ${list}.` : ""}`;
+      if (b.version?.mine) return `Combined with your earlier save.${tail}`;
+      return `Combined with the version saved by ${whoLine(b.version, settings)}.${tail}`;
     }
     case "draftMismatch": return `You have unsaved changes from ${whenText(b.when) || "earlier"} that don't match this file.`;
     case "copyQuestion": {
@@ -276,7 +281,8 @@ export function attemptBannerOf(tab: { banners: TabBanner[]; presence?: { guard:
     ?? tab.banners.find((x) => PRESENCE_KINDS.includes(x.kind) || x.kind === "tooNew") ?? null;
 }
 
-export function bannerActionLabel(kind: BannerKind, action: BannerAction): string {
+/** `state`: the banner's `state` (phase 4: "Combine" on a savedOver banner in state "review"). */
+export function bannerActionLabel(kind: BannerKind, action: BannerAction, state?: TabBanner["state"]): string {
   switch (action) {
     case "openPrivacy": return "Open Privacy settings";
     case "retry": return kind === "saveFailed" ? "Try again" : "Retry";
@@ -298,6 +304,7 @@ export function bannerActionLabel(kind: BannerKind, action: BannerAction): strin
     case "discardDraft": return "Discard";
     case "chooseLocation": return "Choose where to keep it…";
     case "combine":
+      if (kind === "savedOver" && state === "review") return "Combine";
       return kind === "newerOnDisk" ? "Combine my changes with it" : kind === "extraCopy" ? "Combine…" : "Choose…";
     case "remove": return "Remove it";
     case "keep": return "Keep";
@@ -651,7 +658,7 @@ export const C = {
   theirs: (who: string) => `Theirs: ${who}`,
   theirsCopy: (copyName: string, who: string) => `Theirs: '${copyName}', saved by ${who}`,
   queue: (i: number, n: number) => `Copy ${i} of ${n}`,
-  twoWay: "These two copies were last the same too long ago to compare part by part. Choose which to keep for each part that differs.",
+  twoWay: "These two copies were last the same too long ago to compare cell by cell. Choose which to keep for each part that differs.",
   toChoose: (n: number) => `${n} to choose`,
   unchanged: "Unchanged",
   combinedChip: "Combined",
@@ -679,3 +686,217 @@ export const C = {
 
 /** The labelled undo step after a combine ("Undo: combine with Alice's changes"), as the store gives it. */
 export const undoTooltip = (label: string | null) => label ?? "Undo";
+
+// ── phase 4: combining row by row, setting by setting, cell by cell (phase 4 contract §6) ──
+
+const FIELD: Record<string, string> = {
+  test: "Test", posthoc: "Follow-up test", compare: "Comparisons", control: "Control group", pairs: "Chosen pairs",
+  alpha: "Significance level", within: "Compare within", family: "Correction applied", correlation: "Correlation",
+  graph_type: "Graph type", center: "Centre and error bars", show_points: "Show points", point_size: "Point size",
+  bar_width: "Bar width", show_band: "Confidence band", show_equation: "Show equation", sig_show: "Significance marks",
+  sig_label: "Significance label", title: "Graph title", xlabel: "X axis title", ylabel: "Y axis title",
+  font_size: "Font size", y_min: "Y axis from", y_max: "Y axis to", colors: "Colours", labels: "Series labels",
+  show_legend: "Legend", theme: "Theme", width: "Width", height: "Height", dpi: "Resolution", export_format: "Export format",
+  transparent: "Transparent background", fig_label: "Figure label", n_unit: "What n counts", palette: "Palette",
+  palette_colors: "Palette colours", palette_reverse: "Palette reversed", palette_edited: "Colours edited", axis_scheme: "Axis colours",
+  series: "Series",
+};
+
+/** A setting in plain words ("y_min" → "Y axis from"; unknown ones from their name). */
+export function fieldLabel(field: string): string {
+  if (FIELD[field]) return FIELD[field];
+  const t = field.replace(/_/g, " ").trim();
+  return t ? t[0].toUpperCase() + t.slice(1) : field;
+}
+
+/** A value for display: "" (and a place that isn't there) as "(empty)". */
+export const shortValue = (s: string | null | undefined) => (s === "" || s == null ? "(empty)" : s);
+
+/** Test names for "The chosen test (…) can't run": the app's own labels, without the bracketed part. */
+export const testName = (t: string | null | undefined) =>
+  (t ? (TEST_LABELS as Record<string, string>)[t]?.split(" (")[0] ?? t : "");
+
+/** A setting's value as a person reads it: test and follow-up test names instead of their codes, and column or row
+ *  names instead of the hidden ids inside a control group or chosen pairs (§6.8: never show an id). */
+export function settingValue(field: string, v: string | null | undefined, x?: Pick<FineTextCtx, "colTitle" | "rowNo" | "rowTitle">): string {
+  if (v == null || v === "") return shortValue(v);
+  if (field === "test") return testName(v);
+  if (field === "posthoc") return (POSTHOC_LABELS as Record<string, string>)[v] ?? v;
+  // The labels of the Comparisons switch in the analysis panel.
+  if (field === "compare") return ({ all: "All pairs", control: "Vs control", selected: "Chosen pairs" } as Record<string, string>)[v] ?? v;
+  // Only a value that is an id, or a list / object (canonical text) holding ids; a typed text stays as typed.
+  if (!/^[[{]/.test(v) && !/^(row|col)-[0-9a-z]+$/i.test(v)) return v;
+  return v.replace(/\b(row|col)-[0-9a-z]+\b/gi, (id) => {
+    if (!x) return "?";
+    if (id.startsWith("col-")) return x.colTitle(id) || "?";
+    const t = x.rowTitle(id).trim();
+    const n = x.rowNo(id);
+    return t || (n != null ? F.rowN(n) : "?");
+  }).replace(/"/g, "");
+}
+
+export const GROUP_TITLE: Record<FigureGroup, string> = { colours: "Colours", size: "Size", yRange: "Y axis range" };
+
+/** The combine dialog, phase 4 (§6.1–6.4). Every function takes plain strings and numbers only. */
+export const F = {
+  changesCombined: (n: number) => `${n} change${n === 1 ? "" : "s"} combined`,
+  sideBySideChosen: "both side by side",
+  useAll: (side: string) => `Use ${side} for all`,
+  /** Fixer VUX-4: only the ones without a choice yet. */
+  useRest: (side: string) => `Use ${side} for the rest`,
+  more: (n: number) => `and ${n} more — use the buttons above to choose for all of them`,
+  row: (n: number | string, title: string) => `Row ${n}${title ? ` · ${title}` : ""}`,
+  /** `deleted` / `changed`: "on this computer" or "by Alice (Office iMac)". */
+  rowDeleted: (n: number | string, deleted: string, changed: string) => `Row ${n} — deleted ${deleted}, changed ${changed}`,
+  colDeleted: (title: string, deleted: string, changed: string) => `Column '${title}' — deleted ${deleted}, changed ${changed}`,
+  onThisComputer: "on this computer",
+  inYourSave: "in your save",
+  inTheFileNow: "in the file now",
+  yourSave: "your save",
+  theirsWord: "theirs",
+  mineWord: "mine",
+  by: (who: string) => `by ${who}`,
+  colTitle: "Column title",
+  rowTitleHead: "Row title",
+  xTitle: "X title",
+  seriesLabel: (title: string) => `Legend label of '${title}'`,
+  quoted: (mine: string, a: string, theirs: string, b: string) => `${mine}: '${a}' · ${theirs}: '${b}'`,
+  values: (mine: string, a: string, theirs: string, b: string) => `${mine}: ${a} · ${theirs}: ${b}`,
+  groupLine: (setting: string, mine: string, a: string, theirs: string, b: string) => `${setting}: ${mine} ${a} · ${theirs} ${b}`,
+  numberFormat: "Number format",
+  valuesChanged: (n: number) => `${n} value${n === 1 ? "" : "s"} changed`,
+  change: (where: string, before: string, after: string) => `${where}: ${before} → ${after}`,
+  rowN: (n: number | string) => `Row ${n}`,
+  aRow: "A row",
+  deleteRow: "Delete the row",
+  keepRow: "Keep the row",
+  deleteCol: "Delete the column",
+  keepCol: "Keep the column",
+  bothSeparate: "Both as separate files",
+  bothSideBySide: "Both side by side",
+  bothCaption: "Both side by side puts the other sheet to the right of yours.",
+  wholeTwoWay: "These two copies were last the same too long ago to compare cell by cell. Keep:",
+  wholeShift: "The scratchpad was rearranged on one computer, so it can't be combined cell by cell. Keep:",
+  wholeTable: "These two tables are too different to combine row by row. Keep:",
+  autoList: (n: number) => `Combined automatically (${n})`,
+  both: "both",
+  adjustedTitle: (n: number) => `Adjusted automatically (${n})`,
+  adjustedFoot: "Check the result after applying.",
+  adjSeries: (title: string) => `Colour and label of '${title}'`,
+  adjTestNotRun: (test: string) => `The chosen test (${test}) can't run on the combined table.`,
+  adjComparisons: "Some chosen comparisons are not used with the combined table.",
+  adjReplicates: (to: string | number) => `Replicates kept at ${to} so no values are dropped.`,
+  adjTable: "The table was tidied up.",
+  adjScratch: "The scratchpad was tidied up.",
+  orderRows: "Row order — please check. Both computers added rows in the same place.",
+  orderCols: "Column order — please check. Both computers added columns in the same place.",
+  orderMark: "Added in the same place on both computers",
+  combinedOrder: "As combined",
+  notThere: "—",
+  /** Fixer VUX-1: the third line of a row's mini-table, and what its marks mean. */
+  resultLine: "Combined",
+  fromOtherSide: "From the other side: only that side changed it",
+  othersKept: (n: number) => `${n} other value${n === 1 ? "" : "s"} in this row changed on one side only and ${n === 1 ? "is" : "are"} kept whichever you choose.`,
+  /** Fixer VUX-5: how many values of the row are to choose. */
+  valuesToChoose: (n: number) => `${n} value${n === 1 ? "" : "s"} to choose`,
+  /** Fixer VUX-2: which rows an order note is about, and what the shortened table shows. */
+  rowsAt: (from: number, to: number) => (from === to ? `row ${from}` : `rows ${from}–${to}`),
+  orderRowsAt: (where: string) => `Row order — please check (${where}). Both computers added rows in the same place.`,
+  nearMarked: "Showing the rows to check and the rows around them.",
+  /** Fixer VUX-8: the left-hand group counts parts. */
+  combinedParts: (n: number) => `Combined automatically (${n} ${n === 1 ? "part" : "parts"})`,
+  value: (n: number | string) => `value ${n}`,
+} as const;
+
+/** What the text helpers below need to know about the two sides and the tables. */
+export interface FineTextCtx {
+  /** 1-based position of a row in mine's table, else theirs', else the combined one; null when none has it. */
+  rowNo(rowId: string): number | null;
+  rowTitle(rowId: string): string;
+  /** The column's title as shown (a default "Group A" when blank); "" when no table has it. */
+  colTitle(colId: string): string;
+  /** Replicates shown in the tables (cell lines name the value only when there are several). */
+  nRep: number;
+  /** "mine" · "Alice" (or "theirs"), used in brackets after an automatic change. */
+  mineShort: string;
+  theirsShort: string;
+  /** "on this computer" / "by Alice (Office iMac)" for deleted rows and columns. */
+  minePhrase: string;
+  theirsPhrase: string;
+}
+
+const q = (s: string | null | undefined) => `'${s ?? ""}'`;
+
+function rowPlace(id: string | undefined, x: FineTextCtx): string {
+  const n = id ? x.rowNo(id) : null;
+  return n == null ? F.aRow : F.rowN(n);
+}
+
+/** One line of "Combined automatically" (§6.2), e.g. "Row 3, Group A: 5.1 → 5.4 (mine)". */
+export function autoLine(a: FineAuto, x: FineTextCtx): string {
+  const who = a.from === "mine" ? x.mineShort : a.from === "theirs" ? x.theirsShort : F.both;
+  const tail = ` (${who})`;
+  const b = shortValue(a.before), n = shortValue(a.after);
+  const col = a.colId ? x.colTitle(a.colId) : "";
+  switch (a.what) {
+    case "cell": {
+      const rep = x.nRep > 1 && a.rep !== undefined ? `, ${F.value(a.rep + 1)}` : "";
+      return F.change(`${rowPlace(a.rowId, x)}, ${col}${rep}`, b, n) + tail;
+    }
+    case "rowTitle": return F.change(`${rowPlace(a.rowId, x)} title`, q(a.before), q(a.after)) + tail;
+    case "x": return F.change(`${rowPlace(a.rowId, x)}, X`, b, n) + tail;
+    case "colTitle": return F.change(F.colTitle, q(a.before), q(a.after)) + tail;
+    case "xTitle": return F.change(F.xTitle, q(a.before), q(a.after)) + tail;
+    case "replicates": return F.change("Replicates", b, n) + tail;
+    case "rowAdded": return `Row added${tail}`;
+    case "rowRemoved": return `${a.before ? `Row ${q(a.before)}` : "Row"} removed${tail}`;
+    case "colAdded": return `Column ${q(a.after || col)} added${tail}`;
+    case "colRemoved": return `Column ${q(a.before || col)} removed${tail}`;
+    case "field": return F.change(fieldLabel(a.field ?? ""), settingValue(a.field ?? "", a.before, x), settingValue(a.field ?? "", a.after, x)) + tail;
+    case "group": return `${a.group ? GROUP_TITLE[a.group] : fieldLabel(a.field ?? "")}${tail}`;
+    case "seriesLabel": return F.change(F.seriesLabel(col), q(a.before), q(a.after)) + tail;
+    case "scratch": return F.change(a.addr ?? "", b, n) + tail;
+    case "colWidth": return F.change(`Width of column ${a.field ?? ""}`, b, n) + tail;
+  }
+  return F.change(fieldLabel(a.field ?? a.what), b, n) + tail;
+}
+
+/** The heading of one block to choose (§6.2). */
+export function conflictHeading(c: FineConflict, x: FineTextCtx): string {
+  const n = c.rowId ? x.rowNo(c.rowId) ?? "" : "";
+  const del = (deleted: boolean) => (deleted ? (c.deletedBy === "mine" ? x.minePhrase : x.theirsPhrase) : (c.deletedBy === "mine" ? x.theirsPhrase : x.minePhrase));
+  switch (c.kind) {
+    case "row": return F.row(n, c.rowId ? x.rowTitle(c.rowId).trim() : "");
+    case "rowDeleted": return F.rowDeleted(n, del(true), del(false));
+    case "colDeleted": return F.colDeleted(c.colId ? x.colTitle(c.colId) : "", del(true), del(false));
+    case "colTitle": return F.colTitle;
+    case "tableField": return F.xTitle;
+    case "field": return fieldLabel(c.field ?? "");
+    case "group": return c.group ? GROUP_TITLE[c.group] : fieldLabel(c.field ?? "");
+    case "seriesLabel": return F.seriesLabel(c.colId ? x.colTitle(c.colId) : "");
+    case "cell": return c.addr ?? "";
+    case "section": return SECTION_TITLE[c.section];
+  }
+  return "";
+}
+
+/** One line of "Adjusted automatically" (§6.4). */
+export function adjustmentLine(a: FineAdjustment, x: Pick<FineTextCtx, "colTitle" | "rowNo" | "rowTitle">): string {
+  const kind: AdjustKind = a.kind;
+  switch (kind) {
+    case "setting": {
+      const f = a.field ?? "";
+      if (f.startsWith("series.")) return F.adjSeries(x.colTitle(f.slice(7)));
+      return F.change(fieldLabel(f), settingValue(f, a.from, x), settingValue(f, a.to, x));
+    }
+    case "testNotRun": return F.adjTestNotRun(testName(a.from));
+    case "comparisons": return F.adjComparisons;
+    case "replicates": return F.adjReplicates(a.to ?? "");
+    case "table": return F.adjTable;
+    case "scratchpad": return F.adjScratch;
+  }
+  return F.change(fieldLabel(a.field ?? ""), shortValue(a.from), shortValue(a.to));
+}
+
+/** The note of an order to check (§6.4). */
+export const orderCheckText = (o: Pick<OrderCheck, "axis">) => (o.axis === "row" ? F.orderRows : F.orderCols);
