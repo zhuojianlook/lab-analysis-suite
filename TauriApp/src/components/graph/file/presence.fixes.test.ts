@@ -216,12 +216,14 @@ describe("fixer VS-5: a new identity at most once per launch", () => {
   });
 });
 
-describe("fixer VS-6: the after-sleep guard commits an open Scratchpad entry first", () => {
-  it("flushScratch({commitEdit}) runs before the resuming guard is set", async () => {
+// Changed by the typed-edit fixer round (V-2): the flush still writes pending Scratchpad changes before the guard,
+// but no longer commits an open cell entry (a typed editor stays open and editable under the guard).
+describe("fixer VS-6: the after-sleep guard writes pending Scratchpad changes first", () => {
+  it("flushScratch runs before the resuming guard is set, without commitEdit", async () => {
     const order: string[] = [];
     let ref: Computer | null = null;
     const g = await group(1, {
-      deps: [{ flushScratch: (o?: { commitEdit?: boolean }) => { if (o?.commitEdit) order.push(`flush:${ref ? guardOf(ref) ?? "-" : "?"}`); } }],
+      deps: [{ flushScratch: (o?: { commitEdit?: boolean }) => { order.push(`flush:${ref ? guardOf(ref) ?? "-" : "?"}:${!!o?.commitEdit}`); } }],
     });
     const [a] = g.cs;
     ref = a;
@@ -231,7 +233,7 @@ describe("fixer VS-6: the after-sleep guard commits an open Scratchpad entry fir
     a.dev.sleep(5 * MIN);
     await tick(g.w, 5 * MIN + 2 * S, 1000);
     expect(guardOf(a)).toBe("resuming");
-    expect(order[0]).toBe("flush:-");
+    expect(order[0]).toBe("flush:-:false");
   });
 });
 

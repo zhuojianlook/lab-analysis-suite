@@ -147,6 +147,19 @@ export interface GraphState extends StoreGuardApi {
   replaceContent: (p: ReplaceContentArgs) => boolean;
   /** Label of the top undo step (null for ordinary steps or an empty stack). */
   undoLabel: () => string | null;
+
+  // ── phase 3 fix: typing that is not in the content yet ──
+  /** Owners of open editors that hold typed text not yet in the content (an open Scratchpad cell edit, a number
+   *  field typed into but not committed). Not content: no editSerial, no undo step, never "unsaved changes". The
+   *  file controller counts it as editing in progress (never read-only, the hold is kept, newer versions wait). */
+  typing: readonly string[];
+  /** A keystroke changed the text of `owner`'s open editor (it now differs from the content). Without a guard the
+   *  owner is recorded and userEditSerial is bumped — the claim hook (phase 3 §4.1): this computer starts editing at
+   *  the first keystroke, before anything is committed. Under a guard only the owner is recorded (no bump, nothing
+   *  reported: the editor was opened before the guard and keeps its text). False under a guard or with no document. */
+  beginTyping: (owner: string) => boolean;
+  /** `owner`'s editor closed, was committed, or holds the content's text again. Never guarded. */
+  endTyping: (owner: string) => void;
 }
 
 export interface ReplaceContentArgs {
@@ -249,6 +262,8 @@ function sameFields<T extends object>(a: T, b: T): boolean {
 
 /** Reset by every action that opens or closes a document: the controller sets the new tab's guard. */
 const NO_GUARD = { guard: null, blocked: null } as const;
+/** Another document: no editor of the old one is typed into any more (each owner also ends its own). */
+const NO_TYPING = { typing: [] as readonly string[] };
 
 export type GraphStoreApi = UseBoundStore<StoreApi<GraphState>>;
 
@@ -335,6 +350,7 @@ export function createGraphStore(): GraphStoreApi {
       guard: null,
       userEditSerial: 0,
       blocked: null,
+      typing: [],
 
       newDoc: (t, sample) => {
         const doc = sample ? M.sampleDoc(t) : M.emptyDoc(t);
@@ -343,7 +359,7 @@ export function createGraphStore(): GraphStoreApi {
         // A fresh document only counts as changed once it is edited.
         set((s) => ({
           ...next, savedName: "", currentId: null, savedSnapshot: snapshotKey(next), undoStack: [], lastEditKey: null,
-          docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new", scratch: "", savedScratch: "", file: null, ...NO_GUARD,
+          docSerial: s.docSerial + 1, openedAs: sample ? "sample" : "new", scratch: "", savedScratch: "", file: null, ...NO_GUARD, ...NO_TYPING,
         }));
       },
 
@@ -356,13 +372,13 @@ export function createGraphStore(): GraphStoreApi {
         set((s) => ({
           ...next, savedName: saved ? name : null, currentId: id, savedSnapshot: saved ? snapshotKey(next) : null,
           undoStack: [], lastEditKey: null,
-          docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft", scratch: sc, savedScratch: saved ? sc : null, file: null, ...NO_GUARD,
+          docSerial: s.docSerial + 1, openedAs: saved ? "saved" : "draft", scratch: sc, savedScratch: saved ? sc : null, file: null, ...NO_GUARD, ...NO_TYPING,
         }));
       },
 
       close: () => set((s) => ({
         doc: null, name: "", savedName: null, currentId: null, savedSnapshot: null, undoStack: [], lastEditKey: null, docSerial: s.docSerial + 1,
-        scratch: "", savedScratch: null, file: null, ...NO_GUARD,
+        scratch: "", savedScratch: null, file: null, ...NO_GUARD, ...NO_TYPING,
       })),
 
       setName: user("name", "setName", undefined, (name: string) => set({ name })),
@@ -527,6 +543,8 @@ export function createGraphStore(): GraphStoreApi {
           savedSnapshot: saved ? snapshotKey(c) : null, savedScratch: saved ? c.scratch : null,
           undoStack: [], lastEditKey: null,
           docSerial: inPlace ? s.docSerial : s.docSerial + 1, openedAs: saved ? "saved" : "draft", ...NO_GUARD,
+          // In place (same document, the Scratchpad session survives when its text is unchanged): open editors stay.
+          ...(inPlace ? {} : NO_TYPING),
         }));
       },
 
@@ -579,6 +597,24 @@ export function createGraphStore(): GraphStoreApi {
       },
 
       noteBlockedEdit: (path: EditPath, action: string) => rawSet((s) => ({ blocked: nextBlocked(s, path, action) })),
+
+      // ── phase 3 fix: typing in an open editor claims ──
+      beginTyping: (owner: string) => {
+        const s = get();
+        if (!s.doc) return false;
+        const typing = s.typing.includes(owner) ? s.typing : [...s.typing, owner];
+        if (s.guard) {
+          if (typing !== s.typing) rawSet({ typing });
+          return false;
+        }
+        rawSet((st) => ({ typing: st.typing.includes(owner) ? st.typing : [...st.typing, owner], userEditSerial: st.userEditSerial + 1 }));
+        return true;
+      },
+
+      endTyping: (owner: string) => {
+        if (!get().typing.includes(owner)) return;
+        rawSet((s) => ({ typing: s.typing.filter((o) => o !== owner) }));
+      },
 
       undoLabel: () => {
         const st = get().undoStack;

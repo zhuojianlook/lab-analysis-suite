@@ -539,6 +539,13 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     return { doc: s.doc!, analysis: s.analysis, figure: s.figure, scratch: s.scratch };
   };
   const tabDirty = (key: string) => (isLoaded(key) ? isDirty(graph.getState()) : !!tabOf(key)?.dirty);
+  /** Phase 3 fix (typed-edit claim): the loaded tab has an open editor with typed text not in the content yet
+   *  (graphStore `typing`). Not unsaved changes (Save, Close, drafts and combining go by tabDirty), but for the
+   *  presence rules it counts as editing in progress: decide() sees it as dirty (never read-only, never waiting),
+   *  the hold is never released while it lasts, and content arriving on its own waits (busyNow). */
+  const typingIn = (key: string) => isLoaded(key) && graph.getState().typing.length > 0;
+  /** Unsaved changes or typing in progress: what keeps a tab editing (presence only). */
+  const editingNow = (key: string) => tabDirty(key) || typingIn(key);
   const addUnique = (list: string[], p: string) => (list.includes(p) ? list : [...list, p]);
 
   /** Every file read goes through here: older versions whose content isn't in the file are marked as not stored. */
@@ -2316,7 +2323,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   // ── reload in place (§5.7) ──
 
   let holds = 0;
-  const busyNow = () => holds > 0 || quietBool(() => deps.interactionBusy());
+  // Phase 3 fix: an open editor with typed text is being edited however long ago its last key came.
+  const busyNow = () => holds > 0 || graph.getState().typing.length > 0 || quietBool(() => deps.interactionBusy());
   function quietBool(f: () => boolean): boolean { try { return !!f(); } catch { return false; } }
 
   /** Put a version's content into the loaded tab (graphStore.replaceContent): only while the tab is still
@@ -2428,7 +2436,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const i = it(key);
     i.combining++;
     try {
-      if (isLoaded(key)) deps.flushScratch({ commitEdit: true });
+      // fixer V-3: a combine nobody asked for ("poll") leaves a typed editor alone (it holds the replace back,
+      // busyNow); the person's own combine (a Save, the banner) commits an entry that can be committed.
+      if (isLoaded(key)) deps.flushScratch({ commitEdit: origin !== "poll" });
       const R = t.baseRevision;
       const dirty = tabDirty(key);
       // The markers of my side: those of the working copy handed in (a Save built it before its first attempt;
@@ -3859,7 +3869,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     const pr = it(key).pr;
     const diskHead = diskHeadOf(key);
     return decide({
-      me: me(), now: now(), diskHead, knows: knowsFn(key), dirty: tabDirty(key), holding: pr.holding,
+      me: me(), now: now(), diskHead, knows: knowsFn(key), dirty: editingNow(key), holding: pr.holding,
       myEpoch: pr.epoch, resuming: !!pr.resume, overrides: pr.overrides, notes: handoverView(key, diskHead), obs: pr.obs,
     });
   }
@@ -3881,7 +3891,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     pr.handoverUntil = null;
     const m = it(key).manifest;
     const until = pr.headSeen.at + LIMITS_HANDOVER_MS;
-    if (!diskHead || !m || tabDirty(key) || pr.holding || t0 >= until) return notes;
+    if (!diskHead || !m || editingNow(key) || pr.holding || t0 >= until) return notes;
     const r = revisionOf(m, diskHead);
     if (!r || !r.device_id) return notes;
     let used = false;
@@ -4089,7 +4099,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
 
   /** Release at once (D6 b, c) when the tab is clean. */
   function releaseIfClean(key: string): void {
-    if (tabOf(key) && it(key).pr.holding && !tabDirty(key)) release(key);
+    if (tabOf(key) && it(key).pr.holding && !editingNow(key)) release(key);
   }
 
   function clearLinger(key: string): void {
@@ -4112,7 +4122,8 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
   function lingerCheck(key: string): void {
     if (!tabOf(key)) return;
     const pr = it(key).pr;
-    if (!pr.holding || tabDirty(key) || pr.editHereHold) return; // unsaved changes never release: the note goes quiet by itself
+    // Unsaved changes (or typing in progress) never release: the note goes quiet by itself.
+    if (!pr.holding || editingNow(key) || pr.editHereHold) return;
     const since = Math.max(pr.lastSaveAt, pr.lastInputAt);
     if (now() - since < LIMITS_P3.lingerMs) { restartLinger(key); return; }
     release(key);
@@ -4135,23 +4146,26 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       return true;
     }
     if (wanted === "tooNew" || wanted === "resuming" || (cur !== null && READ_ONLY_GUARDS.includes(cur))) {
-      // An open Scratchpad cell entry is committed first: under the guard it could not be committed any more and
-      // would be lost when the Scratchpad closes (fixer VS-6). The tab has unsaved changes already; it stays so.
+      // Pending Scratchpad changes are written first (fixer VS-6). An open cell entry is no longer committed
+      // (fixer V-2): a typed editor stays open and editable under the guard (Enter commits it once the guard is
+      // gone), and leaving the Scratchpad tab parks it rather than lose it; a pristine one holds nothing.
       if (wanted === "resuming" && cur === null) {
-        deps.flushScratch({ commitEdit: true });
+        deps.flushScratch({ commitEdit: false });
         if (mySeq !== evalSeq) return false;
       }
       graph.getState().setGuard({ reason: wanted });
       pr.guard = wanted;
       return true;
     }
-    // Becoming read-only: an open Scratchpad edit is committed first (it may be a claim), never in the middle of
-    // a typed value, never with unsaved changes.
+    // Becoming read-only: never in the middle of a typed value, never with unsaved changes.
+    // Phase 3 fix: typing still in an editor counts like unsaved changes (it claimed at its first keystroke), so
+    // the open entry is left alone (fixer V-3: never committed, or closed, by a check nobody asked for); pending
+    // Scratchpad changes are written.
     const serial0 = s.userEditSerial;
-    deps.flushScratch({ commitEdit: true });
+    deps.flushScratch({ commitEdit: false });
     if (mySeq !== evalSeq) return false;
     const s1 = graph.getState();
-    if (s1.userEditSerial !== serial0 || isDirty(s1)) { if (mySeq === evalSeq) evaluate(key); return false; }
+    if (s1.userEditSerial !== serial0 || isDirty(s1) || s1.typing.length > 0) { if (mySeq === evalSeq) evaluate(key); return false; }
     if (quietBool(() => deps.interactionBusy())) {
       pr.guardRetry = deps.timers.setTimeout(() => { pr.guardRetry = null; if (tabOf(key)) evaluate(key); }, LIMITS_P3.applyHoldRetryMs);
       return true;
@@ -4216,7 +4230,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
     if (d.yieldedTo) {
       // Another computer took over my claim ("Edit here" there).
       if (pr.resume) { pr.resume = null; clearResumeTimer(key); pr.forceSync = true; d = decideFor(key); }
-      if (d.yieldedTo && !tabDirty(key) && pr.holding) {
+      if (d.yieldedTo && !editingNow(key) && pr.holding) {
         pr.holding = false;
         pr.supersedes = [];
         pr.overrides = [];
@@ -4226,7 +4240,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         d = decideFor(key);
       }
     }
-    if (pr.holding && !pr.resume && !tabDirty(key) && newerClaim(key, d)) {
+    if (pr.holding && !pr.resume && !editingNow(key) && newerClaim(key, d)) {
       // fixer round 2 (RV-4): another computer started editing this version after my claim (it did not see my note
       // yet, or it claimed again): a clean tab's hold ends, as when that computer presses Edit here.
       pr.holding = false;
@@ -4259,7 +4273,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
         pr.checkTimer = deps.timers.setTimeout(() => { pr.checkTimer = null; pr.checkAt = null; if (tabOf(key)) evaluate(key); }, ms);
       }
     }
-    if (pr.holding && !tabDirty(key) && !pr.lingerTimer) restartLinger(key);
+    if (pr.holding && !editingNow(key) && !pr.lingerTimer) restartLinger(key);
   }
 
   /** fixer round 2 (RV-4): a live editing claim on this tab's version that was not known when my hold began. */
@@ -4519,7 +4533,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       const pr = it(t.key).pr;
       pr.obs = markGap(pr.obs, t0);
       if (pr.holding) {
-        if (!tabDirty(t.key)) { pr.holding = false; pr.supersedes = []; pr.overrides = []; clearLinger(t.key); }
+        if (!editingNow(t.key)) { pr.holding = false; pr.supersedes = []; pr.overrides = []; clearLinger(t.key); }
         else {
           pr.resume = { since: t0 };
           clearResumeTimer(t.key);
@@ -4570,7 +4584,7 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       const act = quietNum(() => deps.lastActivity());
       if (act > pr.lastActivitySeen) {
         pr.lastActivitySeen = act;
-        if (pr.holding && tabDirty(key) && quietBool(() => deps.graphsVisible())) noteInput(key);
+        if (pr.holding && editingNow(key) && quietBool(() => deps.graphsVisible())) noteInput(key);
       }
     }
     for (const tab of get().tabs) {
@@ -5379,6 +5393,9 @@ export function createFileSession(partial: Partial<SessionDeps> = {}): FileSessi
       if (it(key).pr.holding) noteInput(key);
       else if (tabOf(key)?.path) claim(key, { input: true });
     }
+    // Phase 3 fix: the last typed editor closed (Escape, or its text is the content's again) without a change: a
+    // clean tab's hold ends 30 s after the last input again (lingerCheck left it alone while the typing lasted).
+    if (s.typing.length === 0 && prev.typing.length > 0 && prev.file?.docKey === key && it(key).pr.holding) restartLinger(key);
     if (s.blocked && s.blocked !== prev.blocked && prev.file?.docKey === key) onBlocked(key);
   });
 

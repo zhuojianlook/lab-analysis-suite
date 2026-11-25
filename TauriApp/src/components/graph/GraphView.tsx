@@ -30,7 +30,7 @@ import { GraphFigureControls, TitleFields } from "./GraphFigureControls";
 import { FigureTextPanel, readTextPanelOpen, writeTextPanelOpen } from "./FigureTextPanel";
 import { GraphResults } from "./GraphResults";
 import { flushScratch, scratchController, useScratchUi } from "./scratchpad/scratchBridge";
-import { BlockedClick, RailGuard, useReadOnly } from "./RailGuard";
+import { BlockedClick, RailGuard, useReadOnly, useTypingReport } from "./RailGuard";
 import {
   MAX_COLS, MAX_REP, MAX_ROWS, POSTHOC_LABELS, TEST_LABELS, colHasData, countInvalid, defaultColTitle,
   effectiveAnalysis, effectiveFigure, formatP, hasNumbers, hasPosthoc, templateInfo, toNumericTable, usedCols,
@@ -380,6 +380,7 @@ function GraphEditor() {
   const plotStale = !!plot && plotKey !== plotKeyRendered.current && !plotting;
 
   // ── start screen ──────────────────────────────────────────────────────────
+  const repsTyping = useTypingReport("table:n_rep");
   if (!doc || !table) return <CanvasSpinner />;
 
   // ── rail ──────────────────────────────────────────────────────────────────
@@ -410,7 +411,8 @@ function GraphEditor() {
         <>
           <RailHeading>Replicates</RailHeading>
           <Stack direction="row" spacing={1} alignItems="center">
-            <NumberField size="small" label="Sub-columns per group" value={doc.n_rep} onCommit={changeReps} min={1} max={MAX_REP} step={1} sx={{ width: 170 }} />
+            <NumberField size="small" label="Sub-columns per group" value={doc.n_rep} onCommit={changeReps} min={1} max={MAX_REP} step={1} sx={{ width: 170 }}
+              onTyping={repsTyping} />
             <Typography variant="caption" color="text.secondary">
               {template === "grouped" ? "Replicate values per row and group." : "Replicate Y values per X."}
             </Typography>

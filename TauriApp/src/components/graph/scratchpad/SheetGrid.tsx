@@ -28,6 +28,7 @@ import {
   scrollToShow, withDollars, type Assist, type Complete, type Pending,
 } from "./formulaEdit";
 import { ArgHintPopup, ColouredText, FN_LIST_ID, FN_LIST_PAGE, FunctionListPopup, fnOptionId } from "./FormulaAssist";
+import { TypingReporter, backgroundCommit, editTyped } from "./openEdit";
 
 const ROW_H = 24;
 const HEAD_H = 24;
@@ -51,8 +52,10 @@ interface Pos { r: number; c: number }
 /** a = anchor corner, f = focus (moving) corner, act = active cell (inside the range). */
 export interface Sel { a: Pos; f: Pos; act: Pos }
 /** Selection and scroll position, kept by the owner across remounts (switching tabs). */
-export interface ViewMemo { sel?: Sel; top: number; left: number }
-interface EditState { r: number; c: number; text: string; mode: "enter" | "edit"; origin: "cell" | "bar" }
+/** Kept by the Scratchpad tab across remounts (switching tabs). `edit` (fixer V-1): a typed edit the sheet refused
+ *  when the tab was left (a half-typed "=SUM("), opened again with its text on the next mount. */
+export interface ViewMemo { sel?: Sel; top: number; left: number; edit?: EditState }
+export interface EditState { r: number; c: number; text: string; mode: "enter" | "edit"; origin: "cell" | "bar" }
 type MenuKind = "cell" | "row" | "col";
 
 const one = (p: Pos): Sel => ({ a: p, f: p, act: p });
@@ -68,14 +71,20 @@ type EditEl = HTMLInputElement | HTMLTextAreaElement;
 interface PointTarget { el: EditEl; origin: "cell" | "bar"; atPending: boolean; afterRef: boolean; unionOnly: boolean }
 
 export interface SheetGridHandle {
-  /** Commit an open edit (no move). False when the commit failed and the editor stays open. */
-  commitEdit: () => boolean;
+  /** Commit an open edit (no move). False when the commit failed and the editor stays open. `background`: a
+   *  commit the person did not ask for (Save, drafts, the read-only check — see openEdit.ts): only typed text is
+   *  written, and an entry that can't be written (a half-typed formula) stays in its editor with no message. */
+  commitEdit: (opts?: { background?: boolean }) => boolean;
   /** Copy the selection's displayed values to the system clipboard. */
   copyValues: () => void;
   focus: () => void;
   selection: () => CellRange;
   /** Forget the cut/copy marquee (after an edit made elsewhere). */
   clearMarquee: () => void;
+  /** Fixer V-1: the grid is about to unmount (leaving the Scratchpad tab). A background commit first; a typed
+   *  entry it refused (a half-typed formula, or any entry while read-only) is kept in the view memo and opens
+   *  again on the next mount. True when an edit was parked (its typing stays recorded in the graph store). */
+  park: () => boolean;
 }
 
 export interface SheetGridProps {
@@ -97,6 +106,9 @@ export interface SheetGridProps {
   readOnly?: boolean;
   /** A refused change (one call per gesture), e.g. "type", "paste", "delete", "fill". */
   onBlocked?: (action: string) => void;
+  /** Phase 3 fix: the open edit holds typed text (true on every keystroke that leaves it different from the
+   *  cell) or no longer does (false, once). The owner turns it into graphStore.beginTyping / endTyping. */
+  onTyping?: (typed: boolean) => void;
 }
 
 /** Text width in px (cached canvas measureText). */
@@ -118,14 +130,15 @@ function useMeasure(fontFamily: string) {
 }
 
 export const SheetGrid = forwardRef<SheetGridHandle, SheetGridProps>(function SheetGrid(
-  { session, rev, onResult, onUndo, onRedo, onSelectionChange, onNotice, memo, readOnly = false, onBlocked }, ref,
+  { session, rev, onResult, onUndo, onRedo, onSelectionChange, onNotice, memo, readOnly = false, onBlocked, onTyping }, ref,
 ) {
   const theme = useTheme();
   const measure = useMeasure(String(theme.typography.fontFamily ?? "sans-serif"));
   const primary = theme.palette.primary.main;
 
   const [sel, setSelState] = useState<Sel>(() => memo?.sel ?? one({ r: 1, c: 1 }));
-  const [edit, setEditState] = useState<EditState | null>(null);
+  // A parked edit (fixer V-1) opens again where it was, with its text and caret at the end.
+  const [edit, setEditState] = useState<EditState | null>(() => memo?.edit ?? null);
   const [view, setView] = useState({ top: 0, left: 0, w: 800, h: 500 });
   const [marquee, setMarquee] = useState<CellRange | null>(null);
   const [fillPreview, setFillPreview] = useState<CellRange | null>(null);
@@ -140,6 +153,19 @@ export const SheetGrid = forwardRef<SheetGridHandle, SheetGridProps>(function Sh
   roRef.current = readOnly;
   const onBlockedRef = useRef(onBlocked);
   onBlockedRef.current = onBlocked;
+  const onTypingRef = useRef(onTyping);
+  onTypingRef.current = onTyping;
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  /** Phase 3 fix: reports whether the open edit holds typed text (its first keystroke claims the analysis). */
+  const typing = useMemo(() => new TypingReporter((typed) => onTypingRef.current?.(typed)), []);
+  useEffect(() => {
+    // A restored edit (fixer V-1) holds typed text: it is typing again (reported; the store may already list it).
+    // Not keyed on memo.edit, so a StrictMode re-run reports it again after its simulated cleanup ended it.
+    if (memo?.edit) memo.edit = undefined;
+    typing.update(sessionRef.current, editRef.current);
+    return () => typing.end();
+  }, [typing]); // eslint-disable-line react-hooks/exhaustive-deps
   /** Read-only: report the refused gesture; true when it was refused. */
   const refused = useCallback((action: string): boolean => {
     if (!roRef.current) return false;
@@ -156,7 +182,7 @@ export const SheetGrid = forwardRef<SheetGridHandle, SheetGridProps>(function Sh
   const pendingCopy = useRef<{ cut: boolean } | null>(null);
   /** Reference inserted in point mode: [start, end) in the editor text, and the cells it spans. */
   const pointRef = useRef<Pending | null>(null);
-  const pendingCaret = useRef<{ el: "cell" | "bar"; pos: number } | null>(null);
+  const pendingCaret = useRef<{ el: "cell" | "bar"; pos: number } | null>(edit ? { el: edit.origin, pos: edit.text.length } : null);
   /** The open editor's selection (UTF-16), for the render-time assist; handlers read the element instead. */
   const [caret, setCaret] = useState({ s: 0, e: 0 });
   const [edScroll, setEdScroll] = useState({ left: 0, top: 0 });
@@ -176,7 +202,8 @@ export const SheetGrid = forwardRef<SheetGridHandle, SheetGridProps>(function Sh
     editRef.current = e;
     setEditState(e);
     if (!e) setAcDismissed(null);   // a closed list is forgotten with the edit
-  }, []);
+    typing.update(sessionRef.current, e);
+  }, [typing]);
 
   // ── formula assist (autocomplete, argument hint, point mode) ─────────────
   /** The engine's completion context for a formula (sheet and cell don't matter). */
@@ -297,7 +324,7 @@ export const SheetGrid = forwardRef<SheetGridHandle, SheetGridProps>(function Sh
   useEffect(() => { onSelectionChange(range, act); }, [range.r1, range.c1, range.r2, range.c2, act.r, act.c]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Focus the grid when it first appears.
-  useEffect(() => { focusProxy(); }, [focusProxy]);
+  useEffect(() => { if (editRef.current?.origin !== "bar") focusProxy(); }, [focusProxy]);
 
   // A double-click on a function in the list (the Excel habit): the first press picks it and closes the list,
   // so the second press would land on whatever is under it (a cell: a stray reference). Swallow that press.
@@ -360,19 +387,37 @@ export const SheetGrid = forwardRef<SheetGridHandle, SheetGridProps>(function Sh
     return true;
   }, [session, apply, setEdit]);
 
+  /** A commit the person did not ask for (openEdit.ts): never an alert, a refused entry stays in its editor. */
+  const commitBackground = useCallback((): boolean => {
+    const out = backgroundCommit(session, editRef.current);
+    if (out.kind === "committed") {
+      apply(out.res);
+      pointRef.current = null;
+      setEdit(null);
+      return true;
+    }
+    if (out.kind === "kept") {
+      if (out.res.reason === "fatal") onResult(out.res);   // the engine is gone: the tab shows that
+      return false;
+    }
+    return true;
+  }, [session, apply, setEdit, onResult]);
+
   const cancelEdit = useCallback(() => {
     pointRef.current = null;
     setEdit(null);
     focusProxy();
   }, [setEdit, focusProxy]);
 
-  // The analysis became read-only (another computer started editing) with an edit open: it can't be written,
-  // so close it rather than leave an editor that takes keys but can never commit. An unsaved change is reported
-  // (the banner says why).
+  // The analysis became read-only with an edit open. A pristine editor (opened, nothing typed) closes: it holds
+  // nothing, and read-only opens no editor. A typed one stays open with its text (phase 3 fix): its first
+  // keystroke claimed, so read-only should not come at all; if it does anyway (e.g. the after-sleep "resuming"
+  // guard), the text is kept and Enter commits it once the guard is gone (until then the commit is refused and
+  // reported).
   useEffect(() => {
     const ed = editRef.current;
     if (!readOnly || !ed) return;
-    if (ed.text !== session.input(ed.r, ed.c)) onBlockedRef.current?.("edit");
+    if (editTyped(session, ed)) return;
     cancelEdit();
   }, [readOnly]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -930,12 +975,20 @@ export const SheetGrid = forwardRef<SheetGridHandle, SheetGridProps>(function Sh
 
   // ── imperative handle ─────────────────────────────────────────────────────
   useImperativeHandle(ref, () => ({
-    commitEdit: () => commit(),
+    commitEdit: (opts) => (opts?.background ? commitBackground() : commit()),
     copyValues,
     focus: focusProxy,
     selection: () => rangeOf(selRef.current),
     clearMarquee: () => { setMarquee(null); session.clip = null; },
-  }), [commit, copyValues, focusProxy, session]);
+    park: () => {
+      if (commitBackground()) return false;
+      const ed = editRef.current;
+      if (!ed || !memo || !editTyped(session, ed)) return false;
+      memo.edit = { ...ed };
+      typing.detach();
+      return true;
+    },
+  }), [commit, commitBackground, copyValues, focusProxy, session, memo, typing]);
 
   // ── formula bar ───────────────────────────────────────────────────────────
   const barValue = edit ? edit.text : session.barText(act.r, act.c);

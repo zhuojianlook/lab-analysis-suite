@@ -6,7 +6,9 @@
 import { create } from "zustand";
 
 export interface ScratchController {
-  /** Write pending changes into the graph store; with `commitEdit`, first commit an open cell edit. */
+  /** Write pending changes into the graph store; with `commitEdit`, first commit an open cell edit the way a
+   *  commit the person did not ask for does (openEdit.ts): typed text the sheet accepts is written, a refused
+   *  entry (a half-typed formula) stays in its editor with no alert, a pristine editor is left alone. */
   flush(commitEdit: boolean): void;
   /** Copy the selection's displayed values (TSV) to the clipboard. */
   copy(): void;
@@ -26,8 +28,9 @@ export function registerScratchController(c: ScratchController | null): void {
 export const scratchController = (): ScratchController | null => controller;
 
 /** Make the store's `scratch` current (no-op when the Scratchpad was never opened).
- *  `commitEdit` (save, the unsaved-changes guard) also commits a cell being typed in;
- *  the background draft backup leaves an open editor alone. */
+ *  `commitEdit` (save, close, the unsaved-changes guard, the person's own combine) also commits a cell being
+ *  typed in when it can be committed (never an alert: see ScratchController.flush); the background draft
+ *  backup, the read-only / after-sleep checks and the automatic combine leave an open editor alone. */
 export function flushScratch(opts: { commitEdit?: boolean } = {}): void {
   try { controller?.flush(!!opts.commitEdit); } catch { /* the sheet must never block a save */ }
 }

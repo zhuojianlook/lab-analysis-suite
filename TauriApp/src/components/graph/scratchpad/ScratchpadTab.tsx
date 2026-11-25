@@ -26,6 +26,12 @@ import { BlockedClick, reportBlocked } from "../RailGuard";
 const guarded = () => useGraphStore.getState().guard !== null;
 /** A refused Scratchpad change (the banner's button pulses; the sheet shows no message of its own). */
 const blocked = (action: string) => reportBlocked("scratchpad", action);
+/** Phase 3 fix: the open cell edit holds typed text (graph store `typing`; its first keystroke claims). */
+const TYPING_OWNER = "scratchpad";
+const onTyping = (typed: boolean) => {
+  const st = useGraphStore.getState();
+  if (typed) st.beginTyping(TYPING_OWNER); else st.endTyping(TYPING_OWNER);
+};
 
 // ── session lifetime (module level: survives switching tabs) ────────────────
 
@@ -41,6 +47,8 @@ function acquire(serial: number, text: string): Current {
   if (engineDead) throw new Error(FATAL_MSG);
   if (!current || current.serial !== serial || current.lastText !== text) {
     if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
+    // A parked edit (fixer V-1) belonged to the old session: it goes with it, and so does its typing.
+    if (current?.view.edit) { current.view.edit = undefined; useGraphStore.getState().endTyping(TYPING_OWNER); }
     current?.session.dispose();
     const session = new SheetSession(text);
     session.readOnly = guarded();
@@ -222,7 +230,9 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
   useEffect(() => {
     if (!session) return;
     registerScratchController({
-      flush: (commitEdit) => { if (commitEdit) gridRef.current?.commitEdit(); writeStore(); },
+      // Every committing caller is a commit the person did not ask for in the sheet (Save, Close, their own
+      // combine): a half-typed formula stays in its editor, with no alert (phase 3 fix, see openEdit.ts).
+      flush: (commitEdit) => { if (commitEdit) gridRef.current?.commitEdit({ background: true }); writeStore(); },
       copy: () => gridRef.current?.copyValues(),
       openSend,
       clearAll,
@@ -231,10 +241,13 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
     return () => registerScratchController(null);
   }, [session, openSend, clearAll]);
 
-  // Leaving the tab (or the document): commit an open edit and write everything now.
+  // Leaving the tab (or the document): commit an open edit and write everything now. A typed entry the sheet
+  // refuses (a half-typed formula; anything while read-only) is parked instead (fixer V-1): it opens again with
+  // its text when the Scratchpad comes back, and stays "typing" (this computer keeps editing) meanwhile.
   useLayoutEffect(() => () => {
-    gridRef.current?.commitEdit();
+    gridRef.current?.park();
     writeStore();
+    if (!current?.view.edit) useGraphStore.getState().endTyping(TYPING_OWNER);
     useScratchUi.setState({ ready: false });
   }, []);
 
@@ -315,7 +328,8 @@ export default function ScratchpadTab({ onSent }: { onSent: (r: PasteResult) => 
           </BlockedClick>
         </Stack>
         <SheetGrid key={cur.key} ref={gridRef} session={session} rev={rev} onResult={onResult} onUndo={onUndo} onRedo={onRedo}
-          onSelectionChange={onSelectionChange} onNotice={onNotice} memo={cur.view} readOnly={readOnly} onBlocked={blocked} />
+          onSelectionChange={onSelectionChange} onNotice={onNotice} memo={cur.view} readOnly={readOnly} onBlocked={blocked}
+          onTyping={onTyping} />
       </Box>
       <SendToDataDialog info={send} onClose={() => { setSend(null); gridRef.current?.focus(); }}
         onSent={(r) => { setSend(null); onSent(r); }} />

@@ -3,7 +3,7 @@
    controls look unavailable and turn a click on them into a reported edit attempt (the banner's
    button pulses). No layout changes: the same elements are rendered with or without the guard. */
 
-import type { ReactNode } from "react";
+import { useCallback, useEffect, type ReactNode } from "react";
 import { Box, type SxProps, type Theme } from "@mui/material";
 import { useGraphStore } from "../../store/graphStore";
 import type { EditPath } from "./file/contract";
@@ -13,6 +13,17 @@ export const useReadOnly = (): boolean => useGraphStore((s) => s.guard !== null)
 
 /** Report an edit attempt that never reached a store action. */
 export const reportBlocked = (path: EditPath, action: string): void => useGraphStore.getState().noteBlockedEdit(path, action);
+
+/** Phase 3 fix: for a field that keeps typed text until it commits (blur / Enter): pass the result as its
+ *  `onTyping`. Its first keystroke claims the analysis (graphStore.beginTyping), as a committed change would, so
+ *  this computer is never made read-only while the person is typing in it. */
+export function useTypingReport(owner: string): (typed: boolean) => void {
+  useEffect(() => () => useGraphStore.getState().endTyping(owner), [owner]);
+  return useCallback((typed: boolean) => {
+    const st = useGraphStore.getState();
+    if (typed) st.beginTyping(owner); else st.endTyping(owner);
+  }, [owner]);
+}
 
 /** Opacity of controls that can't be used while the analysis is read-only. */
 export const READONLY_OPACITY = 0.6;

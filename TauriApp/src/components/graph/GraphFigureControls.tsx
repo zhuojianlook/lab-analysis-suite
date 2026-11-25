@@ -7,6 +7,7 @@ import { RailHeading } from "../shared/RailSection";
 import { NumberField } from "../shared/NumberField";
 import { CENTERS, editColor, templateInfo } from "./graphModel";
 import { PalettePicker } from "./PalettePicker";
+import { useTypingReport } from "./RailGuard";
 
 /** Caption + slider with the current value shown on the right. */
 export function LabeledSlider({
@@ -33,8 +34,10 @@ export const Grid2 = ({ children }: { children: ReactNode }) => (
 /** Number input where blank means "automatic" (null). Commits on blur/Enter. */
 function OptionalNumberField({ label, value, onCommit }: { label: string; value: number | null; onCommit: (v: number | null) => void }) {
   const [text, setText] = useState(value === null ? "" : String(value));
-  useEffect(() => { setText(value === null ? "" : String(value)); }, [value]);
+  const onTyping = useTypingReport(`figure:${label}`);
+  useEffect(() => { setText(value === null ? "" : String(value)); onTyping(false); }, [value]); // eslint-disable-line react-hooks/exhaustive-deps
   const commit = () => {
+    onTyping(false);
     const t = text.trim().replace(/^(-?\d+),(\d+)$/, "$1.$2");
     if (t === "") { if (value !== null) onCommit(null); return; }
     const n = Number(t);
@@ -43,7 +46,7 @@ function OptionalNumberField({ label, value, onCommit }: { label: string; value:
   };
   return (
     <TextField size="small" label={label} value={text} placeholder="Auto"
-      onChange={(e) => setText(e.target.value)} onBlur={commit}
+      onChange={(e) => { setText(e.target.value); onTyping(e.target.value !== (value === null ? "" : String(value))); }} onBlur={commit}
       onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
       slotProps={{ inputLabel: { shrink: true }, htmlInput: { inputMode: "decimal" } }} />
   );
@@ -108,6 +111,8 @@ export function GraphFigureControls({
   /** Replicate sub-columns per X (XY tables). */
   nRep?: number;
 }) {
+  const widthTyping = useTypingReport("figure:width");
+  const heightTyping = useTypingReport("figure:height");
   const f = figure;
   const g = f.graph_type;
   const graphs = templateInfo(template).graphs;
@@ -263,8 +268,8 @@ export function GraphFigureControls({
       <RailHeading>Export</RailHeading>
       <Stack spacing={1}>
         <Grid2>
-          <NumberField size="small" label="Width (px)" value={f.width} onCommit={(v) => setFigure({ width: v })} min={300} max={8000} step={100} />
-          <NumberField size="small" label="Height (px)" value={f.height} onCommit={(v) => setFigure({ height: v })} min={300} max={8000} step={100} />
+          <NumberField size="small" label="Width (px)" value={f.width} onCommit={(v) => setFigure({ width: v })} min={300} max={8000} step={100} onTyping={widthTyping} />
+          <NumberField size="small" label="Height (px)" value={f.height} onCommit={(v) => setFigure({ height: v })} min={300} max={8000} step={100} onTyping={heightTyping} />
         </Grid2>
         <Grid2>
           <TextField select size="small" label="DPI" value={f.dpi} onChange={(e) => setFigure({ dpi: Number(e.target.value) })}>
